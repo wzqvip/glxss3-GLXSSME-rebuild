@@ -29,6 +29,15 @@ App 通过 Android USB Host API 打开设备，把 **fd + busNum + devAddr + usb
 - 分辨率：**640 × 400**，DPI = 1（`framework/lcd/utils/ConstantUtils.java`）
 - 交叉验证：`assets/logo.bin` 大小 1,024,000 B = 640 × 400 × 4（RGBA8888），且该文件被原样当作一帧发送。
 
+## SoC
+
+**Intel Movidius Myriad 2（MA2450）** —— 与 Intel Neural Compute Stick 1（NCS1）同款芯片。
+
+- 固件里 `ddrInitHeaderForMvcmd.elf` 与 git 分支 `..._ma2450` 直接指向 Myriad 2；
+- boot 模式 USB ID **`0x03E7:0x2150`** 就是 NCS1 的默认 ID。
+
+详见 [soc-myriad2.md](soc-myriad2.md)。
+
 ## 原生库
 
 | 库 | 作用 |

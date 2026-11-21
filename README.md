@@ -27,6 +27,7 @@
 | 厂商代号 | glxss3 / G25（构建任务 `G25_paltform_sdk_DTR`，SDK `com.llvision.glass3.sdk`） |
 | 正常模式 USB | **VID `0x2E09` / PID `0x0030`**（复合设备：UVC 摄像头 + LCD + HID） |
 | 固件下载模式 USB | **VID `0x03E7` / PID `0x2150`** |
+| SoC | **Intel Movidius Myriad 2（MA2450）**，与 Intel NCS1 神经棒同款 |
 | 显示分辨率 | **640 × 400**，DPI = 1 |
 | 帧格式 | `16B 头 + 裸 RGBA8888` |
 | 固件 | `G25_MainFW_1.9.1.img`：`MA2x` 容器 + Marvell MVCMD DDR init + `main.elf`（2016-06-09） |
@@ -60,6 +61,7 @@ sudo python3 code/poc_send_frame.py --pattern bars --fps 5   # 发送色条测�
 ```
 docs/                 研究文档
   device.md           设备画像、USB、固件
+  soc-myriad2.md      SoC = Intel Myriad 2（NCS1 同款）与刷机路线
   protocol.md         投屏协议（帧格式、数据流、控制命令）
   open-questions.md   待验证项与验证方法
 code/
