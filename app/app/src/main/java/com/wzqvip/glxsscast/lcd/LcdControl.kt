@@ -50,9 +50,21 @@ object LcdControl {
         return conn.controlTransfer(REQ_CTRL, 0x19, if (on) 1 else 0, IFACE_AUX, ByteArray(1), 1, TIMEOUT) > 0
     }
 
+    /** 真实固件版本：0xA1/0x17，HID 接口(2)，24 字节 = 16B 版本串 + 8B ID */
+    fun getFirmwareVersion(conn: UsbDeviceConnection): String? {
+        val n = conn.controlTransfer(REQ_CTRL, 0x17, 0, IFACE_AUX, ByteArray(24), 24, TIMEOUT)
+        if (n <= 0) return null
+        val buf = ByteArray(24)
+        val r = conn.controlTransfer(REQ_CTRL, 0x17, 0, IFACE_AUX, buf, 24, TIMEOUT)
+        if (r <= 0) return null
+        val s = String(buf, 0, minOf(16, r), Charsets.US_ASCII)
+        return s.trim('\u0000', ' ', '\n')
+    }
+
     /** 查询状态：返回 8 字节，byte[5]=当前亮度 */
     fun getStatus(conn: UsbDeviceConnection): ByteArray? = ctrl(conn, 0x04, 0, IFACE_LCD, 8)
 
     /** HID 报告（28 字节） */
     fun getHidReport(conn: UsbDeviceConnection): ByteArray? = ctrl(conn, 0x16, 0, IFACE_AUX, 28)
 }
+

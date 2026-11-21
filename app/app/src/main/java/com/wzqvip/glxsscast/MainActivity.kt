@@ -95,6 +95,7 @@ class MainActivity : ComponentActivity() {
                     val dev = intent.getParcelableExtra(
                         UsbManager.EXTRA_DEVICE, android.hardware.usb.UsbDevice::class.java
                     )
+                    if (dev != null && dev.vendorId == 0x03E7) autoFlashBoot(dev)
                     if (dev != null && dev.vendorId == UsbLink.VID) connect(dev)
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -151,6 +152,17 @@ class MainActivity : ComponentActivity() {
         unregisterReceiver(attachReceiver)
         // 连接是进程内共享的（CastService 可能还在用），这里不关闭
         super.onDestroy()
+    }
+
+    private fun autoFlashBoot(dev: android.hardware.usb.UsbDevice) {
+        if (!usb.hasPermission(dev)) { status = "引导模式设备，请求权限…"; usb.requestPermission(dev); return }
+        val base = getExternalFilesDir(null)?.absolutePath ?: "/sdcard/Android/data/com.wzqvip.glxsscast/files"
+        val img = base + "/G25_MainFW_1.9.1.img"
+        if (!java.io.File(img).exists()) { status = "检测到引导模式，但缺少固件文件"; return }
+        status = "检测到引导模式，自动加载固件…"
+        com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(this, dev, img,
+            { p, m -> runOnUiThread { status = "$p% $m" } },
+            { ok, msg -> runOnUiThread { status = msg } })
     }
 
     private fun connect(dev: android.hardware.usb.UsbDevice) {
@@ -495,6 +507,17 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = {
+                            usb.connection?.let { c ->
+                                val v = LcdControl.getFirmwareVersion(c)
+                                status = if (v.isNullOrBlank()) "读固件版本失败" else "真实固件版本: " + v
+                            } ?: run { status = "未连接" }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("读取真实固件版本") }
+
+                    Button(
+                        onClick = {
                             if (com.wzqvip.glxsscast.usb.Peripherals.hidRunning) {
                                 com.wzqvip.glxsscast.usb.Peripherals.stopHid()
                                 status = "HID 已停止（共 " + com.wzqvip.glxsscast.usb.Peripherals.hidPackets + " 包）"
@@ -577,6 +600,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 
 
 
