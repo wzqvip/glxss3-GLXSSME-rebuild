@@ -2,4 +2,7 @@
 <!-- GLXSS3 正常模式：VID 0x2E09 / PID 0x0030 -->
 <resources>
     <usb-device vendor-id="11785" product-id="48" />
+    <!-- 引导模式：03E7:2150 (Intel Movidius Myriad 2 boot ROM) -->
+    <usb-device vendor-id="999" product-id="8528" />
 </resources>
+
