@@ -160,31 +160,41 @@ UVC 出流的唯一开关就是标准 `SET_CUR(probe)` + `SET_CUR(commit)`，而
 
 ## 4. 原厂 App 的完整初始化序列（健康设备，hook `libusb100.so`）
 
-来自 `re/liangliang/uvc_cap2.log`（完整、从打开设备到出第一帧）：
+来自本次**健康固件**下的完整抓包 `re/liangliang/vendor_init.log`（App 冷启动 → 第一帧，t=482…1651 ms）：
 
-| # | 动作 | 参数 | 备注 |
-|---|---|---|---|
-| 1 | `CLAIM iface=2` | HID | **把内核 hid-generic 摘掉**（之后 `0x16` 才有 28B 返回） |
-| 2 | `0xA1/0x16` | wIndex=2 wLen=28 | HID 传感器报告 `00 71 ...` |
-| 3 | `0xA1/0x06` | wIndex=2 wLen=16 | HID 描述符 |
-| 4 | `CLAIM iface=3` | LCD | |
-| 5 | `0xA1/0x07` | wValue=0x100 wIndex=3 **264B** | 读 EEPROM 产品信息（`LCD.lcdInit()` 成功后自动调） |
-| 6 | `0xA1/0x04` | wIndex=3 wLen=8 | 状态 `80 02 90 01 01 b4 0a 00` |
-| 7 | bulk OUT `ep 0x01` | **1,024,016B** | 一帧 16B 头 + RGBA（这里可能是 logo/首帧） |
-| 8 | `0xA1/0x05` | wValue=1，wIndex=3 | 显示模式切换 |
-| 9 | `CLAIM iface=0` | VideoControl | |
-| 10 | `0xA1/0x81` | wValue=0x0100 wLen=34 | GET_CUR(probe) |
-| 11 | `0x21/0x01` | wValue=0x0100 wLen=34 | SET_CUR(probe) |
-| 12 | `0xA1/0x81` | wValue=0x0200 | GET_CUR(commit) |
-| 13 | `0x21/0x01` | wValue=0x0200 wLen=34 | SET_CUR(commit) |
-| 14 | 收流 | 1 URB = 1 帧 `actual=460812` | `0c 0f/0e` 头 + 460800B YV12 |
+| # | t(ms) | 动作 | 参数 | 备注 |
+|---|---|---|---|---|
+| 1 | 482 | `CLAIM iface=2` | HID | **把内核 hid-generic 摘掉**（之后 `0x16` 才有 28B 返回） |
+| 2 | 482 | `0xA1/0x16` | wIndex=2 wLen=28 | HID 传感器报告 `00 71 00…` |
+| 3 | 482 | `0xA1/0x06` | wIndex=2 wLen=16 | HID 描述符 |
+| 4 | 494 | `CLAIM iface=3` | LCD | |
+| 5 | 494 | `0xA1/0x07` | wValue=0x100 wIndex=3 **264B** | 读 EEPROM 产品信息（`LCD.lcdInit()` 成功后自动调） |
+| 6 | 514 | `0xA1/0x04` ×2 | wIndex=3 wLen=8 | 状态 `80 02 90 01 01 b4 06 00` |
+| 7 | 544 | bulk OUT `ep 0x01` | **1,024,016B** | 一帧 16B 头 + RGBA（黑底，`00 00 00 ff`…） |
+| 8 | 588 | `0xA1/0x05` | wValue=**1** wIndex=3 | 显示模式切到 1（logo/待机） |
+| 9 | 595 | `CLAIM iface=0` | VideoControl | |
+| 10 | 595 | `0x21/0x01` | wValue=**0x0d0d** wIndex=**0x0400** wLen=1 data=`01` | **vendor XU 写**（entity 4）：相机侧一个 1 字节开关；**我们不发也照样出流** |
+| 11 | 640 | bulk OUT `ep 0x01` | 1,024,016B | 第二帧（`01 01 01 ff` 近黑）——**原厂也是 LCD+UVC 并发** |
+| 12 | 1598 | `CLAIM iface=1` | VideoStreaming | |
+| 13 | 1598–1628 | `0xA1/0x81/0x82/0x83` + `0x21/0x01(wValue=0x100)` | wLen=34，wIndex=1 | libuvc 枚举候选格式：format=1，frame 3/4，逐轮 probe |
+| 14 | 1631 | `0x21/0x01` | wValue=**0x0200** wLen=34 | **SET_CUR(commit)**，payload 与最后一次 probe 相同 |
+| 15 | 1651 | 收流 | 1 URB = 1 帧 `actual=460812` | `0c 0e/0f …` + 460800B YV12，间隔 ~10–40 ms |
 
-> 之后是纯收流（20–25 fps）+ 每 300 ms 一次 `0xA1/0x16` 轮询 HID；没有任何 XU / 厂商私有流控制。
+probe/commit 的 34B 回填（GET_CUR）：
+
+```
+01 00 | 01 | 04 | 15 16 05 00 | ... | 00 08 07 00 | 00 40 00 00
+bmHint=1  fmt=1 frm=4  333333(30fps)   460800B       16384
+```
+
+> 之后是纯收流 + 每 ~300 ms 一次 `0xA1/0x16` 轮询 HID。
+> **没有**"摄像头上电/复位"这类私有流控制；UVC 出流的唯一开关就是 probe + commit。
 
 **我们 App 与原厂的差异（都不影响出流，属于稳健性/一致性）：**
 1. 原厂会 claim HID 接口(2) → 我们也补上了（`UsbLink.open`、`UvcCamera.open`）；
 2. 原厂会读 264B EEPROM 产品信息（`0xA1/0x07`）→ 我们不需要（只影响版本显示）；
-3. 原厂送帧前会确保屏已开（`LCDService.c()`：`!bopen` → `setSwitch(true)`）→ 我们补上了（§5.2）。
+3. 原厂会发一条 XU 写 `0x21/0x01 wValue=0x0d0d wIndex=0x0400 data=01` → 我们不发，实测 25 fps 正常；
+4. 原厂送帧前会确保屏已开（`LCDService.c()`：`!bopen` → `setSwitch(true)`）→ 我们补上了（§5.2）。
 
 ---
 
