@@ -60,9 +60,11 @@ sudo python3 code/poc_send_frame.py --pattern bars --fps 5   # 发送色条测�
 
 ```
 docs/                 研究文档
+  glasses-overview.md 眼镜现状：硬件/软件/能力/限制/神经棒取舍
   device.md           设备画像、USB、固件
   soc-myriad2.md      SoC = Intel Myriad 2（NCS1 同款）与刷机路线
   protocol.md         投屏协议（帧格式、数据流、控制命令）
+  app-replacement.md  替代手机 App 设计（架构/功能/里程碑）
   open-questions.md   待验证项与验证方法
 code/
   poc_send_frame.py   发送端 PoC（Linux + pyusb）
