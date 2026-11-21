@@ -30,15 +30,20 @@ import kotlin.math.min
  *           └─ 未压缩  ─► YV12/I420/NV12/YUY2 ─► ARGB IntArray ─► Bitmap
  * ```
  *
- * 关键点（真机 / 厂商日志证据）：
- * - 设备自称 UVC 1.10，VS 接口用 **bulk** 端点（不是 isochronous），所以必须
- *   `setInterface(alt=1)` 才有 0x81；
- * - 厂商日志 `frameSize=(640,480)@YV12` + `frameBufferSize=460822`
- *   （640*480*1.5 = 460800，+22 字节头部余量）说明设备最可能只给
- *   **未压缩 YV12 @640x480**，不一定是 MJPEG。所以这里运行时**解析描述符**
- *   来决定格式，MJPEG / 各 YUV 都支持；
- * - probe/commit 走 INTF1 的 class 控制传输（SET_CUR 0x01 / GET_CUR 0x81，
- *   wValue=0x0100 探针、0x0200 提交）。
+ * 关键点（真机 / 厂商日志 + Frida 抓包证据，详见 docs/uvc-camera-plan.md §8）：
+ * - 设备自称 UVC 1.10，VS 接口用 **bulk** 端点（不是 isochronous），
+ *   INTF1 只有 alt=0 就带 0x81（mps=512），所以 `setInterface(alt=0)` 即可；
+ * - 原厂 libuvc 每次 `libusb_submit_transfer` 就是 `frameBufferSize=460822`
+ *   = `dwMaxVideoFrameSize(460800) + 22`，实测**一次 transfer 正好一帧**：
+ *   `actual_length = 460812 = 460800 + 12B UVC payload header`；
+ * - payload header 是标准 UVC 1.1 的 12 字节头（PTS + SCR 都在）：
+ *   `0C 0F|0E <PTS:4> <SCR:6>`  → `bHeaderLength=12`、`bmHeaderInfo` bit1(EOF)=1、
+ *   bit0(FID) 逐帧翻转、bit2/bit3(PTS/SCR)=1；后 460800 字节是 YV12
+ *   （Y | V | U，实测与原厂画面一致）；
+ * - 因此本实现的 URB 尺寸对齐原厂（`frameSize + 22`），并且**只认合法 header**：
+ *   固件异常时设备会"整块灌满缓冲区"（`n == urbSize`、首字节是亮度值），
+ *   以前那种 `rawPayloadMode` 兜底会把垃圾当图像画出来 → 彩色噪点；
+ *   现在直接判定为无效数据并报错，不再刷噪点。
  *
  * 与现有 [com.wzqvip.glxsscast.usb.UsbLink] 共存：
  * - 二者各自对同一个 [UsbDevice] 调 `openDevice` 是允许的（都拿独立 fd），
@@ -70,6 +75,19 @@ class UvcCamera(private val ctx: Context) {
 
         private const val CTRL_TIMEOUT = 2000
         private const val BULK_TIMEOUT = 1000
+
+        /** UVC payload header 最长 12 字节（2 + PTS 4 + SCR 6） */
+        private const val MAX_HDR = 12
+
+        /**
+         * 原厂 libuvc 的 URB 尺寸 = dwMaxVideoFrameSize + 22（日志 frameBufferSize=460822）。
+         * 实测设备一帧 = 460800 + 12B header = 460812，用 22 留 10 字节余量，
+         * 既不会截断、也不会让一个 URB 横跨两帧。
+         */
+        private const val URB_SLACK = 22
+
+        /** 连续多少个无效 URB 就认定"设备在发无效数据"并上报一次 */
+        private const val INVALID_LIMIT = 10
 
         /** 探测设备的视频格式/帧描述符（不 claim 接口，只读描述符），用于诊断 */
         fun describe(usb: UsbManager, device: UsbDevice): String {
@@ -151,11 +169,28 @@ class UvcCamera(private val ctx: Context) {
     private var frameBuf = ByteArray(0)
     private var frameLen = 0
     private var transferBuf = ByteArray(0)
-    private var rawPayloadMode = false            // 设备不带 UVC payload header 时的兜底
+    /** 单帧净荷（不含 UVC header），640x480 YV12 = 460800 */
+    private var frameSize = 0
+    /** URB 尺寸 = frameSize + URB_SLACK（对齐原厂 460822） */
+    private var urbSize = 0
+
+    /** 最近一个有效 header 的长度/标志位，诊断用 */
+    @Volatile private var lastHdrLen = -1
+    @Volatile private var lastHdrInfo = -1
+    /** 连续无效 URB 计数 / 累计 */
+    @Volatile private var invalidStreak = 0
+    @Volatile private var invalidTotal = 0L
+    @Volatile private var invalidReported = false
+
     @Volatile private var lastBitmap: Bitmap? = null
     private var framesInWindow = 0
     private var windowStart = 0L
     @Volatile private var fps = 0f
+
+    // 双缓冲：每帧不再新建 Bitmap（createBitmap 每帧 1.2MB 分配 + 拷贝）
+    private var bmpA: Bitmap? = null
+    private var bmpB: Bitmap? = null
+    private var useA = true
 
     val isOpen: Boolean get() = conn != null
     val isRunning: Boolean get() = running
@@ -164,8 +199,12 @@ class UvcCamera(private val ctx: Context) {
     fun negotiatedInfo(): String {
         val f = format ?: return "not negotiated"
         val fr = frame ?: return "format=$f"
+        val hdr = if (lastHdrLen > 0) " hdr=${lastHdrLen}B/info=0x%02x".format(lastHdrInfo) else ""
+        val bad = if (invalidTotal > 0) " 无效URB=$invalidTotal" else ""
         return "format=${f.name}(idx=${f.index}) ${fr.width}x${fr.height} " +
-            "frameIdx=${fr.index} maxFrame=${fr.maxFrameSize}B interval=${fr.defaultInterval}(=${String.format(Locale.US, "%.1f", fr.fps)}fps)"
+            "frameIdx=${fr.index} maxFrame=${fr.maxFrameSize}B " +
+            "urb=${urbSize}B interval=${fr.defaultInterval}" +
+            "(=${String.format(Locale.US, "%.1f", fr.fps)}fps)$hdr$bad"
     }
 
     /** 找眼镜（优先精确 VID/PID） */
@@ -288,12 +327,20 @@ class UvcCamera(private val ctx: Context) {
             return false
         }
 
-        // 6) 准备缓冲
-        val need = max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height))
-        frameBuf = ByteArray(need + 1024)
-        transferBuf = ByteArray(min(max(need, 64 * 1024) + 1024, 1024 * 1024))
+        // 6) 准备缓冲：URB 对齐原厂 = 单帧净荷 + 22
+        frameSize = max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height))
+        urbSize = frameSize + URB_SLACK
+        frameBuf = ByteArray(frameSize + 64)
+        transferBuf = ByteArray(urbSize)
         frameLen = 0
-        rawPayloadMode = false
+        invalidStreak = 0
+        invalidTotal = 0
+        invalidReported = false
+        lastHdrLen = -1
+        lastHdrInfo = -1
+        bmpA = null
+        bmpB = null
+        Log.i(TAG, "buffers: frameSize=$frameSize urbSize=$urbSize")
         return true
     }
 
@@ -573,13 +620,24 @@ class UvcCamera(private val ctx: Context) {
     }
 
     /**
-     * 读帧循环。每次 bulk 传输 = 一个 UVC payload（header + body），
-     * EOF 位置 1 表示一帧结束。
+     * 读帧循环。
+     *
+     * 真机行为（Frida 抓原厂 libusb，见 docs §8）：URB = frameSize+22，
+     * **一次 bulk 传输就返回一整帧 payload**：`n = 460812`、
+     * `buf[0]=0x0C`（12B header）、`buf[1]` 的 bit1(EOF)=1。
+     *
+     * 判定规则因此很简单也很严格：
+     * - `bHeaderLength` 不在 2..12、或 ERR 位置 1 → 这个 URB 是无效数据，
+     *   **不拼入帧、不解码、不刷屏**（以前的 rawPayloadMode 兜底会把垃圾当图像画 → 彩色噪点）；
+     * - header 合法 → 跳过 header 拼 payload，EOF 置位就交一帧。
+     *
+     * 固件异常时设备的典型症状是"整块灌满 URB"（`n == urbSize`，首字节是亮度值），
+     * 会命中无效分支；连续 [INVALID_LIMIT] 次后回调一次 [Listener.onError]，
+     * 提示眼镜固件状态异常、需要重新上电或重新加载固件。
      */
     private fun readLoop(c: UsbDeviceConnection, ep: UsbEndpoint) {
         val buf = transferBuf
         var timeouts = 0
-        var badHeaders = 0
         while (running) {
             val n = try {
                 c.bulkTransfer(ep, buf, buf.size, BULK_TIMEOUT)
@@ -589,47 +647,123 @@ class UvcCamera(private val ctx: Context) {
             }
             if (n < 0) {
                 timeouts++
-                if (timeouts % 20 == 0) Log.w(TAG, "bulk in timeout x$timeouts (no data)")
+                if (timeouts == 3) Log.w(TAG, "no UVC data yet (1000ms timeout) — device idle?")
+                if (timeouts % 100 == 0) Log.w(TAG, "bulk in timeout x$timeouts (no data)")
                 continue
             }
             if (n == 0) continue
             timeouts = 0
+            dumpUrb(buf, n)
 
-            var off = 0
-            val headerLen = buf[0].toInt() and 0xff
-            if (!rawPayloadMode && (headerLen < 2 || headerLen > 12 || headerLen > n)) {
-                badHeaders++
-                if (badHeaders <= 3) Log.w(TAG, "bad UVC header len=$headerLen (n=$n), switching to raw payload mode")
-                rawPayloadMode = true
+            val hdrLen = buf[0].toInt() and 0xff
+            val hdrInfo = if (n >= 2) buf[1].toInt() and 0xff else 0
+            val errBit = (hdrInfo and 0x40) != 0
+            val hdrOk = hdrLen in 2..MAX_HDR && hdrLen <= n
+            if (!hdrOk || errBit) {
+                onInvalidUrb(n, hdrLen, hdrInfo, if (!hdrOk) "bad header len" else "ERR flag")
+                continue
             }
-            if (rawPayloadMode) {
-                append(buf, 0, n)
-            } else {
-                val info = buf[1].toInt() and 0xff
-                val err = (info and 0x40) != 0
-                val eof = (info and 0x02) != 0
-                val fidToggle = (info and 0x01) != 0
-                if (err) {
-                    Log.w(TAG, "payload error flag set, dropping frame (fid=$fidToggle)")
-                    frameLen = 0
-                    continue
-                }
-                off = headerLen
-                append(buf, off, n - off)
-                if (eof) {
-                    deliver()
-                }
-            }
-            // raw 模式下没有 EOF 标记，靠攒够整帧来判断
-            if (rawPayloadMode) {
-                val need = estimateFrameBytes(
-                    format?.mapping ?: PixelMapping.UNKNOWN, frameWidth, frameHeight
-                )
-                if (frameLen >= need) deliver()
+            invalidStreak = 0
+            lastHdrLen = hdrLen
+            lastHdrInfo = hdrInfo
+            val eof = (hdrInfo and 0x02) != 0
+            append(buf, hdrLen, n - hdrLen)
+            if (eof) {
+                deliver()
+            } else if (frameLen >= frameSize) {
+                // 设备没按 UVC 语义打 EOF：按长度兜底交帧（真机不会走到这里）
+                deliver()
             }
         }
         frameLen = 0
-        Log.i(TAG, "reader stopped")
+        Log.i(TAG, "reader stopped (invalidUrb=$invalidTotal)")
+    }
+
+    /** 无效 URB：丢弃 + 计数；连续太多次就上报一次（绝不再把垃圾画成噪点） */
+    private fun onInvalidUrb(n: Int, hdrLen: Int, hdrInfo: Int, why: String) {
+        invalidStreak++
+        invalidTotal++
+        frameLen = 0
+        if (invalidStreak <= 2) {
+            Log.w(
+                TAG,
+                "invalid UVC payload ($why): n=$n hdrLen=$hdrLen hdrInfo=0x%02x urbSize=$urbSize"
+                    .format(hdrInfo)
+            )
+        }
+        if (invalidStreak == INVALID_LIMIT && !invalidReported) {
+            invalidReported = true
+            val msg = "UVC 数据没有合法 header（连续 $invalidStreak 个 URB，n=$n）：眼镜在发无效数据流，" +
+                "通常是固件状态异常。请给眼镜重新上电，或用「加载固件（引导模式 03E7:2150）」重建一次。"
+            Log.e(TAG, msg)
+            listener?.onError(msg)
+        }
+    }
+
+    // ---- 原始字节抓包（诊断用，和 Frida 抓原厂那套同样格式） ----
+
+    @Volatile private var dumpOs: FileOutputStream? = null
+    @Volatile private var dumpRemaining = 0
+
+    /**
+     * 把接下来 [urbs] 个 bulk 传输的**原始字节**写到 [file]，格式：
+     * 每个 URB 前置 4 字节小端长度，后接原始数据。
+     *
+     * 这是排查"固件状态异常"最快的手段：合法数据里每个 URB 应以
+     * `0C 0F/0E` 开头、长度 460812；异常时会是 `n == urbSize` 且首字节是亮度值。
+     * 拿回 PC 上可以用 `re/liangliang/uvc_frame_decode.py` 直接解析。
+     *
+     * @return 成功打开文件返回 true（数据在 reader 线程里写）
+     */
+    fun startRawDump(file: File, urbs: Int = 30): Boolean {
+        if (!running) {
+            Log.w(TAG, "startRawDump: reader not running")
+            return false
+        }
+        stopRawDump()
+        return try {
+            file.parentFile?.mkdirs()
+            dumpOs = FileOutputStream(file)
+            dumpRemaining = urbs
+            rawDumpPath = file.absolutePath
+            Log.i(TAG, "raw dump -> ${file.absolutePath} ($urbs URBs)")
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "startRawDump failed", t)
+            false
+        }
+    }
+
+    /** 最近一次原始抓包的文件路径（未抓过为 null） */
+    @Volatile var rawDumpPath: String? = null
+        private set
+
+    fun stopRawDump() {
+        try { dumpOs?.close() } catch (ignored: Throwable) {}
+        dumpOs = null
+        dumpRemaining = 0
+    }
+
+    private fun dumpUrb(buf: ByteArray, n: Int) {
+        if (dumpRemaining <= 0) return
+        val os = dumpOs ?: return
+        try {
+            os.write(
+                byteArrayOf(
+                    (n and 0xff).toByte(), ((n shr 8) and 0xff).toByte(),
+                    ((n shr 16) and 0xff).toByte(), ((n shr 24) and 0xff).toByte()
+                )
+            )
+            os.write(buf, 0, n)
+            if (--dumpRemaining == 0) {
+                os.close()
+                dumpOs = null
+                Log.i(TAG, "raw dump finished: $rawDumpPath")
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "dumpUrb failed", t)
+            stopRawDump()
+        }
     }
 
     private fun append(src: ByteArray, off: Int, len: Int) {
@@ -686,16 +820,36 @@ class UvcCamera(private val ctx: Context) {
     // ---- YUV → Bitmap ----
     private var argb = IntArray(0)
 
+    /**
+     * 把 `argb` 交给一张**复用**的 Bitmap（A/B 双缓冲）。
+     *
+     * 以前每帧 `Bitmap.createBitmap(argb, ...)` 都要新分配 1.2 MB 再拷贝一次，
+     * 20 fps 就是 ~24 MB/s 的分配压力。改成双缓冲后每帧零分配。
+     *
+     * 注意：帧率瓶颈不在解码——原厂 libuvc 的回调间隔实测也是 ~50 ms（≈20 fps），
+     * 说明设备本身就按 20 fps 出流（probe 报的 30 fps 是上限），所以两条路都是 20 fps。
+     */
+    private fun bitmapOf(w: Int, h: Int): Bitmap {
+        var b = if (useA) bmpA else bmpB
+        if (b == null || b.width != w || b.height != h) {
+            b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            if (useA) bmpA = b else bmpB = b
+        }
+        b.setPixels(argb, 0, w, 0, 0, w, h)
+        useA = !useA
+        return b
+    }
+
     private fun yv12ToBitmap(src: ByteArray, len: Int, w: Int, h: Int, uFirst: Boolean): Bitmap? {
         val ySize = w * h
         val cSize = ySize / 4
         if (len < ySize + 2 * cSize) return null
-        // YV12: Y | V | U      I420: Y | U | V
+        // YV12: Y | V | U      I420: Y | U | V（真机实测设备发的是 YV12，与原厂画面颜色一致）
         val vOff = if (uFirst) ySize + cSize else ySize
         val uOff = if (uFirst) ySize else ySize + cSize
         if (argb.size != ySize) argb = IntArray(ySize)
         Yuv.yuv420ToArgb(argb, src, uOff, vOff, w, h)
-        return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
+        return bitmapOf(w, h)
     }
 
     private fun nvToBitmap(src: ByteArray, len: Int, w: Int, h: Int, swap: Boolean): Bitmap? {
@@ -703,7 +857,7 @@ class UvcCamera(private val ctx: Context) {
         if (len < ySize + ySize / 2) return null
         if (argb.size != ySize) argb = IntArray(ySize)
         Yuv.nv12ToArgb(argb, src, ySize, w, h, swap)
-        return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
+        return bitmapOf(w, h)
     }
 
     private fun yuy2ToBitmap(src: ByteArray, len: Int, w: Int, h: Int, uyvy: Boolean = false): Bitmap? {
@@ -711,7 +865,7 @@ class UvcCamera(private val ctx: Context) {
         if (len < ySize * 2) return null
         if (argb.size != ySize) argb = IntArray(ySize)
         Yuv.yuy2ToArgb(argb, src, w, h, uyvy)
-        return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888)
+        return bitmapOf(w, h)
     }
 
     // ==================================================================
@@ -771,6 +925,7 @@ class UvcCamera(private val ctx: Context) {
     }
 
     private fun releaseInternal() {
+        stopRawDump()
         val c = conn
         val itf = vsAlt
         if (c != null && itf != null) {
@@ -792,6 +947,8 @@ class UvcCamera(private val ctx: Context) {
         vsEpIn = null
         ownsConnection = false
         lastBitmap = null
+        bmpA = null
+        bmpB = null
         running = false
     }
 }

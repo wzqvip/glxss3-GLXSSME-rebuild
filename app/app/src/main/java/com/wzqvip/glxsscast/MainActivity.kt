@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -26,6 +27,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -46,6 +48,7 @@ class MainActivity : ComponentActivity() {
     private var castInfo by mutableStateOf("未投屏")
     private var fillMode by mutableStateOf(com.wzqvip.glxsscast.cast.CastService.MODE_CROP)
     private var ledOn by mutableStateOf(false)
+    private var showUvc by mutableStateOf(false)
 
     // 「画面调整」：缩放 1.0–2.0，水平/垂直偏移 -1..1（实时改 CastService 静态字段，下一帧生效）
     private var zoom by mutableStateOf(1f)
@@ -234,6 +237,73 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(status, style = MaterialTheme.typography.bodyLarge)
+
+                    Button(
+                        onClick = { showUvc = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("打开摄像头（UVC）") }
+
+                    if (showUvc) {
+                        val cam = com.wzqvip.glxsscast.uvc.rememberUvcCamera()
+                        androidx.compose.ui.window.Dialog(onDismissRequest = {
+                            try { cam.stop(); cam.close() } catch (_: Exception) {}
+                            showUvc = false
+                        }) {
+                            Column(Modifier.fillMaxWidth().padding(8.dp)) {
+                                var uvcErr by remember { mutableStateOf<String>("") }
+                                com.wzqvip.glxsscast.uvc.UvcPreview(
+                                    cam,
+                                    Modifier.fillMaxWidth().height(300.dp),
+                                    onError = { msg: String -> uvcErr = msg }
+                                )
+                                Text(status, style = MaterialTheme.typography.bodySmall)
+                                if (uvcErr.isNotEmpty()) {
+                                    Text(
+                                        "⚠ " + uvcErr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    com.wzqvip.glxsscast.uvc.UvcCaptureButton(cam, Modifier.weight(1f)) { f ->
+                                        status = "已保存: " + f.absolutePath
+                                    }
+                                    Button(
+                                        onClick = {
+                                            val dev = cam.findDevice()
+                                            if (dev == null) status = "未找到眼镜"
+                                            else if (!cam.hasPermission(dev)) { status = "请求设备权限…"; usb.requestPermission(dev) }
+                                            else if (cam.open(dev, usb.connection)) {
+                                                uvcErr = ""
+                                                cam.start()
+                                                status = "摄像头: " + cam.negotiatedInfo()
+                                            } else status = "打开失败: " + (cam.lastError() ?: "")
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("启动/重试") }
+                                }
+                                Button(
+                                    onClick = {
+                                        val dir = java.io.File(
+                                            getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES), "uvc"
+                                        )
+                                        val f = java.io.File(
+                                            dir,
+                                            "uvc_raw_%d.bin".format(System.currentTimeMillis())
+                                        )
+                                        status = if (cam.startRawDump(f, 30))
+                                            "正在抓 30 个 URB → " + f.absolutePath
+                                        else "抓包失败（先点「启动/重试」）"
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) { Text("抓原始 UVC 字节（诊断）") }
+                                Button(
+                                    onClick = { try { cam.stop(); cam.close() } catch (_: Exception) {}; showUvc = false },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) { Text("关闭摄像头") }
+                            }
+                        }
+                    }
                     Text(castInfo, style = MaterialTheme.typography.bodyMedium)
 
                     androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -507,6 +577,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
 
 
 

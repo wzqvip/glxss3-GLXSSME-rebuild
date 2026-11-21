@@ -10,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
@@ -54,15 +55,20 @@ fun rememberUvcCamera(): UvcCamera {
 
 /**
  * 实时预览。用 `AndroidView` 包一个 ImageView，帧到达时直接 `setImageBitmap`，
- * 不走 Compose 重组（否则每帧一次重组，640x480@15fps 会很难看）。
+ * 不走 Compose 重组（否则每帧一次重组，640x480@30fps 会很难看）。
+ *
+ * @param onError 收流侧上报的错误（例如设备在发无效 UVC 数据 → 固件状态异常），
+ *                上层可以显示成一行提示；预览本身不会再把垃圾画成彩色噪点。
  */
 @Composable
 fun UvcPreview(
     camera: UvcCamera,
     modifier: Modifier = Modifier.fillMaxWidth(),
-    scaleType: ImageView.ScaleType = ImageView.ScaleType.FIT_CENTER
+    scaleType: ImageView.ScaleType = ImageView.ScaleType.FIT_CENTER,
+    onError: (String) -> Unit = {}
 ) {
     val holder = remember { mutableStateOf<ImageView?>(null) }
+    val errorSink = rememberUpdatedState(onError)
 
     DisposableEffect(camera) {
         val l = object : UvcCamera.Listener {
@@ -74,6 +80,7 @@ fun UvcPreview(
 
             override fun onError(message: String) {
                 Log.w(TAG, message)
+                errorSink.value(message)
             }
         }
         camera.listener = l

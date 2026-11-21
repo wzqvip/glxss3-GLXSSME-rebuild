@@ -15,6 +15,7 @@
 | **保底回退** | **方案 A**：拷厂商 6 个 `.so` + 生成 153 个 native 声明。可行、已验证符号，但**类名被 .so 写死**，改动成本最高。 |
 | **排除** | **方案 C**：external camera HAL。LG G8 / Pixel 都不声明 `android.hardware.camera.external`，Camera2 也看不到这台设备。 |
 | **新发现（重要）** | 设备实际喂给 App 的很可能是 **未压缩 YV12 640×480**（不是 MJPEG）。见 §1.2 —— 这直接决定了"`BitmapFactory.decodeByteArray` 一条路走不通"。 |
+| **真机已验证（2026-11-21）** | 方案 B 在 LG G8 + 眼镜上跑通：`fps≈20`、YV12 640×480 画面正常。抓包与修复全过程见 **§8**：标准 UVC 1.1 bulk、12B header、一次 transfer 一帧 460812B、YV12=Y\|V\|U；之前的彩色噪点是**眼镜固件挂掉**在灌垃圾流。 |
 
 三个新加的文件：
 
@@ -451,7 +452,7 @@ C:\gradle\gradle-8.9\bin\gradle.bat assembleDebug --no-daemon --console=plain
 
 ---
 
-## 8. 下一步该谁做
+### 7.3 下一步该谁做（历史计划；2026-11-21 已由 §8 完成）
 
 | 谁 | 做什么 |
 |---|---|
@@ -459,6 +460,180 @@ C:\gradle\gradle-8.9\bin\gradle.bat assembleDebug --no-daemon --console=plain
 | **能碰设备的人** | 装 `app-debug.apk` → 连眼镜 → 打开摄像头 → 抓 `adb logcat -s UvcCamera`，把 `VS formats:` / `probe result:` / `fps=` 三行贴回来 |
 | **拿到日志后** | 按 §7 对照表改一个常量重试；若 `VS formats` 里只有未压缩格式，确认 `PixelMapping` 选对 |
 | **长期** | 若要同时投屏 + 摄像头，考虑把 UVC 降到 5fps 或做互斥开关 |
+
+---
+
+## 8. 真机抓包与修复（2026-11-21，已完成）
+
+> 本节是"抓原厂 App 的 UVC 读帧 → 据此修我们 App → 装机实测"的完整记录。
+> 一句话：**设备的帧格式从头到尾都是标准 UVC 1.10 bulk + 12B header + YV12 640×480；
+> 之前的彩色噪点是眼镜固件挂掉、在灌垃圾流**。代码修的是"垃圾流不该被当图像画"和
+> "URB 尺寸要对齐原厂"，另外加了现场自证用的原始抓包。
+
+### 9.1 抓包环境（为什么不在 Pixel 上抓）
+
+眼镜只有一个，插在 LG G8（`192.168.3.88:37003`，LM-G850N，Android 14，Magisk root，
+`/data/local/tmp/frida-server` 17.27.4 已在跑）；Pixel 上 `dumpsys usb` 只有 gadget 事件、
+宿主侧一个设备都没有。好在 LG 上同时装了原厂 `com.llvision.glxss3.camera` 和我们的 App，
+所以直接在 LG 上抓原厂进程 `:llvision_G25`。
+
+原厂 App 的 UVC 栈（`/data/app/*/com.llvision.glxss3.camera*/lib/arm64/`）：
+
+```
+libUVCCamera.so   serenegiant UVCCamera 的厂商 fork（+lcd/hid 初始化）
+libuvc.so         厂商 fork 的 libuvc（多了 uvc_stream_start_bandwidth 等函数）
+libusb100.so      libusb 1.0.19.10903，自带 android usbfs 后端（android_scan_devices）
+liblcd.so/libhid.so/libboot.so/libcommon.so/libyuvto.so/libjpeg-turbo1500.so
+```
+
+hook 的是 **`libusb100.so`**：`libusb_control_transfer`、`libusb_bulk_transfer`、
+`libusb_submit_transfer`、`libusb_set_interface_alt_setting`、`libusb_claim_interface`，
+再对 `struct libusb_transfer`（arm64 偏移 ep=+9 status=+16 length=+20 actual=+24 buf=+48）
+在 transfer 回调上取 `status / actual_length / 前 64 字节`。
+
+工具（都在 `re/liangliang/`，可复用）：
+
+| 文件 | 作用 |
+|---|---|
+| `uvc_hook.js` + `frida_uvc.py` | 文本日志：CLAIM/ALT/CTRL（带 data）/SUBMIT/回调（带 head hex）/每 3 秒统计 |
+| `frida_frame_dump.js` + `frida_frames.py` | 把完成的整帧（460812B）通过 frida `send(payload, data)` 落盘到 host |
+| `uvc_frame_decode.py` | 解析 12B header、打印 Y/C 平面统计、YV12 与 I420 各解一张 PNG |
+
+用法：`adb forward tcp:27042 tcp:27042` → `python frida_uvc.py uvc_cap.log attach com.llvision.glxss3.camera:llvision_G25 60`
+（`spawn` 模式会先挂在主进程，但 `:llvision_G25` 是子进程，attach-by-name 更省事）。
+
+### 9.2 原厂的控制传输序列（34 字节 UVC 1.1 probe）
+
+```
+CLAIM iface=2  → HID（GET_REPORT 0x16 / SET_REPORT）
+CLAIM iface=3  → LCD（GET_INFO 0x04 → 8002900101b40a00；bulk OUT 0x01 每帧 1024016B 屏幕镜像）
+CLAIM iface=0  → VideoControl
+CLAIM iface=1  → VideoStreaming（alt=0 就带 0x81，没有别的 alt）
+GET_CUR(0x81) wValue=0x0100 wIndex=1 wLength=34 → 01 00 01 04 15 16 05 00 ...
+GET_MIN(0x82) / GET_MAX(0x83) 同上
+SET_CUR(0x01) wValue=0x0100 34B      ← probe
+GET_CUR(0x81) 34B                     ← 设备回填
+（libuvc 内部再 uvc_stream_open_ctrl → SET_CUR probe:0 → commit）
+之后纯收流：**没有任何 XU / 厂商私有控制请求**
+```
+
+GET_CUR 回填解析（34B，UVC 1.1 布局）：
+
+| 偏移 | 值 | 含义 |
+|---|---|---|
+| 0..1 | `01 00` | bmHint = 1（dwFrameInterval 有效） |
+| 2 | `01` | bFormatIndex = 1（YV12） |
+| 3 | `04` | bFrameIndex = 4（640×480@30） |
+| 4..7 | `15 16 05 00` | dwFrameInterval = 333333（30 fps 上限） |
+| 18..21 | `00 08 07 00` | dwMaxVideoFrameSize = 460800 |
+| 22..25 | `00 40 00 00` | dwMaxPayloadTransferSize = 16384 |
+
+GET_MAX 回 `dwMaxVideoFrameSize=0x012c7f80 (19693440)`、`maxPayload=0x012c7f8c`
+——即 4128×3104 那一档，说明这两个字段只是"上限"，不能拿来当 URB 尺寸。
+
+### 9.3 收流形态（本次最关键的数据）
+
+原厂 `uvc_stream_start_bandwidth` 打印 `frameBufferSize=460822` 共 3 次，然后：
+
+```
+SUBMIT#1 ep=0x81 type=BULK len=460822 prevActual=460812
+XCB#1 ep=0x81 status=0(COMPLETED) xferLen=460822 actual=460812
+     head=0c0fb4020000b4020000b402 9fa1a4a5a6a6a7a6a7a7aaa8a9a9aaaaab...
+XCB#2 ep=0x81 status=0(COMPLETED) actual=460812  head=0c0eb5020000b5020000b502 a2a3a3a5...
+```
+
+结论：
+
+1. **一次 bulk transfer 就是整整一帧**：`actual_length = 460812 = 460800 + 12`。
+   设备在帧末发一个 12 字节的短包（460812 = 900×512 + 12），URB 因此提前完成——
+   所以 URB 只要 ≥ 460812 就不会截断，原厂取 460822（+22）留余量。
+2. 3 个 URB 轮转（transfer_id 0/1/2），回调间隔 ~50 ms ⇒ **设备实际 20 fps**（30 只是上限）。
+3. header 是标准 **UVC 1.1 12 字节**（PTS + SCR 都在）：
+
+```
+0c 0f | b4 02 00 00 | b4 02 00 00 b4 02
+ │  │    └ PTS(4B LE) = dwPresentationTime = 692
+ │  └ bmHeaderInfo = 0x0F：bit0 FID=1、bit1 EOF=1、bit2 PTS=1、bit3 SCR=1
+ └ bHeaderLength = 12
+    （下一帧 0c 0e …：FID 翻转、PTS 692→693）
+```
+
+4. body `460800 = 640×480×1.5`，**没有 stride padding**（dwMaxVideoFrameSize 正好等于净荷）。
+5. 平面顺序：用 `uvc_frame_decode.py` 把同一帧按 `Y|V|U`(YV12) 和 `Y|U|V`(I420) 各解一张，
+   `Y|V|U` 的桌面木纹是暖棕、白色纸盒干净，与原厂预览一致；`Y|U|V` 整幅偏冷偏蓝。
+   ⇒ 设备发的就是 **YV12 = Y | V | U**（我们的 `PixelMapping.YV12(uFirst=false)` 是对的）。
+
+### 9.4 彩色噪点的真正原因（不是 header 偏移、不是 U/V、不是 stride）
+
+证据链：
+
+1. 旧版日志：`bad UVC header len=138 (n=461824)`。
+   - `461824` 恰好等于当时我们传给 `bulkTransfer` 的缓冲区大小；
+   - `138 (0x8A)` 是一个合理的**亮度值**，不是 header。
+   ⇒ 设备在"把 URB 整块灌满"，根本没有帧边界（正常应是 `n=460812`、首字节 `0x0C`）。
+2. 本次复现同样的"设备侧发疯"状态：原厂 App 3 个 URB 全部 `status=2 (TIMED_OUT)`，
+   5 秒后 `status=1 (ERROR)`，随后的控制传输返回 `-4 (NO_DEVICE)`，dmesg：
+   ```
+   usb 1-1: USB disconnect, device number 3
+   usb 1-1: new high-speed USB device number 2 ... idVendor=03e7, idProduct=2150
+            Product: Movidius MA2X5X      ← Myriad 掉回 ROM 引导模式
+   ```
+   即眼镜的 Myriad 固件挂了（HID 端点同时也开始刷 `input irq status -75`）。
+3. 用 App 里「加载固件（引导模式 03E7:2150）」（`MyriadBootLoader`，把 0x174590 字节镜像灌进 DDR，
+   **不写 flash**）重建后，设备 ~1.3 s 重新枚举回 `2e09:0030`，
+   **原厂 App 立刻出画面**（截图 `re/liangliang/lg_vendor_ok.png`），随后我们的 App 也出画面。
+4. 我们的 App 抓到自己的 `uvc_raw_*.bin` 与原厂 `vendor_frame_*.bin` **形态逐字节一致**
+   （都是 `0c 0f/0e` + 460800B）。
+
+⇒ 噪点 = 固件异常时的无边界垃圾流被"rawPayloadMode 兜底"当成 YV12 画了出来。
+修复方向因此不是改偏移，而是：**不认就不画** + **URB 对齐原厂** + **把异常说清楚**。
+
+### 9.5 代码改动（`uvc/UvcCamera.kt`、`uvc/UvcPreview.kt`、`MainActivity.kt`）
+
+| 改动 | 原因 |
+|---|---|
+| URB 尺寸 = `dwMaxVideoFrameSize + 22`（460822，与原厂一致） | 原来 `max(need,64K)+1024 = 461824`，比一帧大；固件异常时会把整个 URB 灌满，日志里 `n` 恒等于缓冲区大小，反而看不出问题 |
+| 删掉 `rawPayloadMode`，只认合法 header（`bHeaderLength ∈ 2..12` 且 ERR=0） | 兜底会把垃圾画成图像（用户看到的彩色噪点） |
+| 连续 10 个无效 URB → `Listener.onError()`，`UvcPreview` 传 `onError` 到 UI 红字显示 | 把"玄学噪点"变成可操作提示：重新上电 / 重新加载固件 |
+| 新增 `startRawDump(file, urbs)` + 对话框「抓原始 UVC 字节（诊断）」 | 现场自证：每个 URB 应是 `0c 0f/0e` 开头、460812 字节；以后 30 秒就能分清是设备侧还是代码侧 |
+| YV12→ARGB 后改用 A/B 双缓冲 `Bitmap.setPixels` | 去掉每帧 1.2 MB `createBitmap` 分配（20 fps ≈ 24 MB/s）。**帧率不变**，因为设备本身就是 20 fps |
+| `negotiatedInfo()` 带上 `urb=`、`hdr=`、无效 URB 计数 | 截图/日志直接能看到 URB 尺寸与真实 header 位 |
+
+`Yuv.kt` **没有改**：BT.601 有限范围 + YV12 `Y|V|U` 的偏移与实测一致。
+
+### 9.6 真机验证结果
+
+- `gradle assembleDebug` 通过，`adb install -r` 到 LG G8。
+- 我们 App 预览：`fps≈20.0`、状态行 `format=YV12(idx=1) 640x480 frameIdx=4 maxFrame=460800B urb=460822B`，
+  画面正常、颜色正确。
+
+| 我们 App（修复后） | 原厂 App（同一时刻） |
+|---|---|
+| ![ours](img/uvc-ours-preview.jpg) | ![vendor](img/uvc-vendor-preview.jpg) |
+
+同一帧按两种 U/V 顺序解码（左 Y\|V\|U = YV12，右 Y\|U\|V = I420）——只有左边与上面两张实拍一致：
+
+| YV12（Y\|V\|U，正确） | I420（Y\|U\|V，整体偏冷） |
+|---|---|
+| ![yv12](img/uvc-frame-yv12.jpg) | ![i420](img/uvc-frame-i420.jpg) |
+- logcat 关键行：
+  ```
+  UvcCamera: selected: format=YV12(idx=1) 640x480 frameIdx=4 maxFrame=460800B interval=333333(=30.0fps)
+  UvcCamera: buffers: frameSize=460800 urbSize=460822
+  UvcCamera: fps=20.0 (YV12 640x480)
+  UvcCamera: raw dump -> /storage/emulated/0/Android/data/com.wzqvip.glxsscast/files/Pictures/uvc/uvc_raw_*.bin (30 URBs)
+  UvcCamera: raw dump finished
+  ```
+- 抓包大小自证：30 × (460812 + 4B 长度前缀) = 13 824 480 B，与设备上文件大小完全一致。
+- 复原手法（以后还能用）：`am force-stop` 掉抢设备的 App → 启动我们的 App →
+  「加载固件（引导模式 03E7:2150）」→ 等 dmesg 出现 `idVendor=2e09, idProduct=0030` → 「启动/重试」。
+  注意 `svc power stayon true` + 唤醒屏幕，否则 `input tap` 全部无效（这一坑踩了两次）。
+
+### 9.7 还没做 / 下一步
+
+- 投屏（LCD bulk OUT，1 MB/帧）和 UVC 同时开时的带宽：§7 里那条风险还在，未实测。
+- 若要做高分辨率（1920×1080 YV12 = 3 MB/帧）：URB 要按 `dwMaxVideoFrameSize+22` 跟着放大，
+  当前代码是运行时算的，改分辨率只改 `TARGET_W/H` 即可（但仍建议先把带宽实测一遍）。
 
 ---
 
