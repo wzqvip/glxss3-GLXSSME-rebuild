@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -45,6 +46,12 @@ class MainActivity : ComponentActivity() {
     private var castInfo by mutableStateOf("未投屏")
     private var fillMode by mutableStateOf(com.wzqvip.glxsscast.cast.CastService.MODE_CROP)
     private var ledOn by mutableStateOf(false)
+
+    // 「画面调整」：缩放 1.0–2.0，水平/垂直偏移 -1..1（实时改 CastService 静态字段，下一帧生效）
+    private var zoom by mutableStateOf(1f)
+    private var offsetX by mutableStateOf(0f)
+    private var offsetY by mutableStateOf(0f)
+    private var adjustOpen by mutableStateOf(false)
 
     private val projectionManager by lazy {
         getSystemService(android.media.projection.MediaProjectionManager::class.java)
@@ -98,8 +105,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         usb = UsbLink.get(this)
-        fillMode = getSharedPreferences("prefs", MODE_PRIVATE).getInt("mode", fillMode)
+        val prefs = getSharedPreferences("prefs", MODE_PRIVATE)
+        fillMode = prefs.getInt("mode", fillMode)
         com.wzqvip.glxsscast.cast.CastService.fillMode = fillMode
+        zoom = prefs.getFloat("zoom", 1f).coerceIn(1f, 2f)
+        offsetX = prefs.getFloat("ox", 0f).coerceIn(-1f, 1f)
+        offsetY = prefs.getFloat("oy", 0f).coerceIn(-1f, 1f)
+        applyAdjust(zoom, offsetX, offsetY, persist = false)
 
         // UVC 设备需要 CAMERA 权限才会授予 USB 访问
         if (androidx.core.content.ContextCompat.checkSelfPermission(
@@ -154,6 +166,35 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    /**
+     * 画面调整实时生效：写 CastService 静态字段（下一帧映射就用新值，不重启投屏），
+     * 同时把数值持久化到 SharedPreferences（键 zoom/ox/oy）。
+     */
+    private fun applyAdjust(z: Float, ox: Float, oy: Float, persist: Boolean = true) {
+        val zz = z.coerceIn(1f, 2f)
+        val xx = ox.coerceIn(-1f, 1f)
+        val yy = oy.coerceIn(-1f, 1f)
+        zoom = zz
+        offsetX = xx
+        offsetY = yy
+        val cs = com.wzqvip.glxsscast.cast.CastService
+        cs.zoom = zz
+        cs.offsetX = xx
+        cs.offsetY = yy
+        if (persist) {
+            getSharedPreferences("prefs", MODE_PRIVATE).edit()
+                .putFloat("zoom", zz).putFloat("ox", xx).putFloat("oy", yy).apply()
+        }
+    }
+
+    private fun resyncOrientation() {
+        startService(
+            Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java)
+                .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_RESYNC)
+        )
+        status = "已请求重新适配屏幕方向"
+    }
+
     private fun sendAsync(payload: ByteArray) {
         if (busy) return
         busy = true
@@ -198,8 +239,9 @@ class MainActivity : ComponentActivity() {
                     androidx.compose.runtime.LaunchedEffect(Unit) {
                         while (true) {
                             castInfo = if (com.wzqvip.glxsscast.cast.CastService.running) {
-                                "投屏中: %.1f fps, 累计 %d 帧".format(
+                                "投屏中: %.1f fps · 抓取 %s · 累计 %d 帧".format(
                                     com.wzqvip.glxsscast.cast.CastService.fps,
+                                    com.wzqvip.glxsscast.cast.CastService.captureDesc.ifEmpty { "?" },
                                     com.wzqvip.glxsscast.cast.CastService.frames
                                 )
                             } else {
@@ -233,6 +275,69 @@ class MainActivity : ComponentActivity() {
                         enabled = usb.isOpen,
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("开始投屏（实时镜像）") }
+
+                    // ---- 画面调整（可折叠）：实时微调位置/缩放，值持久化 ----
+                    Button(
+                        onClick = { adjustOpen = !adjustOpen },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            (if (adjustOpen) "▾ " else "▸ ") +
+                                "画面调整（缩放 %.2f×，偏移 %+.2f / %+.2f）"
+                                    .format(zoom, offsetX, offsetY)
+                        )
+                    }
+
+                    if (adjustOpen) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                "缩放 %.2f×（1.0 = 原始裁切，2.0 = 放大一倍）".format(zoom),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Slider(
+                                value = zoom,
+                                onValueChange = { applyAdjust(it, offsetX, offsetY, persist = false) },
+                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
+                                valueRange = 1f..2f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Text(
+                                "水平偏移 %+.2f（0 = 居中，向左/右微调）".format(offsetX),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Slider(
+                                value = offsetX,
+                                onValueChange = { applyAdjust(zoom, it, offsetY, persist = false) },
+                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
+                                valueRange = -1f..1f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Text(
+                                "垂直偏移 %+.2f（0 = 居中，向上/下微调）".format(offsetY),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Slider(
+                                value = offsetY,
+                                onValueChange = { applyAdjust(zoom, offsetX, it, persist = false) },
+                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
+                                valueRange = -1f..1f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { applyAdjust(1f, 0f, 0f) },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("重置") }
+                                Button(
+                                    onClick = { resyncOrientation() },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("重新适配方向") }
+                            }
+                        }
+                    }
 
                     Button(
                         onClick = {

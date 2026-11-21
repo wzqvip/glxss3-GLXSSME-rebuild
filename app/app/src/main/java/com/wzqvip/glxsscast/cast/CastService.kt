@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -16,16 +17,25 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
+import android.view.Display
 import android.view.WindowManager
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.usb.UsbLink
+import java.nio.ByteBuffer
 
 /**
- * 实时投屏：MediaProjection → VirtualDisplay(宽 640、高按手机屏比例) → ImageReader(RGBA)
- * → 行映射到 640×400 → 16B 头 + 1,024,000B → USB bulk。
+ * 实时投屏：MediaProjection → VirtualDisplay（宽高比 = 当前屏幕方向）→ ImageReader(RGBA)
+ * → 映射到 640×400 → 16B 头 + 1,024,000B → USB bulk。
  *
- * 画面模式：0=适应(黑边) 1=裁剪(填满) 2=拉伸(填满)；运行中切换会立即重建管线。
+ * 画面模式：0=适应(黑边) 1=裁剪(填满, cover) 2=拉伸(填满)。
+ *
+ * 横屏黑边修复：
+ *  - VirtualDisplay 尺寸在创建/旋转时都按「当前屏幕」的宽高比算，避免系统在抓取图里 letterbox；
+ *  - 屏幕方向变化时用 `VirtualDisplay.setSurface()` + `resize()` 换到新的 ImageReader
+ *    （Android 14+ 不允许同一个 MediaProjection 建第二个 VirtualDisplay，所以不能重建）；
+ *  - 裁剪模式用 cover：scale = max(640/w, 400/h)，再叠加「画面调整」的 zoom/offset，
+ *    对任意抓取尺寸（包括 resize 失败后残留的 letterbox 图）都居中填满。
  */
 class CastService : Service() {
 
@@ -33,6 +43,7 @@ class CastService : Service() {
         const val ACTION_START = "com.wzqvip.glxsscast.START"
         const val ACTION_STOP = "com.wzqvip.glxsscast.STOP"
         const val ACTION_SET_MODE = "com.wzqvip.glxsscast.SET_MODE"
+        const val ACTION_RESYNC = "com.wzqvip.glxsscast.RESYNC"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_MODE = "mode"
@@ -51,6 +62,17 @@ class CastService : Service() {
         @Volatile var lastError = ""; private set
         @Volatile var fillMode = MODE_CROP
 
+        /** 当前抓取尺寸，UI 展示 / 排障用 */
+        @Volatile var captureDesc = ""; private set
+
+        // ---- 画面调整（静态字段，UI 直接改，下一帧映射生效，不用重启投屏）----
+        /** 缩放 1.0–2.0（1.0 = cover 原始裁切） */
+        @Volatile var zoom = 1f
+        /** 水平偏移 -1..1（归一化；映射时 = offset * 源宽 / 2，再做 clamp） */
+        @Volatile var offsetX = 0f
+        /** 垂直偏移 -1..1（归一化；映射时 = offset * 源高 / 2，再做 clamp） */
+        @Volatile var offsetY = 0f
+
         fun modeName(m: Int) = when (m) {
             MODE_FIT -> "适应(黑边)"
             MODE_STRETCH -> "拉伸(填满)"
@@ -63,6 +85,7 @@ class CastService : Service() {
     private var imageReader: ImageReader? = null
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
     private lateinit var usb: UsbLink
 
     private var sending = false
@@ -71,6 +94,7 @@ class CastService : Service() {
 
     private var rgbaBuf: ByteArray? = null
     private var frameBuf: ByteArray? = null
+    private var rowScratch: ByteArray? = null
     private var captureW = LcdProtocol.WIDTH
     private var captureH = LcdProtocol.HEIGHT
 
@@ -83,6 +107,11 @@ class CastService : Service() {
     override fun onCreate() {
         super.onCreate()
         usb = UsbLink.get(this)
+        // 服务可能先于 Activity 起来：先从 SharedPreferences 恢复画面调整
+        val sp = getSharedPreferences("prefs", MODE_PRIVATE)
+        zoom = sp.getFloat("zoom", 1f).coerceIn(1f, 2f)
+        offsetX = sp.getFloat("ox", 0f).coerceIn(-1f, 1f)
+        offsetY = sp.getFloat("oy", 0f).coerceIn(-1f, 1f)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -99,6 +128,12 @@ class CastService : Service() {
                 // 不能重建管线；抓取尺寸固定，模式只在行映射时应用（下一帧生效）。
                 fillMode = m
                 lastError = "画面模式: ${modeName(m)}"
+            }
+            ACTION_RESYNC -> {
+                // 手动重新按当前屏幕方向适配抓取尺寸（DisplayListener 漏掉时兜底）
+                val hd = handler
+                if (hd != null && running) hd.post { applyScreenSize() }
+                else lastError = "未投屏，无法重新适配方向"
             }
             ACTION_START -> {
                 val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -131,7 +166,17 @@ class CastService : Service() {
         }
     }
 
+    /** 当前屏幕（默认显示器）的真实像素尺寸，随旋转变化 */
     private fun screenSize(): Pair<Int, Int> {
+        runCatching {
+            val dm = getSystemService(DisplayManager::class.java)
+            val d = dm?.getDisplay(Display.DEFAULT_DISPLAY)
+            if (d != null) {
+                val p = Point()
+                d.getRealSize(p)
+                if (p.x > 0 && p.y > 0) return p.x to p.y
+            }
+        }
         return if (Build.VERSION.SDK_INT >= 30) {
             val wm = getSystemService(WindowManager::class.java)
             val b = wm.currentWindowMetrics.bounds
@@ -139,6 +184,21 @@ class CastService : Service() {
         } else {
             val dm = resources.displayMetrics
             dm.widthPixels to dm.heightPixels
+        }
+    }
+
+    /**
+     * 抓取尺寸：保持与屏幕当前方向相同的宽高比，这样系统不会在抓取图里 letterbox。
+     * 竖屏（h >= w）：宽固定 640，高按比例；横屏（w > h）：高固定 400（=目标高），宽按比例。
+     */
+    private fun captureSizeFor(sw: Int, sh: Int): Pair<Int, Int> {
+        if (sw <= 0 || sh <= 0) return LcdProtocol.WIDTH to LcdProtocol.HEIGHT
+        return if (sh >= sw) {
+            val h = (LcdProtocol.WIDTH.toLong() * sh / sw).toInt().coerceIn(64, 4096)
+            LcdProtocol.WIDTH to h
+        } else {
+            val w = (LcdProtocol.HEIGHT.toLong() * sw / sh).toInt().coerceIn(64, 4096)
+            w to LcdProtocol.HEIGHT
         }
     }
 
@@ -181,19 +241,22 @@ class CastService : Service() {
         }
 
         createPipeline()
+        registerDisplayListener()
         running = true
         countWindow = 0
         windowStart = System.currentTimeMillis()
-        Log.i(TAG, "casting started mode=$fillMode")
+        Log.i(TAG, "casting started mode=$fillMode capture=${captureW}x$captureH")
     }
 
-    /** 按当前 fillMode 创建 ImageReader + VirtualDisplay */
+    /** 按当前屏幕方向创建 ImageReader + VirtualDisplay（只在开始投屏时调用一次） */
     private fun createPipeline() {
         val mp = projection ?: throw IllegalStateException("no projection")
         val hd = handler ?: throw IllegalStateException("no handler")
         val (sw, sh) = screenSize()
-        captureW = LcdProtocol.WIDTH
-        captureH = (LcdProtocol.WIDTH.toLong() * sh / sw).toInt().coerceIn(64, 4000)
+        val (w, h) = captureSizeFor(sw, sh)
+        captureW = w
+        captureH = h
+        captureDesc = "${captureW}×${captureH}"
 
         val reader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 2)
         imageReader = reader
@@ -205,6 +268,80 @@ class CastService : Service() {
             reader.surface, null, hd
         )
         Log.i(TAG, "pipeline ${captureW}x$captureH mode=$fillMode")
+    }
+
+    /** 屏幕旋转 / 尺寸变化：换 ImageReader，并 resize 已有的 VirtualDisplay */
+    private fun registerDisplayListener() {
+        val hd = handler ?: return
+        val dm = getSystemService(DisplayManager::class.java) ?: return
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = Unit
+            override fun onDisplayRemoved(displayId: Int) = Unit
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != Display.DEFAULT_DISPLAY) return
+                val h = handler ?: return
+                // 等系统把旋转后的显示尺寸稳定下来再处理
+                h.postDelayed({ applyScreenSize() }, 250)
+            }
+        }
+        dm.registerDisplayListener(listener, hd)
+        displayListener = listener
+    }
+
+    /**
+     * 把抓取尺寸对齐到当前屏幕方向。必须在 cast 线程（handler）上执行，
+     * 这样和 onFrame 的 surface 换手是串行的。
+     */
+    private fun applyScreenSize() {
+        if (!running) return
+        val vd = virtualDisplay ?: return
+        val hd = handler ?: return
+        val (sw, sh) = screenSize()
+        val (nw, nh) = captureSizeFor(sw, sh)
+        if (nw == captureW && nh == captureH) return
+
+        val oldReader = imageReader
+        val oldW = captureW
+        val oldH = captureH
+        val newReader = try {
+            ImageReader.newInstance(nw, nh, PixelFormat.RGBA_8888, 2)
+        } catch (e: Exception) {
+            lastError = "旋转: 新建 ImageReader ${nw}×$nh 失败: ${e.message}"
+            return
+        }
+        newReader.setOnImageAvailableListener({ r -> onFrame(r) }, hd)
+
+        try {
+            vd.setSurface(newReader.surface)
+            vd.resize(nw, nh, 1)
+        } catch (e: Exception) {
+            // 退化：保持原抓取尺寸，用户可用「画面调整」的 zoom/offset 手动补偿
+            try {
+                if (oldReader != null) vd.setSurface(oldReader.surface)
+                vd.resize(oldW, oldH, 1)
+            } catch (_: Exception) {
+            }
+            try {
+                newReader.setOnImageAvailableListener(null, null)
+                newReader.close()
+            } catch (_: Exception) {
+            }
+            lastError = "旋转: resize 到 ${nw}×$nh 失败，保持 ${oldW}×$oldH（可用画面调整补偿）"
+            Log.w(TAG, "resize to ${nw}x$nh failed", e)
+            return
+        }
+
+        imageReader = newReader
+        captureW = nw
+        captureH = nh
+        captureDesc = "${nw}×$nh"
+        try {
+            oldReader?.setOnImageAvailableListener(null, null)
+            oldReader?.close()
+        } catch (_: Exception) {
+        }
+        lastError = "已适配屏幕方向: 抓取 ${nw}×$nh"
+        Log.i(TAG, "capture resized ${nw}x$nh (screen ${sw}x$sh)")
     }
 
     private fun destroyPipeline() {
@@ -229,40 +366,22 @@ class CastService : Service() {
             null
         } ?: return
         try {
+            // 旋转换过 reader 后，旧 reader 的残留帧直接丢弃
+            if (r !== imageReader) return
             if (sending) return
             sending = true
             val w = img.width
             val h = img.height
             val plane = img.planes[0]
             val buf = plane.buffer
+            val dst = rgbaBuf ?: return
             val rowStride = plane.rowStride
             val pixelStride = plane.pixelStride
-            val rowBytes = minOf(w * pixelStride, rowStride)
-            val dst = rgbaBuf ?: return
-            val dstW = LcdProtocol.WIDTH
-            val dstH = LcdProtocol.HEIGHT
-            val dstRow = dstW * 4
-
-            fun copyRow(srcRow: Int, dstRowIdx: Int) {
-                if (srcRow < 0 || srcRow >= h) return
-                buf.position(srcRow * rowStride)
-                val n = minOf(rowBytes, buf.remaining(), dst.size - dstRowIdx * dstRow)
-                if (n > 0) buf.get(dst, dstRowIdx * dstRow, n)
-            }
 
             when (fillMode) {
-                MODE_STRETCH -> for (y in 0 until dstH) copyRow(y * h / dstH, y)
-                MODE_CROP -> {
-                    val keep = minOf(dstH, h)
-                    val startRow = ((h - keep) / 2).coerceAtLeast(0)
-                    for (y in 0 until dstH) copyRow(startRow + (y.toLong() * keep / dstH).toInt(), y)
-                }
-                else -> {
-                    java.util.Arrays.fill(dst, 0)
-                    val contentH = (dstW.toLong() * h / w).toInt().coerceAtMost(dstH)
-                    val top = (dstH - contentH) / 2
-                    for (y in 0 until contentH) copyRow(y * h / contentH, top + y)
-                }
+                MODE_STRETCH -> mapStretch(buf, w, h, rowStride, pixelStride, dst)
+                MODE_FIT -> mapFit(buf, w, h, rowStride, pixelStride, dst)
+                else -> mapCover(buf, w, h, rowStride, pixelStride, dst)
             }
 
             val fb = frameBuf ?: return
@@ -288,8 +407,121 @@ class CastService : Service() {
         }
     }
 
+    /** 拉伸：忽略比例，把整幅图铺满 640×400 */
+    private fun mapStretch(
+        buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
+    ) {
+        val dstW = LcdProtocol.WIDTH
+        val dstH = LcdProtocol.HEIGHT
+        val dstRow = dstW * 4
+        val rowBytes = minOf(w * pixelStride, rowStride)
+        for (y in 0 until dstH) {
+            val srcRow = y * h / dstH
+            buf.position(srcRow * rowStride)
+            val n = minOf(rowBytes, buf.remaining(), dst.size - y * dstRow)
+            if (n > 0) buf.get(dst, y * dstRow, n)
+        }
+    }
+
+    /** 适应：等比缩放后上下留黑边（老行为） */
+    private fun mapFit(
+        buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
+    ) {
+        val dstW = LcdProtocol.WIDTH
+        val dstH = LcdProtocol.HEIGHT
+        val dstRow = dstW * 4
+        val rowBytes = minOf(w * pixelStride, rowStride)
+        java.util.Arrays.fill(dst, 0)
+        val contentH = (dstW.toLong() * h / w).toInt().coerceAtMost(dstH)
+        val top = (dstH - contentH) / 2
+        for (y in 0 until contentH) {
+            val srcRow = y * h / contentH
+            buf.position(srcRow * rowStride)
+            val n = minOf(rowBytes, buf.remaining(), dst.size - (top + y) * dstRow)
+            if (n > 0) buf.get(dst, (top + y) * dstRow, n)
+        }
+    }
+
+    /**
+     * 裁剪(填满)：cover 变换 —— scale = max(dstW/w, dstH/h) * zoom，
+     * 居中裁剪，再叠加归一化偏移（以源图像素为单位 = offset * 源宽/高 / 2），
+     * 采样坐标 clamp 到图内，因此任何抓取尺寸都不会留黑边/越界。
+     */
+    private fun mapCover(
+        buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
+    ) {
+        if (w <= 0 || h <= 0) return
+        val dstW = LcdProtocol.WIDTH
+        val dstH = LcdProtocol.HEIGHT
+        val dstRow = dstW * 4
+
+        val z = zoom.coerceIn(1f, 4f)
+        val scale = maxOf(dstW.toFloat() / w, dstH.toFloat() / h) * z
+        // cover 保证 srcW <= w、srcH <= h
+        val srcW = (dstW / scale).coerceIn(1f, w.toFloat())
+        val srcH = (dstH / scale).coerceIn(1f, h.toFloat())
+        val maxLeft = (w - srcW).coerceAtLeast(0f)
+        val maxTop = (h - srcH).coerceAtLeast(0f)
+
+        val cx = w / 2f + offsetX.coerceIn(-1f, 1f) * w * 0.5f
+        val cy = h / 2f + offsetY.coerceIn(-1f, 1f) * h * 0.5f
+        val left = (cx - srcW / 2f).coerceIn(0f, maxLeft)
+        val top = (cy - srcH / 2f).coerceIn(0f, maxTop)
+
+        // 每列采样源 x（预计算，逐像素只做索引）
+        val xs = IntArray(dstW) { x ->
+            (left + (x + 0.5f) * srcW / dstW).toInt().coerceIn(0, w - 1)
+        }
+        val rowBytes = minOf(w * pixelStride, rowStride)
+        var scratch = rowScratch
+        if (scratch == null || scratch.size < rowBytes) {
+            scratch = ByteArray(rowBytes)
+            rowScratch = scratch
+        }
+
+        var lastSy = -1
+        for (y in 0 until dstH) {
+            val sy = (top + (y + 0.5f) * srcH / dstH).toInt().coerceIn(0, h - 1)
+            if (sy != lastSy) {
+                buf.position(sy * rowStride)
+                val n = minOf(rowBytes, buf.remaining())
+                buf.get(scratch, 0, n)
+                lastSy = sy
+            }
+            val o = y * dstRow
+            var si = o
+            if (pixelStride == 4) {
+                for (x in 0 until dstW) {
+                    val s = xs[x] shl 2
+                    dst[si] = scratch[s]
+                    dst[si + 1] = scratch[s + 1]
+                    dst[si + 2] = scratch[s + 2]
+                    dst[si + 3] = scratch[s + 3]
+                    si += 4
+                }
+            } else {
+                for (x in 0 until dstW) {
+                    val s = xs[x] * pixelStride
+                    dst[si] = scratch[s]
+                    dst[si + 1] = if (s + 1 < rowBytes) scratch[s + 1] else 0
+                    dst[si + 2] = if (s + 2 < rowBytes) scratch[s + 2] else 0
+                    dst[si + 3] = if (s + 3 < rowBytes) scratch[s + 3] else 255.toByte()
+                    si += 4
+                }
+            }
+        }
+    }
+
     private fun stopCasting() {
         running = false
+        try {
+            val dl = displayListener
+            if (dl != null) {
+                getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(dl)
+            }
+        } catch (_: Exception) {
+        }
+        displayListener = null
         destroyPipeline()
         try {
             projection?.unregisterCallback(projectionCallback)
@@ -297,6 +529,7 @@ class CastService : Service() {
         } catch (_: Exception) {
         }
         projection = null
+        captureDesc = ""
         thread?.quitSafely()
         thread = null
         handler = null
@@ -310,5 +543,3 @@ class CastService : Service() {
         super.onDestroy()
     }
 }
-
-
