@@ -1,6 +1,6 @@
-# GLXSS3 投屏协议研究 / GLXSS3 Cast Protocol Research
+# 亮亮视野 Glxss Me GLXSS3 投屏协议研究 / GLXSS3 Cast Protocol Research
 
-> 对 **亮亮视野 LLVision GLXSS3（G25）AR 眼镜** Android App（`com.llvision.glxss3.camera` v2.3.7）
+> 对 **亮亮视野 LLVision GLXSS3（G25）AR 眼镜 (Glxss Me) ** Android App（`com.llvision.glxss3.camera` v2.3.7）
 > 的**互操作性**研究：它如何把手机画面"投屏"到眼镜，以及协议细节。
 >
 > A study of the screen-casting ("投屏") protocol used by the LLVision GLXSS3 (G25) AR glasses
