@@ -660,7 +660,16 @@ class UvcCamera(private val ctx: Context) {
             val errBit = (hdrInfo and 0x40) != 0
             val hdrOk = hdrLen in 2..MAX_HDR && hdrLen <= n
             if (!hdrOk || errBit) {
-                onInvalidUrb(n, hdrLen, hdrInfo, if (!hdrOk) "bad header len" else "ERR flag")
+                // UVC 允许一个 URB 从帧中间开始（没有 header，例如流刚启动/跨 URB）：
+                // 当作裸 YV12 payload 继续拼，攒够 frameSize 就交帧 —— 之前整包丢弃
+                // 会导致只要错位一次就永远没有画面。
+                append(buf, 0, n)
+                if (frameLen >= frameSize) deliver()
+                invalidStreak++
+                invalidTotal++
+                if (invalidStreak <= 2) {
+                    Log.w(TAG, "raw URB (no header): n=$n first=0x%02x len=$frameLen".format(buf[0].toInt() and 0xff))
+                }
                 continue
             }
             invalidStreak = 0
@@ -952,3 +961,4 @@ class UvcCamera(private val ctx: Context) {
         running = false
     }
 }
+
