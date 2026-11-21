@@ -168,6 +168,8 @@ class UvcCamera(private val ctx: Context) {
     // ---- 帧缓冲/统计 ----
     private var frameBuf = ByteArray(0)
     private var frameLen = 0
+    @Volatile private var inSync = false
+    @Volatile private var unalignedDrop = 0
     private var transferBuf = ByteArray(0)
     /** 单帧净荷（不含 UVC header），640x480 YV12 = 460800 */
     private var frameSize = 0
@@ -660,15 +662,18 @@ class UvcCamera(private val ctx: Context) {
             val errBit = (hdrInfo and 0x40) != 0
             val hdrOk = hdrLen in 2..MAX_HDR && hdrLen <= n
             if (!hdrOk || errBit) {
-                // UVC 允许一个 URB 从帧中间开始（没有 header，例如流刚启动/跨 URB）：
-                // 当作裸 YV12 payload 继续拼，攒够 frameSize 就交帧 —— 之前整包丢弃
-                // 会导致只要错位一次就永远没有画面。
-                append(buf, 0, n)
-                if (frameLen >= frameSize) deliver()
-                invalidStreak++
-                invalidTotal++
-                if (invalidStreak <= 2) {
-                    Log.w(TAG, "raw URB (no header): n=$n first=0x%02x len=$frameLen".format(buf[0].toInt() and 0xff))
+                // 没有合法 header：
+                //  - 已经同步到某帧内（续传）→ 追加
+                //  - 未同步（流从帧中间开始）→ 丢弃，等下一个 0x0C 开头的新帧
+                // 之前无条件追加会让整帧永久错位 → 彩色噪点。
+                if (inSync) {
+                    append(buf, 0, n)
+                    if (frameLen >= frameSize) { deliver(); inSync = false }
+                } else {
+                    unalignedDrop++
+                    if (unalignedDrop % 50 == 1) {
+                        Log.w(TAG, "skip unaligned URB n=$n first=0x%02x".format(buf[0].toInt() and 0xff))
+                    }
                 }
                 continue
             }
@@ -676,9 +681,11 @@ class UvcCamera(private val ctx: Context) {
             lastHdrLen = hdrLen
             lastHdrInfo = hdrInfo
             val eof = (hdrInfo and 0x02) != 0
+            if (!inSync) { frameLen = 0; inSync = true }
             append(buf, hdrLen, n - hdrLen)
             if (eof) {
                 deliver()
+                inSync = false
             } else if (frameLen >= frameSize) {
                 // 设备没按 UVC 语义打 EOF：按长度兜底交帧（真机不会走到这里）
                 deliver()
@@ -961,4 +968,5 @@ class UvcCamera(private val ctx: Context) {
         running = false
     }
 }
+
 
