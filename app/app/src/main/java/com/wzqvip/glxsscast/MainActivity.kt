@@ -108,6 +108,12 @@ class MainActivity : ComponentActivity() {
         ) {
             requestPermissions(arrayOf(android.Manifest.permission.CAMERA), 1)
         }
+        if (androidx.core.content.ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.RECORD_AUDIO
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 2)
+        }
 
         androidx.core.content.ContextCompat.registerReceiver(
             this, permissionReceiver, IntentFilter(UsbLink.ACTION_PERMISSION),
@@ -351,18 +357,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("播放测试音（眼镜扬声器）") }
 
-                    Button(
-                        onClick = {
-                            usb.connection?.let { c ->
-                                val on = !ledOn
-                                ledOn = on
-                                status = if (com.wzqvip.glxsscast.lcd.LcdControl.setLed(c, on))
-                                    (if (on) "LED 开" else "LED 关") else "LED 控制失败"
-                            } ?: run { status = "未连接" }
-                        },
-                        enabled = usb.isOpen,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text(if (ledOn) "LED 指示灯：开" else "LED 指示灯：关") }
+
 
                     Button(
                         onClick = { usb.close(); status = "已断开" },
@@ -379,6 +374,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 
 
 
