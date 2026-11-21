@@ -257,11 +257,7 @@ class MainActivity : ComponentActivity() {
 
                     if (showUvc) {
                         val cam = com.wzqvip.glxsscast.uvc.rememberUvcCamera()
-                        androidx.compose.ui.window.Dialog(onDismissRequest = {
-                            try { cam.stop(); cam.close() } catch (_: Exception) {}
-                            showUvc = false
-                        }) {
-                            Column(Modifier.fillMaxWidth().padding(8.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(4.dp)) {
                                 var uvcErr by remember { mutableStateOf<String>("") }
                                 com.wzqvip.glxsscast.uvc.UvcPreview(
                                     cam,
@@ -285,7 +281,7 @@ class MainActivity : ComponentActivity() {
                                             val dev = cam.findDevice()
                                             if (dev == null) status = "未找到眼镜"
                                             else if (!cam.hasPermission(dev)) { status = "请求设备权限…"; usb.requestPermission(dev) }
-                                            else if (cam.open(dev, usb.connection)) {
+                                            else if (cam.open(dev, null)) {
                                                 uvcErr = ""
                                                 cam.start()
                                                 status = "摄像头: " + cam.negotiatedInfo()
@@ -314,7 +310,6 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.fillMaxWidth()
                                 ) { Text("关闭摄像头") }
                             }
-                        }
                     }
                     Text(castInfo, style = MaterialTheme.typography.bodyMedium)
 
@@ -600,6 +595,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 
 
 
