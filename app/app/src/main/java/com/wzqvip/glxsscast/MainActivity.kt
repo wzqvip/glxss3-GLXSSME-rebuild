@@ -376,9 +376,11 @@ class MainActivity : ComponentActivity() {
                                     status = "缺少固件文件: " + img
                                 } else {
                                     status = "正在加载固件…"
-                                    com.wzqvip.glxsscast.usb.BootLoader.flash(this@MainActivity, bootDev, img, key) { ok, msg ->
-                                        runOnUiThread { status = msg }
-                                    }
+                                    com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(
+                                        this@MainActivity, bootDev, img,
+                                        { p, m -> runOnUiThread { status = "$p% $m" } },
+                                        { ok, msg -> runOnUiThread { status = msg } }
+                                    )
                                 }
                             }
                         },
@@ -400,6 +402,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 
 
 
