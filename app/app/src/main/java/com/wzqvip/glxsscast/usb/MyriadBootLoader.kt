@@ -35,12 +35,11 @@ object MyriadBootLoader {
         val len = minOf(ENC_LEN, out.size - start)
         if (len <= 0) return out
         return try {
-            val cipher = Cipher.getInstance("AES/ECB/PKCS5Padding")
+            val cipher = Cipher.getInstance("AES/ECB/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(AES_KEY, "AES"))
             val plain = cipher.doFinal(out, start, len)
             System.arraycopy(plain, 0, out, start, plain.size)
-            // 去掉填充后剩余部分清零（设备按容器长度忽略尾部）
-            for (i in start + plain.size until out.size) out[i] = 0
+            // 保留完整 0x80000 字节（含 PKCS#7 填充字节），总长 = 0x174590
             Log.i(TAG, "decrypted tail: cipher=$len plain=${plain.size}")
             out
         } catch (e: Exception) {
@@ -107,3 +106,4 @@ object MyriadBootLoader {
         }.start()
     }
 }
+
