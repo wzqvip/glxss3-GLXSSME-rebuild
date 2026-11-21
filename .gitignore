@@ -25,3 +25,12 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Android / Gradle
+app/.gradle/
+app/build/
+app/local.properties
+app/.idea/
+*.keystore
+*.jks
+app/app/build/
