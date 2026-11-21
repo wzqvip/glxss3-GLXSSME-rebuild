@@ -200,7 +200,7 @@ bmHint=1  fmt=1 frm=4  333333(30fps)   460800B       16384
 
 ## 5. 代码修复（`glxss3-touying`）
 
-### 5.1 `usb/UsbLink.kt`：claim HID 接口
+### 5.1 `usb/UsbLink.kt`：claim HID 接口（并按需重新 claim）
 
 卡死排查中发现的**真实 bug**：HID 接口被内核 `hid-generic` 占着时，
 `0xA1/0x17`（读真实固件版本）和 `0xA1/0x16`（HID 报告）都返回 **-1**。
@@ -211,6 +211,15 @@ bmHint=1  fmt=1 frm=4  333333(30fps)   460800B       16384
 修复后：读取真实固件版本 → "G25_MainFW_1.9.1" (ret=24)
 ```
 （与 `re/liangliang/vendor_now1.log` 里原厂启动就 `CLAIM iface=2` 一致。）
+
+**进阶发现（实测）**：usbfs 的 claim 是**按 fd** 的。`UvcCamera` 用自己的连接
+`claimInterface(hid, force=true)` 会把 HID 接口从 `UsbLink` 的连接上抢走；UVC 关掉后
+`UsbLink` 的 `0x17` 又会变成 -1（实测：先开 UVC 再关，读版本失败）。
+所以 `UsbLink.ensureHid()` 在每次读版本/轮询前**重新 claim**：
+
+```
+UVC 开着 → 关掉 → 读版本：ensureHid() 重新 claim → "G25_MainFW_1.9.1" ✅
+```
 
 ### 5.2 `lcd/LcdControl.kt` + `MainActivity.kt`：开屏必须显式发 `0xA1/0x03`
 

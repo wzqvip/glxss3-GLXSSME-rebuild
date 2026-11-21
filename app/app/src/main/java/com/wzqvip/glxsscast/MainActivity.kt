@@ -535,8 +535,11 @@ class MainActivity : ComponentActivity() {
                     Button(
                         onClick = {
                             usb.connection?.let { c ->
+                                // HID 接口的 claim 是"按 fd"的：UvcCamera 用自己的连接 force claim 会抢走它，
+                                // 关掉 UVC 后 0xA1/0x17 会重新变成 -1 → 先 ensureHid()
+                                usb.ensureHid()
                                 val v = LcdControl.getFirmwareVersion(c)
-                                status = if (v.isNullOrBlank()) "读固件版本失败" else "真实固件版本: " + v
+                                status = if (v.isNullOrBlank()) "读固件版本失败（HID 接口被占用？）" else "真实固件版本: " + v
                             } ?: run { status = "未连接" }
                         },
                         enabled = usb.isOpen,

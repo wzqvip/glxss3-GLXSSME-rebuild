@@ -108,21 +108,39 @@ class UsbLink private constructor(private val ctx: Context) {
         }
         // 2) 顺带摘掉内核 hid-generic 对 HID 接口(2) 的占用：原厂 App 启动时同样 claim iface2。
         //    不摘的话内核会持续打 `input irq status -75`，且 0xA1/0x16（HID 报告）/0xA1/0x17（固件版本）返回 -1。
-        for (i in 0 until dev.interfaceCount) {
-            val h = dev.getInterface(i)
-            if (h.interfaceClass == UsbConstants.USB_CLASS_HID) {
-                val ok = c.claimInterface(h, true)
-                if (ok) hid = h
-                Log.i(TAG, "claim HID if=${h.id} -> $ok")
-                break
-            }
-        }
+        //    注意：claim 是"按 fd"的——UvcCamera 用自己的连接 force claim 会把它抢走，
+        //    所以 UVC 关掉后要用 ensureHid() 重新 claim，否则 0x17 又会返回 -1。
+        claimHid(c, dev)
         conn = c
         intf = itf
         epOut = ep
         device = dev
         Log.i(TAG, "opened if=${itf.id} ep=0x${ep.address.toString(16)} mps=${ep.maxPacketSize}")
         return true
+    }
+
+    private fun claimHid(c: UsbDeviceConnection, dev: UsbDevice): Boolean {
+        for (i in 0 until dev.interfaceCount) {
+            val h = dev.getInterface(i)
+            if (h.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                val ok = c.claimInterface(h, true)
+                if (ok) hid = h
+                Log.i(TAG, "claim HID if=${h.id} -> $ok")
+                return ok
+            }
+        }
+        return false
+    }
+
+    /**
+     * 重新拿回 HID 接口(2) 的 claim。
+     * HID 的 class 控制请求（0xA1/0x16、0xA1/0x17）在本机只有在"本 fd 拥有该接口"时才成功；
+     * UvcCamera 用自己连接 force claim 会抢走它，关掉 UVC 后需要调用本方法恢复。
+     */
+    fun ensureHid(): Boolean {
+        val c = conn ?: return false
+        val d = device ?: return false
+        return claimHid(c, d)
     }
 
     /** 发送一帧（已含 16 字节头）。原厂用单次 bulk 传输整帧（1,024,016 B，timeout 5000ms）；失败时退回分块。 */
