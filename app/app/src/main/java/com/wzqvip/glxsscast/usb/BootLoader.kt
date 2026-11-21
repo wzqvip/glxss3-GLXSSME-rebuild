@@ -39,7 +39,7 @@ object BootLoader {
         }
         val fd = conn.fileDescriptor
         val (bus, addr) = parseBusAddr(dev.deviceName)
-        val usbfs = dev.deviceName
+        val usbfs = "/dev/bus/usb"
         Thread {
             try {
                 val r = Boot.bootInit(dev.vendorId, dev.productId, fd, bus, addr, usbfs)
@@ -51,11 +51,14 @@ object BootLoader {
                 val r2 = Boot.bootDownload(imgPath, keyPath, object : BootCallback {
                     override fun onFail(code: Int, msg: String?) {
                         Log.e(TAG, "bootDownload fail $code $msg")
+                        try { conn.close() } catch (_: Exception) {}
                         onDone(false, "刷写失败: $code $msg")
                     }
 
                     override fun onSuccess() {
                         Log.i(TAG, "bootDownload success")
+                        // 注意：此时设备会自行重启，连接交由系统回收
+                        try { conn.close() } catch (_: Exception) {}
                         onDone(true, "固件加载成功，等待设备重新枚举为 2e09:0030")
                     }
                 })
@@ -65,11 +68,9 @@ object BootLoader {
                 Log.e(TAG, "flash exception", e)
                 onDone(false, "异常: ${e.message}")
             } finally {
-                try {
-                    conn.close()
-                } catch (_: Exception) {
-                }
+                // 连接在回调中关闭；异常路径才在这里兜底
             }
         }.start()
     }
 }
+
