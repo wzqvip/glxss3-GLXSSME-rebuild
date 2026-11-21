@@ -208,14 +208,7 @@ class MainActivity : ComponentActivity() {
                             com.wzqvip.glxsscast.cast.CastService.fillMode = fillMode
                             getSharedPreferences("prefs", MODE_PRIVATE).edit()
                                 .putInt("mode", fillMode).apply()
-                            // 运行中立即生效（服务内部重建管线）
-                            if (com.wzqvip.glxsscast.cast.CastService.running) {
-                                startService(
-                                    Intent(this@MainActivity, com.wzqvip.glxsscast.cast.CastService::class.java)
-                                        .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_SET_MODE)
-                                        .putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_MODE, fillMode)
-                                )
-                            }
+
                             status = "画面模式: " + com.wzqvip.glxsscast.cast.CastService.modeName(fillMode)
                         },
                         modifier = Modifier.fillMaxWidth()
@@ -281,17 +274,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("开屏（显示模式 2）") }
 
-                    Button(
-                        onClick = {
-                            // 关屏：先停投屏（否则帧流会立刻把屏幕点亮），再切模式 1
-                            if (com.wzqvip.glxsscast.cast.CastService.running) stopCastService()
-                            usb.connection?.let { c ->
-                                if (LcdControl.setDisplayMode(c, 1)) status = "已关屏（显示模式 1）" else status = "关屏失败"
-                            } ?: run { status = "未连接" }
-                        },
-                        enabled = usb.isOpen,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("关屏（显示模式 1）") }
+
 
                     Row(
                         Modifier.fillMaxWidth(),
@@ -343,4 +326,5 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 

@@ -95,19 +95,10 @@ class CastService : Service() {
             }
             ACTION_SET_MODE -> {
                 val m = intent.getIntExtra(EXTRA_MODE, MODE_CROP)
+                // 注意：Android 14+ 的 MediaProjection 只能建一个 VirtualDisplay，
+                // 不能重建管线；抓取尺寸固定，模式只在行映射时应用（下一帧生效）。
                 fillMode = m
-                if (running) {
-                    // 立即生效：重建管线（复用当前 MediaProjection，无需重新授权）
-                    try {
-                        destroyPipeline()
-                        createPipeline()
-                        lastError = "画面模式已切换: ${modeName(m)}"
-                    } catch (e: Exception) {
-                        lastError = "切换模式失败: ${e.message}"
-                    }
-                } else {
-                    lastError = "画面模式: ${modeName(m)}（下次投屏生效）"
-                }
+                lastError = "画面模式: ${modeName(m)}"
             }
             ACTION_START -> {
                 val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -202,8 +193,7 @@ class CastService : Service() {
         val hd = handler ?: throw IllegalStateException("no handler")
         val (sw, sh) = screenSize()
         captureW = LcdProtocol.WIDTH
-        captureH = if (fillMode == MODE_FIT) LcdProtocol.HEIGHT
-        else (LcdProtocol.WIDTH.toLong() * sh / sw).toInt().coerceIn(64, 4000)
+        captureH = (LcdProtocol.WIDTH.toLong() * sh / sw).toInt().coerceIn(64, 4000)
 
         val reader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 2)
         imageReader = reader
@@ -320,4 +310,5 @@ class CastService : Service() {
         super.onDestroy()
     }
 }
+
 
