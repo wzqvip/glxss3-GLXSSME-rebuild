@@ -43,6 +43,7 @@ class MainActivity : ComponentActivity() {
     private var frames by mutableStateOf(0)
     private var brightness by mutableStateOf(180)
     private var castInfo by mutableStateOf("未投屏")
+    private var fillMode by mutableStateOf(com.wzqvip.glxsscast.cast.CastService.MODE_CROP)
 
     private val projectionManager by lazy {
         getSystemService(android.media.projection.MediaProjectionManager::class.java)
@@ -57,6 +58,7 @@ class MainActivity : ComponentActivity() {
                 action = com.wzqvip.glxsscast.cast.CastService.ACTION_START
                 putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_CODE, result.resultCode)
                 putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_DATA, data)
+                putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_MODE, fillMode)
             }
             androidx.core.content.ContextCompat.startForegroundService(this, i)
             status = "投屏已启动"
@@ -182,6 +184,17 @@ class MainActivity : ComponentActivity() {
                             }
                             kotlinx.coroutines.delay(500)
                         }
+                    }
+
+                    Button(
+                        onClick = {
+                            fillMode = (fillMode + 1) % 3
+                            com.wzqvip.glxsscast.cast.CastService.fillMode = fillMode
+                            status = "画面模式: " + listOf("适应(黑边)", "裁剪(填满)", "拉伸(填满)")[fillMode]
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("画面模式: " + listOf("适应(黑边)", "裁剪(填满)", "拉伸(填满)")[fillMode])
                     }
 
                     Button(

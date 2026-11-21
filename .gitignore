@@ -34,3 +34,6 @@ app/.idea/
 *.keystore
 *.jks
 app/app/build/
+
+# 自研 APK 分发（允许入库）
+!dist/*.apk
