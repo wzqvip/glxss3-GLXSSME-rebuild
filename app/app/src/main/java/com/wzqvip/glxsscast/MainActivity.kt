@@ -42,6 +42,28 @@ class MainActivity : ComponentActivity() {
     private var status by mutableStateOf("未连接")
     private var frames by mutableStateOf(0)
     private var brightness by mutableStateOf(180)
+    private var castInfo by mutableStateOf("未投屏")
+
+    private val projectionManager by lazy {
+        getSystemService(android.media.projection.MediaProjectionManager::class.java)
+    }
+
+    private val mpLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == android.app.Activity.RESULT_OK && data != null) {
+            val i = Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java).apply {
+                action = com.wzqvip.glxsscast.cast.CastService.ACTION_START
+                putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_DATA, data)
+            }
+            androidx.core.content.ContextCompat.startForegroundService(this, i)
+            status = "投屏已启动"
+        } else {
+            status = "投屏授权被取消"
+        }
+    }
     private var busy by mutableStateOf(false)
 
     private val permissionReceiver = object : BroadcastReceiver() {
@@ -138,6 +160,41 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(status, style = MaterialTheme.typography.bodyLarge)
+                    Text(castInfo, style = MaterialTheme.typography.bodyMedium)
+
+                    androidx.compose.runtime.LaunchedEffect(Unit) {
+                        while (true) {
+                            castInfo = if (com.wzqvip.glxsscast.cast.CastService.running) {
+                                "投屏中: %.1f fps, 累计 %d 帧".format(
+                                    com.wzqvip.glxsscast.cast.CastService.fps,
+                                    com.wzqvip.glxsscast.cast.CastService.frames
+                                )
+                            } else {
+                                "未投屏"
+                            }
+                            kotlinx.coroutines.delay(500)
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            mpLauncher.launch(projectionManager.createScreenCaptureIntent())
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("开始投屏（实时镜像）") }
+
+                    Button(
+                        onClick = {
+                            startService(
+                                Intent(this@MainActivity, com.wzqvip.glxsscast.cast.CastService::class.java)
+                                    .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_STOP)
+                            )
+                            status = "已停止投屏"
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("停止投屏") }
+
                     Button(
                         onClick = {
                             val dev = usb.findDevice()
