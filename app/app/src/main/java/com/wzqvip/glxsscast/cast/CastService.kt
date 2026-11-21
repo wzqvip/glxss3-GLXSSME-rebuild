@@ -22,13 +22,10 @@ import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.usb.UsbLink
 
 /**
- * 实时投屏：MediaProjection → VirtualDisplay(宽度 640、高度按手机屏幕比例)
- * → ImageReader(RGBA_8888) → 行映射到 640×400 → 16B 头 + 1,024,000B → USB bulk。
+ * 实时投屏：MediaProjection → VirtualDisplay(宽 640、高按手机屏比例) → ImageReader(RGBA)
+ * → 行映射到 640×400 → 16B 头 + 1,024,000B → USB bulk。
  *
- * 画面模式（fillMode）：
- *   0 = FIT     保持比例、上下留黑边
- *   1 = CROP    保持比例、居中裁剪填满（默认，无黑边不变形）
- *   2 = STRETCH 拉伸填满（可能有形变）
+ * 画面模式：0=适应(黑边) 1=裁剪(填满) 2=拉伸(填满)；运行中切换会立即重建管线。
  */
 class CastService : Service() {
 
@@ -53,6 +50,12 @@ class CastService : Service() {
         @Volatile var fps = 0f; private set
         @Volatile var lastError = ""; private set
         @Volatile var fillMode = MODE_CROP
+
+        fun modeName(m: Int) = when (m) {
+            MODE_FIT -> "适应(黑边)"
+            MODE_STRETCH -> "拉伸(填满)"
+            else -> "裁剪(填满)"
+        }
     }
 
     private var projection: MediaProjection? = null
@@ -66,7 +69,6 @@ class CastService : Service() {
     private var countWindow = 0L
     private var windowStart = 0L
 
-    // 复用缓冲，避免每帧 1MB 分配
     private var rgbaBuf: ByteArray? = null
     private var frameBuf: ByteArray? = null
     private var captureW = LcdProtocol.WIDTH
@@ -80,7 +82,7 @@ class CastService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        usb = UsbLink(this)
+        usb = UsbLink.get(this)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -95,8 +97,16 @@ class CastService : Service() {
                 val m = intent.getIntExtra(EXTRA_MODE, MODE_CROP)
                 fillMode = m
                 if (running) {
-                    // 模式变化：重建投屏（需要重新授权，故仅记录，下次启动生效）
-                    lastError = "画面模式已切换为 ${modeName(m)}（下次开始投屏生效）"
+                    // 立即生效：重建管线（复用当前 MediaProjection，无需重新授权）
+                    try {
+                        destroyPipeline()
+                        createPipeline()
+                        lastError = "画面模式已切换: ${modeName(m)}"
+                    } catch (e: Exception) {
+                        lastError = "切换模式失败: ${e.message}"
+                    }
+                } else {
+                    lastError = "画面模式: ${modeName(m)}（下次投屏生效）"
                 }
             }
             ACTION_START -> {
@@ -109,12 +119,6 @@ class CastService : Service() {
             }
         }
         return START_NOT_STICKY
-    }
-
-    private fun modeName(m: Int) = when (m) {
-        MODE_FIT -> "适应(黑边)"
-        MODE_STRETCH -> "拉伸"
-        else -> "裁剪"
     }
 
     private fun startForegroundCompat() {
@@ -136,7 +140,6 @@ class CastService : Service() {
         }
     }
 
-    /** 手机屏幕宽高（用于计算与 640 同比例的抓取高度） */
     private fun screenSize(): Pair<Int, Int> {
         return if (Build.VERSION.SDK_INT >= 30) {
             val wm = getSystemService(WindowManager::class.java)
@@ -149,7 +152,11 @@ class CastService : Service() {
     }
 
     private fun startCasting(resultCode: Int, data: Intent) {
-        if (running) return
+        if (running) {
+            // 已在投屏：只切模式
+            fillMode = fillMode
+            return
+        }
         if (!usb.isOpen) {
             val dev = usb.findDevice()
             if (dev == null || !usb.open(dev)) {
@@ -168,10 +175,9 @@ class CastService : Service() {
         mp.registerCallback(projectionCallback, Handler(mainLooper))
         projection = mp
 
-        val (sw, sh) = screenSize()
-        captureH = if (fillMode == MODE_FIT) LcdProtocol.HEIGHT
-        else (LcdProtocol.WIDTH.toLong() * sh / sw).toInt().coerceIn(64, 4000)
-        captureW = LcdProtocol.WIDTH
+        val ht = HandlerThread("cast").also { it.start() }
+        thread = ht
+        handler = Handler(ht.looper)
 
         rgbaBuf = ByteArray(LcdProtocol.PAYLOAD_SIZE)
         frameBuf = ByteArray(LcdProtocol.HEADER_SIZE + LcdProtocol.PAYLOAD_SIZE).also { fb ->
@@ -183,24 +189,46 @@ class CastService : Service() {
             fb[7] = ((total ushr 24) and 0xFF).toByte()
         }
 
-        val ht = HandlerThread("cast").also { it.start() }
-        thread = ht
-        handler = Handler(ht.looper)
-
-        val reader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 2)
-        imageReader = reader
-        reader.setOnImageAvailableListener({ r -> onFrame(r) }, handler)
-
-        virtualDisplay = mp.createVirtualDisplay(
-            "glxss-cast",
-            captureW, captureH, 1,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface, null, handler
-        )
+        createPipeline()
         running = true
         countWindow = 0
         windowStart = System.currentTimeMillis()
-        Log.i(TAG, "casting started ${captureW}x$captureH mode=$fillMode")
+        Log.i(TAG, "casting started mode=$fillMode")
+    }
+
+    /** 按当前 fillMode 创建 ImageReader + VirtualDisplay */
+    private fun createPipeline() {
+        val mp = projection ?: throw IllegalStateException("no projection")
+        val hd = handler ?: throw IllegalStateException("no handler")
+        val (sw, sh) = screenSize()
+        captureW = LcdProtocol.WIDTH
+        captureH = if (fillMode == MODE_FIT) LcdProtocol.HEIGHT
+        else (LcdProtocol.WIDTH.toLong() * sh / sw).toInt().coerceIn(64, 4000)
+
+        val reader = ImageReader.newInstance(captureW, captureH, PixelFormat.RGBA_8888, 2)
+        imageReader = reader
+        reader.setOnImageAvailableListener({ r -> onFrame(r) }, hd)
+        virtualDisplay = mp.createVirtualDisplay(
+            "glxss-cast-$fillMode",
+            captureW, captureH, 1,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader.surface, null, hd
+        )
+        Log.i(TAG, "pipeline ${captureW}x$captureH mode=$fillMode")
+    }
+
+    private fun destroyPipeline() {
+        try {
+            virtualDisplay?.release()
+        } catch (_: Exception) {
+        }
+        virtualDisplay = null
+        try {
+            imageReader?.setOnImageAvailableListener(null, null)
+            imageReader?.close()
+        } catch (_: Exception) {
+        }
+        imageReader = null
     }
 
     @Suppress("UNUSED_PARAMETER")
@@ -233,38 +261,29 @@ class CastService : Service() {
             }
 
             when (fillMode) {
-                MODE_STRETCH -> {
-                    for (y in 0 until dstH) copyRow(y * h / dstH, y)
-                }
+                MODE_STRETCH -> for (y in 0 until dstH) copyRow(y * h / dstH, y)
                 MODE_CROP -> {
-                    // 保持比例：纵向居中裁剪出 400 行（抓取宽 640 与手机同比例）
                     val keep = minOf(dstH, h)
                     val startRow = ((h - keep) / 2).coerceAtLeast(0)
-                    for (y in 0 until dstH) {
-                        val src = startRow + (y.toLong() * keep / dstH).toInt()
-                        copyRow(src, y)
-                    }
+                    for (y in 0 until dstH) copyRow(startRow + (y.toLong() * keep / dstH).toInt(), y)
                 }
-                else -> { // MODE_FIT：保持比例，上下黑边
+                else -> {
                     java.util.Arrays.fill(dst, 0)
                     val contentH = (dstW.toLong() * h / w).toInt().coerceAtMost(dstH)
                     val top = (dstH - contentH) / 2
-                    for (y in 0 until contentH) {
-                        copyRow(y * h / contentH, top + y)
-                    }
+                    for (y in 0 until contentH) copyRow(y * h / contentH, top + y)
                 }
             }
 
             val fb = frameBuf ?: return
             System.arraycopy(dst, 0, fb, LcdProtocol.HEADER_SIZE, dst.size)
-            val ok = usb.sendFrame(fb)
-            if (ok) {
+            if (usb.sendFrame(fb)) {
                 frames++
                 countWindow++
                 val now = System.currentTimeMillis()
                 if (now - windowStart >= 1000) {
                     fps = countWindow * 1000f / (now - windowStart)
-                    Log.i(TAG, "fps=${fps} frames=${frames} capture=${captureW}x${captureH} mode=$fillMode")
+                    Log.i(TAG, "fps=$fps frames=$frames capture=${captureW}x${captureH} mode=$fillMode")
                     countWindow = 0
                     windowStart = now
                 }
@@ -281,16 +300,7 @@ class CastService : Service() {
 
     private fun stopCasting() {
         running = false
-        try {
-            virtualDisplay?.release()
-        } catch (_: Exception) {
-        }
-        virtualDisplay = null
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {
-        }
-        imageReader = null
+        destroyPipeline()
         try {
             projection?.unregisterCallback(projectionCallback)
             projection?.stop()
@@ -306,7 +316,8 @@ class CastService : Service() {
 
     override fun onDestroy() {
         stopCasting()
-        usb.close()
+        // USB 连接是进程内共享的（Activity 还在用），这里不关闭
         super.onDestroy()
     }
 }
+

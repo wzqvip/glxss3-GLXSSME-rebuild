@@ -96,7 +96,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        usb = UsbLink(this)
+        usb = UsbLink.get(this)
+        fillMode = getSharedPreferences("prefs", MODE_PRIVATE).getInt("mode", fillMode)
+        com.wzqvip.glxsscast.cast.CastService.fillMode = fillMode
 
         // UVC 设备需要 CAMERA 权限才会授予 USB 访问
         if (androidx.core.content.ContextCompat.checkSelfPermission(
@@ -125,7 +127,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         unregisterReceiver(permissionReceiver)
         unregisterReceiver(attachReceiver)
-        usb.close()
+        // 连接是进程内共享的（CastService 可能还在用），这里不关闭
         super.onDestroy()
     }
 
@@ -138,17 +140,31 @@ class MainActivity : ComponentActivity() {
         status = if (usb.open(dev)) "已连接: ${dev.productName ?: dev.deviceName}" else "打开失败"
     }
 
+    private fun stopCastService() {
+        startService(
+            Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java)
+                .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_STOP)
+        )
+    }
+
     private fun sendAsync(payload: ByteArray) {
         if (busy) return
         busy = true
         lifecycleScope.launch {
             val ok = withContext(Dispatchers.IO) {
+                // 发测试图前先停止投屏，避免画面被投屏覆盖
+                if (com.wzqvip.glxsscast.cast.CastService.running) {
+                    stopCastService()
+                    Thread.sleep(400)
+                }
+                // 停止投屏会把显示模式切回 1（关屏），发测试图前先切回 2（开屏）
+                usb.connection?.let { LcdControl.setDisplayMode(it, 2) }
                 usb.sendFrame(LcdProtocol.frame(payload))
             }
             busy = false
             if (ok) {
                 frames++
-                status = "已发送 $frames 帧"
+                status = "已发送 $frames 帧（已停止投屏）"
             } else {
                 status = "发送失败（检查端点/权限）"
             }
@@ -190,11 +206,24 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             fillMode = (fillMode + 1) % 3
                             com.wzqvip.glxsscast.cast.CastService.fillMode = fillMode
-                            status = "画面模式: " + listOf("适应(黑边)", "裁剪(填满)", "拉伸(填满)")[fillMode]
+                            getSharedPreferences("prefs", MODE_PRIVATE).edit()
+                                .putInt("mode", fillMode).apply()
+                            // 运行中立即生效（服务内部重建管线）
+                            if (com.wzqvip.glxsscast.cast.CastService.running) {
+                                startService(
+                                    Intent(this@MainActivity, com.wzqvip.glxsscast.cast.CastService::class.java)
+                                        .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_SET_MODE)
+                                        .putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_MODE, fillMode)
+                                )
+                            }
+                            status = "画面模式: " + com.wzqvip.glxsscast.cast.CastService.modeName(fillMode)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("画面模式: " + listOf("适应(黑边)", "裁剪(填满)", "拉伸(填满)")[fillMode])
+                        Text(
+                            "画面模式: " + com.wzqvip.glxsscast.cast.CastService.modeName(fillMode) +
+                                if (com.wzqvip.glxsscast.cast.CastService.running) "（立即生效）" else ""
+                        )
                     }
 
                     Button(
@@ -245,8 +274,8 @@ class MainActivity : ComponentActivity() {
                     Button(
                         onClick = {
                             usb.connection?.let { c ->
-                                if (LcdControl.setDisplayMode(c, 2)) status = "显示模式 2（投屏）" else status = "显示模式设置失败"
-                            }
+                                if (LcdControl.setDisplayMode(c, 2)) status = "显示模式 2（投屏/开屏）" else status = "显示模式设置失败"
+                            } ?: run { status = "未连接" }
                         },
                         enabled = usb.isOpen,
                         modifier = Modifier.fillMaxWidth()
@@ -254,9 +283,11 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = {
+                            // 关屏：先停投屏（否则帧流会立刻把屏幕点亮），再切模式 1
+                            if (com.wzqvip.glxsscast.cast.CastService.running) stopCastService()
                             usb.connection?.let { c ->
-                                if (LcdControl.setDisplayMode(c, 1)) status = "显示模式 1（关闭/待机）" else status = "显示模式设置失败"
-                            }
+                                if (LcdControl.setDisplayMode(c, 1)) status = "已关屏（显示模式 1）" else status = "关屏失败"
+                            } ?: run { status = "未连接" }
                         },
                         enabled = usb.isOpen,
                         modifier = Modifier.fillMaxWidth()
@@ -312,3 +343,4 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+

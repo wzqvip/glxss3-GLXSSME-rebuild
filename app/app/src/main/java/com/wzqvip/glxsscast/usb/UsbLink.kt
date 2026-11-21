@@ -19,7 +19,7 @@ import android.util.Log
  * 选接口：优先 vendor-specific(0xFF) 且带 bulk OUT 的接口
  * 发送：1 MB 的帧分块写入（单次 ≤ 16 KB），失败重试
  */
-class UsbLink(private val ctx: Context) {
+class UsbLink private constructor(private val ctx: Context) {
 
     companion object {
         const val VID = 0x2E09
@@ -28,6 +28,13 @@ class UsbLink(private val ctx: Context) {
         private const val TAG = "UsbLink"
         private const val CHUNK = 16 * 1024
         private const val TIMEOUT_MS = 2000
+
+        // 进程内共享同一个连接（Activity 与 CastService 共用）
+        @Volatile private var shared: UsbLink? = null
+        fun get(context: Context): UsbLink =
+            shared ?: synchronized(this) {
+                shared ?: UsbLink(context.applicationContext).also { shared = it }
+            }
     }
 
     private val usb = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -141,3 +148,4 @@ class UsbLink(private val ctx: Context) {
         device = null
     }
 }
+
