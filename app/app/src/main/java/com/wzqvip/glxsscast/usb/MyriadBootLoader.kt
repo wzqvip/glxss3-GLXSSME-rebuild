@@ -31,7 +31,8 @@ object MyriadBootLoader {
     /** 解密尾部 512 KiB；返回要发送的完整镜像（长度不变，尾部不足补 0） */
     fun prepareImage(img: ByteArray): ByteArray {
         val out = img.copyOf()
-        val start = minOf(ENC_START, out.size)
+        // 加密尾 = 文件末尾 0x80000 字节（1.9.1 是 0x0F4590，1.7.4 是 0x0F3AF0 —— 用 size 推算，别写死）
+        val start = maxOf(0, out.size - ENC_LEN)
         val len = minOf(ENC_LEN, out.size - start)
         if (len <= 0) return out
         return try {
@@ -106,4 +107,5 @@ object MyriadBootLoader {
         }.start()
     }
 }
+
 
