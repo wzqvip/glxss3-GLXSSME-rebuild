@@ -1,5 +1,8 @@
 # 眼镜"画面全无"——诊断、固件行为与恢复 SOP
 
+> **这是故障诊断的原始记录 + 操作手册。** 教程版见
+> [第 6 章 · 固件 §7](ch-firmware.md#7-半死现象与恢复-sop)；固件格式见 [第 6 章](ch-firmware.md)。
+>
 > 场景：GLXSS G25 插在 LG G8（`192.168.3.88:37003`，root）上，枚举正常（`2e09:0030`），
 > 但 **UVC 不出图、LCD 测试色条/投屏也不出图**。
 > 本文记录 2026-11-21 的完整诊断过程、固件侧证据、代码修复与可复现的恢复流程。
@@ -88,7 +91,7 @@ logcat 里 `libuvc/stream: retrying transfer, status = 2` 刷屏。
 
 ⇒ **不是我们 App 的问题**：同一台机器、同一时刻，原厂那套 proven 的 libuvc 也拿不到数据。
 
-### 2.4 dmesg 里的 `input irq status -75` 是正常现象，别误判【验】
+### 2.4 dmesg 里的 `input irq status -75` 是正常现象，别误判
 
 每次枚举后 `hid-generic` 会打 4–6 条 `input irq status -75`（EOVERFLOW），健康状态（重灌后立刻开流）**同样有**：
 
@@ -310,7 +313,7 @@ APK 内 assets/G25_MainFW_1.9.1.img  md5 9cea02e400fcf6c126aac12e1fb4765c (1,525
 
 仍然未知的（下次复现时优先查）：
 
-1. 触发条件：长期 `force-stop`（主机单方面丢掉 alt=1 的流）、LCD+UVC 并发、还是固件自身 watchdog？
+1. 触发条件：长期 `force-stop`（主机单方面丢掉 VS 流）、LCD+UVC 并发、还是固件自身 watchdog？
 2. `list full`（LEON IPC 队列满）是否就是卡死点？——需要 UART/console 才能看到固件日志【未】；
 3. `perform_power_saving_on` 是否会把 camera/LCD 任务停掉而 USB 任务照跑？strings 里 `light_sensor_suspend` 暗示有"光感/佩戴"省电逻辑【推】。
 

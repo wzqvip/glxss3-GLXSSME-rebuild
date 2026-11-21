@@ -1,5 +1,8 @@
 # GLXSS G25 固件提取可行性报告
 
+> **这是"为什么没有固件可 dump"的完整论证与复算记录。** 教程版见
+> [第 6 章 · 固件](ch-firmware.md)；引导协议见 [firmware-boot-protocol.md](firmware-boot-protocol.md)。
+>
 > 对象：亮亮视野 GLXSS G25（Intel Movidius Myriad 2 / MA2450，NCS1 同芯片）
 > 样本：`com.llvision.glxss3.camera` v2.3.7（`re/liangliang/app.apk`）
 > 设备：Pixel 10 Pro Fold `192.168.3.50:37353`（原厂 App 正常连过眼镜）
@@ -372,7 +375,7 @@ CONFIG 1 total=734, 7 interfaces
 
 **厂商接口只有 EP 0x01 OUT**，没有 bulk IN 端点。也就是说：即使固件想回传整片镜像，也没有 bulk 通道；只能走 control IN 小包（见 §3.2）。
 
-### 3.2 全部 vendor control 请求枚举：没有“读 flash/内存”【验】
+### 3.2 全部 vendor control 请求枚举：没有“读 flash/内存”
 
 对 `liblcd.so` / `libhid.so` 里所有 `libusb_control_transfer` 调用点做了静态枚举（含参数常量），并与真机 Frida 抓包（`re/liangliang/frida3.log`）交叉核对：
 

@@ -1,4 +1,7 @@
-# SoC：Intel Movidius Myriad 2（MA2450）—— 与 Intel 神经棒同款
+# SoC：Intel Movidius Myriad 2（MA2450）
+
+> 本文是 SoC 的**证据留档**。它在项目里的意义、能不能拿来跑 NN、有哪几条路线，
+> 见 **[第 8 章 · NPU](ch-npu.md)**；硬件规格速查见 [README §2](../README.md#2-硬件规格)。
 
 ## 结论
 
@@ -9,13 +12,13 @@
 
 ### 1. 固件里的 DDR 初始化程序名
 
-`G25_MainFW_1.9.1.img` 头部（偏移 0x08）：
+`G25_MainFW_1.9.1.img` 头部（偏移 `0x08`）：
 
 ```
 MA2x | ddrInitHeaderForMvcmd.elf | .text ...
 ```
 
-- **`Mvcmd` = Movidius Command**，是 Myriad 系列的启动/固件容器命名；
+- **`Mvcmd` = Movidius Command**，Myriad 系列的启动/固件容器命名；
 - `ddrInitHeaderFor*` 是 Myriad 启动时先加载的 DDR 初始化程序。
 
 ### 2. 固件内嵌构建信息
@@ -31,18 +34,20 @@ GIT VERSION: CLEAN 2016-06-09 06:56:58 +0300
 
 | 模式 | VID | PID | 说明 |
 |---|---|---|---|
-| 正常 | `0x2E09` | `0x0030` | 厂商自定义（复合设备：UVC + LCD + HID） |
+| 正常 | `0x2E09` | `0x0030` | 厂商自定义（复合设备：UVC + LCD + HID + UAC） |
 | **Boot** | **`0x03E7`** | **`0x2150`** | **Intel NCS1（Myriad 2）的默认 USB ID** |
 
-`0x03E7` 是 Intel 的 USB Vendor ID；`0x2150` 就是第一代神经棒（MA2450）在 boot 模式下的 PID。
+`0x03E7` 是 Intel 的 USB Vendor ID；`0x2150` 是第一代神经棒（MA2450）的 ID。
 （第二代 NCS2 / Myriad X 是 `0x03E7:0x2485`。）
 
 App 的 `LLVisionPlatformService` 里硬编码了这两个常量（`BOOT_VID = 999`，`BOOT_PID = 8528`），
 说明厂商直接把 NCS1 的 boot 流程拿来刷自家固件。
 
-## 这颗芯片是什么
+> **命名澄清**：NCS1（Myriad 2）对应 **MA2x5x** 系列；`ma2x8x` 是 **Myriad X（NCS2）**，
+> 两者固件不通用。早期笔记里把 NCS1 固件写成 `ma2x8x.mvcmd` 是笔误，已在此更正。
+> 具体文件名随 NCSDK 版本变化，本仓库不附带任何 NCS 固件。
 
-Myriad 2（MA2450）规格：
+## 规格
 
 | 项 | 参数 |
 |---|---|
@@ -54,41 +59,20 @@ Myriad 2（MA2450）规格：
 | 接口 | USB 3.0 / 2.0、I2C、SPI、UART、GPIO、MIPI |
 | 典型用途 | 视觉处理、深度神经网络推理（NCS1 就是它） |
 
-这意味着眼镜的"投屏"实际是：**手机通过 USB 把帧传给 Myriad 2，Myriad 2 的 LEON 核驱动显示屏**
-（I2C/SPI 控制 + 并行/DSI 数据），同时 Myriad 2 还负责 UVC 摄像头、HID、传感器。
-
-## 对"自己做 AR 眼镜"的意义
-
-### 路线 1：复用厂商固件，只写宿主端（最稳）
-
-- 协议已在 [protocol.md](protocol.md) 写清楚（16B 头 + 640×400 RGBA）；
-- 宿主（PC/手机）自己渲染、自己发帧；
-- 优点：不用碰固件、不用 MDK；缺点：只能"当显示器用"。
-
-### 路线 2：替换 Myriad 2 固件（潜力最大，难度也最大）
-
-- Boot 模式就是标准 NCS1 的 ROM 引导，**开源工具 `myriad-usbboot`（movidius）可以用任意 MVCMD 文件
-  启动 MA2450/MA2480**；
-- 也就是说：**理论上你可以把自己的 MVCMD 固件刷进这副眼镜的 Myriad 2**，从而完全接管摄像头/显示；
-- **主要障碍**：写出 MVCMD 需要 **Intel Movidius Development Kit（MDK）**（SHAVE 编译器 + LEON 工具链），
-  该工具链已停止公开分发，获取困难；另外要逆向出这块板子的 LCD/摄像头硬件连接（面板型号、接口、时序）；
-- 风险：刷写失败可能变砖（Myriad 的 ROM boot 通常可恢复，但不保证）。
-
-### 路线 3：换芯片自研
-
-- 参考 Myriad 2 的架构，选 ESP32-S3 / K230 / RV1106 等带 ISP 的 SoC 自行设计；
-- 低成本、可控，但要自己做显示与摄像头驱动。
+**在本眼镜里**：手机通过 USB 把帧传给 Myriad 2，LEON 核驱动显示屏，同时负责 UVC 摄像头、
+HID、音频、传感器。固件是 RTEMS，USB 设备栈来自 MCCI。
 
 ## 下一步验证
 
-1. 两种模式下 `lsusb -v -d 03e7:2150` / `-d 2e09:0030`，记录端点与接口；
-2. 用 `usbmon` 抓 App 刷固件时的 bulk 传输，确认是否就是标准 MVCMD 引导序列；
-3. 查 `G25_MainFW_1.9.1.img` 的容器格式（`MA2x` 头 + `ddrInitHeaderForMvcmd.elf` + `main.elf`），
-   与 NCSDK 的 `ma2x8x.mvcmd` 对比；
-4. 评估 MDK 获取途径与风险，决定是否走路线 2。
+1. ~~两种模式下 `lsusb -v` 记录端点与接口~~ ✅ 已完成，见 [usb-capture.md](usb-capture.md)；
+2. ~~用 `usbmon`/Frida 抓刷机序列，确认是否就是标准 MVCMD 引导~~ ✅ 已完成，见
+   [firmware-boot-protocol.md](firmware-boot-protocol.md) / [vendor-flash-capture.md](vendor-flash-capture.md)；
+3. ~~查容器的 `MA2x` 头/TLV/ELF 结构~~ ✅ 已完成，见 [ch-firmware.md §2](ch-firmware.md#2-容器格式ma2x--mvcmd)；
+4. 评估 MDK 获取途径与"自写 MVCMD"的可行性 → 见 [ch-npu.md §4](ch-npu.md#4-四条可能路线)（未开始）。
 
 ## 参考
 
-- Intel Neural Compute Stick 1 使用 Movidius Myriad 2（MA2450）
-- MVCMD 启动格式与 `myriad-usbboot` 工具（Movidius 开源）
-- Myriad 2 数据手册（Intel/Movidius，公开版本）
+- Intel NCS1 使用 Movidius Myriad 2（MA2450）；
+- MVCMD 启动格式与 `myriad-usbboot`（Movidius 开源，已归档）；
+- NCSDK `api/src/usb_boot.c`（Myriad 2 ROM 引导的主机侧实现）；
+- Myriad 2 数据手册（Intel/Movidius，公开版本）。

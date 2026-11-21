@@ -1,6 +1,9 @@
 # 原厂 App 固件刷写 USB 序列抓取与 -206 根因分析
 
-- 日期：2026-11-20 23:05（America/New_York）
+> **这是历史抓包与根因分析。** `-206` 的修复现状、默认灌写路径与恢复 SOP 见
+> [第 6 章 · 固件](ch-firmware.md)（§4.3 / §5 / §7）。
+>
+> - 日期：2026-11-20 23:05（America/New_York）
 - 手机：LG LM-G850N（`lineage_mh2lm`，Android 14 / LineageOS，Magisk root，`192.168.3.88`，adb 端口本次运行中从 `38279` 变为 `37003`）
 - 眼镜：亮亮视野 GLXSS G25（Intel Movidius Myriad 2 / MA2450）
 - 原厂 App：`com.llvision.glxss3.camera` v2.3.7（versionCode 15，targetSdk 25）

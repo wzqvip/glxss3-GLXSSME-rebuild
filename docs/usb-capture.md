@@ -1,5 +1,8 @@
 # USB 控制传输实测（真机抓包）
 
+> **这是原始证据页。** 想按子系统读协议与代码，请先看：
+> [显示](ch-display.md) · [UVC](ch-uvc.md) · [HID](ch-hid.md) · [音频](ch-audio.md) · [USB](ch-usb.md)。
+>
 > 方法：Pixel 10 Pro Fold（Android 16，KernelSU root）+ 眼镜（`2e09:0030`），
 > 用 Frida 在 App 的 `:llvision_G25` 进程 hook `libusb_control_transfer` / `libusb_bulk_transfer`
 > 抓取全部控制传输；同时用 `uiautomator` 驱动 App 界面触发各功能。
@@ -28,7 +31,8 @@ libusb_bulk_transfer(ep=0x01, len=1,024,016, timeout=5000)
 ```
 - 每帧 **1,024,016 字节 = 16 字节头 + 640×400×4 RGBA**；
 - **一次性 bulk 传输**（不是分块），超时 5000 ms；
-- 连续发送，实测约 1~2 帧/秒（受手机端渲染/发送线程限制，见下方 BULK 统计）。
+- 连续发送，实测约 1~2 帧/秒（**这是早期原厂 App 抓包时的发送节奏**，受当时手机端渲染/发送线程限制；
+  本项目优化后投屏可达 25 fps，见 [ch-display.md §6](ch-display.md#6-实测数据)）。
 
 ## 3. 控制传输（全部实测）
 

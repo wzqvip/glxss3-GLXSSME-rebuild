@@ -1,5 +1,8 @@
 # 亮亮视野 GLXSS G25 固件引导协议（LibBoot / MA2x MVCMD）
 
+> **这是二进制级逆向证据篇。** 教程、容器速查、恢复 SOP 与可直接跑的纯 Kotlin 实现见
+> [第 6 章 · 固件](ch-firmware.md)；"为什么没有固件可 dump"见 [firmware-extraction.md](firmware-extraction.md)。
+>
 > 目标设备：亮亮视野 G25 AR 眼镜（Intel Movidius Myriad 2 / MA2450，与 Intel NCS1 同芯片）
 > 逆向对象：`com.llvision.glxss3.camera` v2.3.7 中的 `libboot.so` / `libcommon.so`、`Boot.java`、`LLVisionPlatformService.java`、`assets/G25_MainFW_1.9.1.img`
 > 本文所有结论都带证据（虚拟地址 / 指令 / 字符串）。标注说明：
@@ -153,7 +156,7 @@ usb_destory();  // release_interface + close
 | 阶段 | 时间 | 来源 |
 |---|---|---|
 | 单块 bulk 超时 | 10 000 ms | 立即数 `0x2710` |
-| 1.5 MB 传输（约 1490 块） | 依 USB 速率，通常 3–15 s | 块数 = ⌈1525136/1024⌉ = **1490** |
+| 1.5 MB 传输（约 1490 块） | **实测约 460 ms**（≈3.3 MB/s）；理论 3–15 s 是按不同 USB 速率的保守估计 | 块数 = ⌈1525136/1024⌉ = **1490**；实测见 [ch-firmware.md §6](ch-firmware.md#6-实测数据) |
 | 解密 | 仅 AES-128-ECB 512 KiB，毫秒级 | 见 5.3 |
 | 设备重启 + 重枚举 | 数百 ms ~ 数秒 | 由 Java `USBMonitor` 捕获 attach |
 
@@ -493,7 +496,7 @@ thread {
 1. `0x44: 0x11047018` 与 `0x40: 0x8A00` 的确切含义（长度/入口/校验）。
 2. `0x9A` 记录第二字段（`0x11111111`）是否真是写入值，还是掩码/延时。
 3. 发送完成后设备"自我重启"的触发条件（收满？校验通过？超时？）；无 ACK 可观测。
-4. PKCS#7 去填充后应发送 `0x174584` 还是 `0x174574`（两种截断算法都能解释反汇编）；**建议按完整 `0x174590` 发送**，容器自带长度字段，多出的尾字节应被忽略。
+4. ~~PKCS#7 去填充后应发送 `0x174584` 还是 `0x174574`~~ **已解决**：原厂 `outLen = size - 16 - plain[last] = 0x174574`（1,525,108 B）；完整 `0x174590`（1,525,136 B）也已实测能成功启动，设备按容器内长度解析，末尾多出的 28 B 无影响。见 [ch-firmware.md §3.2](ch-firmware.md#32-三个长度别搞混)。
 5. 真机上 `wMaxPacketSize` 是否为 1024（影响是否需要 ZLP；原厂不发，故照抄即可）。
 6. 引导模式进入方式（按键/命令/掉电）——不在本次范围。
 
