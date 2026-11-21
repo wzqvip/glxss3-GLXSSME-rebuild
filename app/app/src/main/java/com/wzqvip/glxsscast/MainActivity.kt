@@ -360,6 +360,32 @@ class MainActivity : ComponentActivity() {
 
 
                     Button(
+                        onClick = {
+                            val usbMgr = getSystemService(android.content.Context.USB_SERVICE) as UsbManager
+                            val bootDev = com.wzqvip.glxsscast.usb.BootLoader.findBootDevice(usbMgr)
+                            if (bootDev == null) {
+                                status = "未检测到引导模式设备(03E7:2150)"
+                            } else if (!usb.hasPermission(bootDev)) {
+                                status = "请求引导设备权限…"
+                                usb.requestPermission(bootDev)
+                            } else {
+                                val base = getExternalFilesDir(null)?.absolutePath ?: "/sdcard/Android/data/com.wzqvip.glxsscast/files"
+                                val img = base + "/G25_MainFW_1.9.1.img"
+                                val key = base + "/llvision.enkey"
+                                if (!java.io.File(img).exists()) {
+                                    status = "缺少固件文件: " + img
+                                } else {
+                                    status = "正在加载固件…"
+                                    com.wzqvip.glxsscast.usb.BootLoader.flash(this@MainActivity, bootDev, img, key) { ok, msg ->
+                                        runOnUiThread { status = msg }
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("加载固件（引导模式 03E7:2150）") }
+
+                    Button(
                         onClick = { usb.close(); status = "已断开" },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("断开") }
@@ -374,6 +400,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
 
 
 
