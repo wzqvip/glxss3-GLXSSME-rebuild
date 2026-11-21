@@ -43,6 +43,7 @@ class UsbLink private constructor(private val ctx: Context) {
         private set
     private var conn: UsbDeviceConnection? = null
     private var intf: UsbInterface? = null
+    private var hid: UsbInterface? = null
     private var epOut: UsbEndpoint? = null
 
     val isOpen: Boolean get() = conn != null && epOut != null
@@ -105,6 +106,17 @@ class UsbLink private constructor(private val ctx: Context) {
             c.close()
             return false
         }
+        // 2) 顺带摘掉内核 hid-generic 对 HID 接口(2) 的占用：原厂 App 启动时同样 claim iface2。
+        //    不摘的话内核会持续打 `input irq status -75`，且 0xA1/0x16（HID 报告）/0xA1/0x17（固件版本）返回 -1。
+        for (i in 0 until dev.interfaceCount) {
+            val h = dev.getInterface(i)
+            if (h.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                val ok = c.claimInterface(h, true)
+                if (ok) hid = h
+                Log.i(TAG, "claim HID if=${h.id} -> $ok")
+                break
+            }
+        }
         conn = c
         intf = itf
         epOut = ep
@@ -162,9 +174,11 @@ class UsbLink private constructor(private val ctx: Context) {
 
     fun close() {
         intf?.let { conn?.releaseInterface(it) }
+        hid?.let { conn?.releaseInterface(it) }
         conn?.close()
         conn = null
         intf = null
+        hid = null
         epOut = null
         device = null
     }

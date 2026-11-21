@@ -10,6 +10,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Environment
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
@@ -285,6 +286,15 @@ class UvcCamera(private val ctx: Context) {
         if (vc != null) {
             val ok = c.claimInterface(vc, true)
             Log.i(TAG, "claim VC iface=#${vc.id} alt=${vc.alternateSetting} -> $ok")
+        }
+
+        // 2.6) 摘掉内核 hid-generic 对 HID 接口(2)的占用：原厂 App 启动时也会 claim iface2。
+        // 不摘的话 dmesg 持续 `input irq status -75`，且 0xA1/0x16 返回 -1。
+        val hid = (0 until dev.interfaceCount).map { dev.getInterface(it) }
+            .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_HID }
+        if (hid != null) {
+            val ok = c.claimInterface(hid, true)
+            Log.i(TAG, "claim HID iface=#${hid.id} -> $ok")
         }
 
         // 3) claim + 切 alt setting
@@ -621,6 +631,11 @@ class UvcCamera(private val ctx: Context) {
         if (running) return
         running = true
         frameLen = 0
+        inSync = false
+        invalidStreak = 0
+        invalidTotal = 0
+        invalidReported = false
+        unalignedDrop = 0
         framesInWindow = 0
         windowStart = System.currentTimeMillis()
         thread = Thread({ readLoop(c, ep) }, "UvcReader").also {
@@ -648,21 +663,46 @@ class UvcCamera(private val ctx: Context) {
     private fun readLoop(c: UsbDeviceConnection, ep: UsbEndpoint) {
         val buf = transferBuf
         var timeouts = 0
+        var fastFails = 0
+        var lastLog = 0L
         while (running) {
+            val t0 = SystemClock.elapsedRealtime()
             val n = try {
                 c.bulkTransfer(ep, buf, buf.size, BULK_TIMEOUT)
             } catch (t: Throwable) {
                 Log.e(TAG, "bulkTransfer threw", t)
                 break
             }
+            val dt = SystemClock.elapsedRealtime() - t0
             if (n < 0) {
+                // Android 的 bulkTransfer 对「超时」和「设备错误/已拔出」都返回 -1。
+                // 用耗时区分，否则设备一拔就会变成 100% CPU 的热循环：
+                //   dt ≈ BULK_TIMEOUT → 设备在线但没数据（固件没出流）
+                //   dt ≈ 0            → URB 立即失败（设备已断开 / alt 被重置 / 连接被别的 App 抢走）
+                val fast = dt < BULK_TIMEOUT / 2
+                if (fast) fastFails++ else fastFails = 0
+                if (fastFails >= 5) {
+                    val msg = "USB 传输连续失败（设备已断开，或接口被其它 App 抢走）。请重新插拔眼镜后再试。"
+                    Log.e(TAG, "$msg dt=${dt}ms")
+                    listener?.onError(msg)
+                    break
+                }
                 timeouts++
-                if (timeouts == 3) Log.w(TAG, "no UVC data yet (1000ms timeout) — device idle?")
-                if (timeouts % 100 == 0) Log.w(TAG, "bulk in timeout x$timeouts (no data)")
+                if (timeouts == 3) Log.w(TAG, "no UVC data yet (${BULK_TIMEOUT}ms timeout) — device idle?")
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastLog >= 3000) {
+                    Log.w(TAG, "bulk in timeout x$timeouts (no data) fastFails=$fastFails")
+                    lastLog = now
+                }
+                if (fast) Thread.sleep(20)
                 continue
             }
-            if (n == 0) continue
+            if (n == 0) {
+                Thread.sleep(10)
+                continue
+            }
             timeouts = 0
+            fastFails = 0
             dumpUrb(buf, n)
 
             val hdrLen = buf[0].toInt() and 0xff
@@ -679,9 +719,8 @@ class UvcCamera(private val ctx: Context) {
                     if (frameLen >= frameSize) { deliver(); inSync = false }
                 } else {
                     unalignedDrop++
-                    if (unalignedDrop % 50 == 1) {
-                        Log.w(TAG, "skip unaligned URB n=$n first=0x%02x".format(buf[0].toInt() and 0xff))
-                    }
+                    onInvalidUrb(n, hdrLen, hdrInfo,
+                        if (!hdrOk) "bHeaderLength=$hdrLen" else "ERR bit set")
                 }
                 continue
             }
@@ -717,8 +756,9 @@ class UvcCamera(private val ctx: Context) {
         }
         if (invalidStreak == INVALID_LIMIT && !invalidReported) {
             invalidReported = true
-            val msg = "UVC 数据没有合法 header（连续 $invalidStreak 个 URB，n=$n）：眼镜在发无效数据流，" +
-                "通常是固件状态异常。请给眼镜重新上电，或用「加载固件（引导模式 03E7:2150）」重建一次。"
+            val msg = "眼镜在发无效数据流（连续 $invalidStreak 个 URB 没有合法 UVC header，n=$n）：" +
+                "固件媒体流水线已卡死。请拔插眼镜 USB —— App 会自动重灌固件（03E7:2150 → 2E09:0030）；" +
+                "若没自动重灌，等设备出现后用「加载固件（引导模式 03E7:2150）」。"
             Log.e(TAG, msg)
             listener?.onError(msg)
         }
@@ -976,6 +1016,7 @@ class UvcCamera(private val ctx: Context) {
         running = false
     }
 }
+
 
 
 

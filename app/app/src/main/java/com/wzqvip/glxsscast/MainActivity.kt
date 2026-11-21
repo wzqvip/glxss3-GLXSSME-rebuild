@@ -84,7 +84,13 @@ class MainActivity : ComponentActivity() {
             if (intent.action != UsbLink.ACTION_PERMISSION) return
             val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, android.hardware.usb.UsbDevice::class.java)
             val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            if (dev != null && granted) connect(dev) else status = "USB 权限被拒绝"
+            when {
+                dev == null -> status = "USB 权限被拒绝"
+                !granted -> status = "USB 权限被拒绝"
+                // 引导模式设备：继续灌固件（不能当正常设备连接）
+                dev.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID -> autoFlashBoot(dev)
+                else -> connect(dev)
+            }
         }
     }
 
@@ -214,22 +220,40 @@ class MainActivity : ComponentActivity() {
         if (busy) return
         busy = true
         lifecycleScope.launch {
-            val ok = withContext(Dispatchers.IO) {
+            val r = withContext(Dispatchers.IO) {
                 // 发测试图前先停止投屏，避免画面被投屏覆盖
                 if (com.wzqvip.glxsscast.cast.CastService.running) {
                     stopCastService()
                     Thread.sleep(400)
                 }
-                // 停止投屏会把显示模式切回 1（关屏），发测试图前先切回 2（开屏）
-                usb.connection?.let { LcdControl.setDisplayMode(it, 2) }
-                usb.sendFrame(LcdProtocol.frame(payload))
+                val c = usb.connection
+                var screenOn = false
+                var modeOk = false
+                if (c != null) {
+                    // 停止投屏会把显示模式切回 1（关屏）——先切回 2（投屏）
+                    modeOk = LcdControl.setDisplayMode(c, 2)
+                    // 原厂 App 停止投屏后会 0xA1/0x03 关屏；关屏状态下只发帧是看不到的，必须显式开屏
+                    screenOn = LcdControl.setScreenOn(c, true)
+                }
+                val sent = usb.sendFrame(LcdProtocol.frame(payload))
+                Triple(sent, screenOn, modeOk)
             }
+            val sent = r.first
+            val screenOn = r.second
+            val modeOk = r.third
             busy = false
-            if (ok) {
+            if (sent) {
                 frames++
-                status = "已发送 $frames 帧（已停止投屏）"
+                val warn = when {
+                    !modeOk && !screenOn -> "（警告：开屏/显示模式都没 ACK）"
+                    !screenOn -> "（警告：开屏命令没 ACK）"
+                    !modeOk -> "（警告：显示模式没 ACK）"
+                    else -> ""
+                }
+                status = "已发送 $frames 帧（已停止投屏）$warn"
             } else {
-                status = "发送失败（检查端点/权限）"
+                status = if (usb.isOpen) "发送失败（bulk OUT 没有写完）"
+                else "发送失败（未连接眼镜）"
             }
         }
     }
@@ -456,12 +480,17 @@ class MainActivity : ComponentActivity() {
                     Button(
                         onClick = {
                             usb.connection?.let { c ->
-                                if (LcdControl.setDisplayMode(c, 2)) status = "显示模式 2（投屏/开屏）" else status = "显示模式设置失败"
+                                // 原厂 LCDService.c()：屏没开就先 setSwitch(true)，再切 displayMode
+                                val sw = LcdControl.setScreenOn(c, true)
+                                val md = LcdControl.setDisplayMode(c, 2)
+                                val st = LcdControl.readStatus(c)
+                                status = "开屏: switch=$sw mode2=$md" +
+                                    (st?.let { " · 状态 ${it.hex()} · 屏=${if (it.screenOpen) "开" else "关"} 亮度=${it.luminance}" } ?: "")
                             } ?: run { status = "未连接" }
                         },
                         enabled = usb.isOpen,
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("开屏（显示模式 2）") }
+                    ) { Text("开屏（switch=1 + 显示模式 2）") }
 
 
 
@@ -492,8 +521,11 @@ class MainActivity : ComponentActivity() {
                     Button(
                         onClick = {
                             usb.connection?.let { c ->
-                                val st = LcdControl.getStatus(c)
-                                status = if (st != null) "状态: ${st.joinToString("") { "%02x".format(it) }}  亮度=${st[5].toInt() and 0xff}" else "读状态失败"
+                                val st = LcdControl.readStatus(c)
+                                status = if (st != null) {
+                                    "状态 ${st.hex()} · ${st.width}x${st.height} 屏=${if (st.screenOpen) "开" else "关"}" +
+                                        " 亮度=${st.luminance} roll=${st.roll}"
+                                } else "读状态失败"
                             }
                         },
                         enabled = usb.isOpen,
@@ -579,6 +611,15 @@ class MainActivity : ComponentActivity() {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("加载固件（引导模式 03E7:2150）") }
+
+                    Text(
+                        "固件卡死（UVC 无帧 / 投屏和色条都没画面，但 USB 还能查状态）时：\n" +
+                            "① 拔掉眼镜 USB 再插上 → 设备会以 03E7:2150 出现；\n" +
+                            "② App 会自动灌固件（约 2 秒），等它重新枚举成 2E09:0030；\n" +
+                            "③ 再点「连接眼镜」，然后开摄像头 / 发色条。\n" +
+                            "原理与证据见 docs/device-recovery.md。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
 
                     Button(
                         onClick = { usb.close(); status = "已断开" },

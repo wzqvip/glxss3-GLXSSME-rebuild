@@ -637,6 +637,26 @@ XCB#2 ep=0x81 status=0(COMPLETED) actual=460812  head=0c0eb5020000b5020000b502 a
 
 ---
 
+## 10. 2026-11-21 补充：设备会进入"USB 活着但不出图"的半死状态
+
+§9 之后又出现了一次"**UVC、投屏、测试色条全都不出图**"的故障。结论与做法都写在新文档
+**[device-recovery.md](device-recovery.md)**，这里只留要点：
+
+| 项 | 结论 |
+|---|---|
+| 现象 | 枚举正常 `2e09:0030`；`0xA1/0x04` 返回 8B、`0x05/0x03/0x01` 全 ACK、1 MB LCD 帧 30 ms 收完；但 UVC 0 帧、面板不刷新 |
+| 谁的问题 | **固件**。同一时刻原厂 App（libuvc）也是 3×`TIMED_OUT` ⇒ 不是我们代码 |
+| 有没有私有复位命令 | **没有**。`liblcd.so`/`libhid.so` 的全部 control 请求已枚举，无 reset/power-on/camera-enable |
+| 恢复 | 拔插 → `03E7:2150` → App 自动灌 1.9.1 → `2E09:0030`；实测后 UVC 25 fps、原厂也出图 |
+| 我们补的 | claim HID 接口（`0xA1/0x17` 从 -1 → 返回版本）、发帧前显式 `0xA1/0x03` 开屏、断开时不再热循环、无效 URB 真正报错 |
+| 带宽 | §7 那条"投屏+UVC 会挤"的风险**实测不成立**：同时跑，投屏 25 fps + UVC 24.6 fps |
+
+> 更正 §9.4 的一条：`dmesg` 里的 `input irq status -75` 在**健康**状态下也会出现（枚举后 4–6 条），
+> 它不是固件挂掉的证据。
+
+
+---
+
 ## 附录 A：`libUVCCamera.so` 全量 native 速查（方案 A 用）
 
 `nm -D libUVCCamera.so` 的结论：**145 个动态符号，`.text` 段只导出 `JNI_OnLoad`，

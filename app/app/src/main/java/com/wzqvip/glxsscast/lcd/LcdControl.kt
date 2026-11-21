@@ -40,6 +40,46 @@ object LcdControl {
         return conn.controlTransfer(REQ_CTRL, 0x05, m, IFACE_LCD, ByteArray(1), 1, TIMEOUT) > 0
     }
 
+    /**
+     * 屏幕开关（原厂 `LCD.setSwitch()` → `liblcd.so` 0xA1/0x03 wIndex=3）。
+     *
+     * **重要**：原厂 LCDService 在停止投屏/浮层后会主动 `setSwitch(false)`，
+     * 30 秒的 "Switch-LCD" 线程也会在「没有在投屏」时把屏关掉。
+     * 屏 switch 关掉以后，只发帧/只切 displayMode **不会**重新点亮 —— 必须显式 setSwitch(true)。
+     */
+    fun setScreenOn(conn: UsbDeviceConnection, on: Boolean): Boolean =
+        conn.controlTransfer(REQ_CTRL, 0x03, if (on) 1 else 0, IFACE_LCD, ByteArray(1), 1, TIMEOUT) > 0
+
+    /** 屏幕旋转（原厂 `LCD.setRoll()` → 0xA1/0x02，参数放 wValue） */
+    fun setRoll(conn: UsbDeviceConnection, roll: Int): Boolean =
+        conn.controlTransfer(REQ_CTRL, 0x02, roll, IFACE_LCD, ByteArray(1), 1, TIMEOUT) > 0
+
+    /** 读状态并解析：width,height,bopen,luminance,rollover（与厂商 LCDInfo 一致） */
+    data class Status(
+        val width: Int,
+        val height: Int,
+        val screenOpen: Boolean,
+        val luminance: Int,
+        val roll: Int,
+        val raw: ByteArray
+    ) {
+        fun hex(): String = raw.joinToString("") { "%02x".format(it) }
+    }
+
+    fun readStatus(conn: UsbDeviceConnection): Status? {
+        val b = ctrl(conn, 0x04, 0, IFACE_LCD, 8) ?: return null
+        if (b.size < 8) return null
+        fun u(i: Int) = b[i].toInt() and 0xff
+        return Status(
+            width = u(0) or (u(1) shl 8),
+            height = u(2) or (u(3) shl 8),
+            screenOpen = u(4) != 0,
+            luminance = u(5),
+            roll = u(6) or (u(7) shl 8),
+            raw = b
+        )
+    }
+
     /** 自动亮度开关 */
     fun setAutoBrightness(conn: UsbDeviceConnection, on: Boolean): Boolean {
         return conn.controlTransfer(REQ_CTRL, 0x10, if (on) 1 else 0, IFACE_AUX, ByteArray(1), 1, TIMEOUT) > 0
@@ -50,14 +90,13 @@ object LcdControl {
         return conn.controlTransfer(REQ_CTRL, 0x19, if (on) 1 else 0, IFACE_AUX, ByteArray(1), 1, TIMEOUT) > 0
     }
 
-    /** 真实固件版本：0xA1/0x17，HID 接口(2)，24 字节 = 16B 版本串 + 8B ID */
+    /** 真实固件版本：0xA1/0x17，HID 接口(2)，24 字节 = 16B 版本串 + 8B ID
+     *  （HID 接口未被 claim 时该请求会返回 -1；UsbLink.open / UvcCamera.open 都会 claim 一次） */
     fun getFirmwareVersion(conn: UsbDeviceConnection): String? {
-        val n = conn.controlTransfer(REQ_CTRL, 0x17, 0, IFACE_AUX, ByteArray(24), 24, TIMEOUT)
-        if (n <= 0) return null
         val buf = ByteArray(24)
-        val r = conn.controlTransfer(REQ_CTRL, 0x17, 0, IFACE_AUX, buf, 24, TIMEOUT)
-        if (r <= 0) return null
-        val s = String(buf, 0, minOf(16, r), Charsets.US_ASCII)
+        val n = conn.controlTransfer(REQ_CTRL, 0x17, 0, IFACE_AUX, buf, 24, TIMEOUT)
+        if (n <= 0) return null
+        val s = String(buf, 0, minOf(16, n), Charsets.US_ASCII)
         return s.trim('\u0000', ' ', '\n')
     }
 
