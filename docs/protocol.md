@@ -69,8 +69,17 @@ JNI 方法（`sdk/lcd/LCD.java`，通过 `RegisterNatives` 动态注册）：
 | `nativeLCDTransferStream(byte[])` | 送帧 | 16B 头 + RGBA |
 | `nativeWriteCustomFields(byte[≤128], int)` | 写产品信息 | |
 
-控制类操作在原生层通过 **USB control transfer** 实现（`liblcd.so` 引用 `libusb_control_transfer`），
-具体 `bmRequestType / wValue / wIndex` 常量仍需真机抓包确认（见 [open-questions.md](open-questions.md)）。
+控制类操作在原生层通过 **USB control transfer** 实现（`liblcd.so` 引用 `libusb_control_transfer`）。
+**参数已真机抓包确认**，详见 [usb-capture.md](usb-capture.md)：
+
+| 功能 | bmRequestType | bRequest | wValue | wIndex | wLen |
+|---|---|---|---|---|---|
+| 查询状态 | 0xA1 | 0x04 | 0 | 0x0003 | 8 |
+| 设置亮度 | 0xA1 | 0x01 | 亮度(100–254) | 0x0003 | 1 |
+| 设置显示模式 | 0xA1 | 0x05 | 1=关 / 2=开 | 0x0003 | 1 |
+| 自动亮度 | 0xA1 | 0x10 | 0/1 | 0x0002 | 1 |
+| LED 指示灯 | 0xA1 | 0x19 | 0/1 | 0x0002 | 1 |
+| HID 报告 | 0xA1 | 0x16 | 0 | 0x0002 | 28 |
 
 ## 4. 流量估算
 

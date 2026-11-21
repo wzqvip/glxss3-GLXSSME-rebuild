@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -28,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.usb.UsbLink
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +41,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var usb: UsbLink
     private var status by mutableStateOf("未连接")
     private var frames by mutableStateOf(0)
+    private var brightness by mutableStateOf(180)
     private var busy by mutableStateOf(false)
 
     private val permissionReceiver = object : BroadcastReceiver() {
@@ -160,6 +163,61 @@ class MainActivity : ComponentActivity() {
                         enabled = usb.isOpen && !busy,
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("发送黑屏") }
+
+                    Button(
+                        onClick = {
+                            usb.connection?.let { c ->
+                                if (LcdControl.setDisplayMode(c, 2)) status = "显示模式 2（投屏）" else status = "显示模式设置失败"
+                            }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("开屏（显示模式 2）") }
+
+                    Button(
+                        onClick = {
+                            usb.connection?.let { c ->
+                                if (LcdControl.setDisplayMode(c, 1)) status = "显示模式 1（关闭/待机）" else status = "显示模式设置失败"
+                            }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("关屏（显示模式 1）") }
+
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                brightness = (brightness - 20).coerceIn(100, 254)
+                                usb.connection?.let { LcdControl.setBrightness(it, brightness) }
+                                status = "亮度 = $brightness"
+                            },
+                            enabled = usb.isOpen,
+                            modifier = Modifier.weight(1f)
+                        ) { Text("亮度 −") }
+                        Button(
+                            onClick = {
+                                brightness = (brightness + 20).coerceIn(100, 254)
+                                usb.connection?.let { LcdControl.setBrightness(it, brightness) }
+                                status = "亮度 = $brightness"
+                            },
+                            enabled = usb.isOpen,
+                            modifier = Modifier.weight(1f)
+                        ) { Text("亮度 +") }
+                    }
+
+                    Button(
+                        onClick = {
+                            usb.connection?.let { c ->
+                                val st = LcdControl.getStatus(c)
+                                status = if (st != null) "状态: ${st.joinToString("") { "%02x".format(it) }}  亮度=${st[5].toInt() and 0xff}" else "读状态失败"
+                            }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("读取状态") }
 
                     Button(
                         onClick = { usb.close(); status = "已断开" },

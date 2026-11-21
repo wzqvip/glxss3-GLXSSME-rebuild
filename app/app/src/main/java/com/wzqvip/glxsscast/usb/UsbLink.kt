@@ -40,6 +40,9 @@ class UsbLink(private val ctx: Context) {
 
     val isOpen: Boolean get() = conn != null && epOut != null
 
+    /** 供控制命令使用 */
+    val connection: UsbDeviceConnection? get() = conn
+
     /** 找 GLXSS3（优先精确匹配 VID/PID） */
     fun findDevice(): UsbDevice? {
         val list = usb.deviceList.values
@@ -103,21 +106,28 @@ class UsbLink(private val ctx: Context) {
         return true
     }
 
-    /** 发送一帧（已含 16 字节头） */
+    /** 发送一帧（已含 16 字节头）。原厂用单次 bulk 传输整帧（1,024,016 B，timeout 5000ms）；失败时退回分块。 */
     fun sendFrame(frame: ByteArray): Boolean {
         val c = conn ?: return false
         val ep = epOut ?: return false
-        var off = 0
+        // 1) 整帧一次写（与原厂一致）
+        var sent = c.bulkTransfer(ep, frame, 0, frame.size, 5000)
+        if (sent == frame.size) return true
+        if (sent > 0) {
+            Log.w(TAG, "partial bulk write $sent/${frame.size}, falling back to chunks")
+        } else {
+            Log.w(TAG, "bulk write failed ($sent), falling back to chunks")
+        }
+        // 2) 分块重试
+        var off = if (sent > 0) sent else 0
         while (off < frame.size) {
             val len = minOf(CHUNK, frame.size - off)
-            var sent = c.bulkTransfer(ep, frame, off, len, TIMEOUT_MS)
-            if (sent < 0) {
-                Log.w(TAG, "bulkTransfer failed off=$off len=$len")
-                // 一次重试
-                sent = c.bulkTransfer(ep, frame, off, len, TIMEOUT_MS)
-                if (sent < 0) return false
+            val n = c.bulkTransfer(ep, frame, off, len, TIMEOUT_MS)
+            if (n < 0) {
+                Log.w(TAG, "chunk failed off=$off len=$len")
+                return false
             }
-            off += sent
+            off += n
         }
         return true
     }

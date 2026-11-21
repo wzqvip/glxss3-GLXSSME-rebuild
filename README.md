@@ -64,6 +64,7 @@ docs/                 研究文档
   device.md           设备画像、USB、固件
   soc-myriad2.md      SoC = Intel Myriad 2（NCS1 同款）与刷机路线
   protocol.md         投屏协议（帧格式、数据流、控制命令）
+  usb-capture.md      真机 USB 抓包结果（控制请求/帧传输/音频接口）
   app-replacement.md  替代手机 App 设计（架构/功能/里程碑）
   open-questions.md   待验证项与验证方法
 code/
