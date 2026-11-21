@@ -279,6 +279,14 @@ class UvcCamera(private val ctx: Context) {
         conn = c
         ownsConnection = (reuse == null)
 
+        // 2.5) 也 claim VideoControl 接口（原厂 libuvc 会 claim；部分设备要求先有 VC 才出流）
+        val vc = (0 until dev.interfaceCount).map { dev.getInterface(it) }
+            .firstOrNull { it.interfaceClass == 0x0e && it.interfaceSubclass == 0x01 }
+        if (vc != null) {
+            val ok = c.claimInterface(vc, true)
+            Log.i(TAG, "claim VC iface=#${vc.id} alt=${vc.alternateSetting} -> $ok")
+        }
+
         // 3) claim + 切 alt setting
         if (!c.claimInterface(foundAlt, true)) {
             lastError = "claimInterface(#${foundAlt.id} alt=${foundAlt.alternateSetting}) failed"
@@ -968,5 +976,6 @@ class UvcCamera(private val ctx: Context) {
         running = false
     }
 }
+
 
 
