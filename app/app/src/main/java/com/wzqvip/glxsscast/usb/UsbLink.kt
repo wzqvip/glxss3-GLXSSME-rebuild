@@ -139,6 +139,27 @@ class UsbLink private constructor(private val ctx: Context) {
         return true
     }
 
+    // ---- HID / 中断端点 ----
+    fun openHidEndpoint(): UsbEndpoint? {
+        val c = conn ?: return null
+        val dev = device ?: return null
+        for (i in 0 until dev.interfaceCount) {
+            val itf = dev.getInterface(i)
+            if (itf.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                for (e in 0 until itf.endpointCount) {
+                    val ep = itf.getEndpoint(e)
+                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT && ep.direction == UsbConstants.USB_DIR_IN) {
+                        if (c.claimInterface(itf, true)) return ep
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    fun readInterrupt(ep: UsbEndpoint, buf: ByteArray, timeoutMs: Int): Int =
+        conn?.bulkTransfer(ep, buf, buf.size, timeoutMs) ?: -1
+
     fun close() {
         intf?.let { conn?.releaseInterface(it) }
         conn?.close()
@@ -148,4 +169,5 @@ class UsbLink private constructor(private val ctx: Context) {
         device = null
     }
 }
+
 

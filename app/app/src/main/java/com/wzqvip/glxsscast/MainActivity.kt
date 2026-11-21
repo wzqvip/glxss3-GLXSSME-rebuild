@@ -44,6 +44,7 @@ class MainActivity : ComponentActivity() {
     private var brightness by mutableStateOf(180)
     private var castInfo by mutableStateOf("未投屏")
     private var fillMode by mutableStateOf(com.wzqvip.glxsscast.cast.CastService.MODE_CROP)
+    private var ledOn by mutableStateOf(false)
 
     private val projectionManager by lazy {
         getSystemService(android.media.projection.MediaProjectionManager::class.java)
@@ -312,6 +313,58 @@ class MainActivity : ComponentActivity() {
                     ) { Text("读取状态") }
 
                     Button(
+                        onClick = {
+                            if (com.wzqvip.glxsscast.usb.Peripherals.hidRunning) {
+                                com.wzqvip.glxsscast.usb.Peripherals.stopHid()
+                                status = "HID 已停止（共 " + com.wzqvip.glxsscast.usb.Peripherals.hidPackets + " 包）"
+                            } else if (usb.isOpen) {
+                                com.wzqvip.glxsscast.usb.Peripherals.startHid(usb)
+                                status = "HID 监听中"
+                            } else status = "未连接"
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            if (com.wzqvip.glxsscast.usb.Peripherals.hidRunning)
+                                "停止 HID（已收 " + com.wzqvip.glxsscast.usb.Peripherals.hidPackets + "）"
+                            else "开始 HID 监听"
+                        )
+                    }
+
+                    Button(
+                        onClick = {
+                            lifecycleScope.launch {
+                                val r = withContext(Dispatchers.IO) { com.wzqvip.glxsscast.usb.Peripherals.micRms() }
+                                status = if (r < 0) "麦克风不可用" else "麦克风 RMS = " + r
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("麦克风电平测试") }
+
+                    Button(
+                        onClick = {
+                            lifecycleScope.launch {
+                                val ok = withContext(Dispatchers.IO) { com.wzqvip.glxsscast.usb.Peripherals.playTone(440.0, 1.0) }
+                                status = if (ok) "已播放 440Hz（应走眼镜扬声器）" else "播放失败"
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("播放测试音（眼镜扬声器）") }
+
+                    Button(
+                        onClick = {
+                            usb.connection?.let { c ->
+                                val on = !ledOn
+                                ledOn = on
+                                status = if (com.wzqvip.glxsscast.lcd.LcdControl.setLed(c, on))
+                                    (if (on) "LED 开" else "LED 关") else "LED 控制失败"
+                            } ?: run { status = "未连接" }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (ledOn) "LED 指示灯：开" else "LED 指示灯：关") }
+
+                    Button(
                         onClick = { usb.close(); status = "已断开" },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("断开") }
@@ -326,5 +379,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 
 
