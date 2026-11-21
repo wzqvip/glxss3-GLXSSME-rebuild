@@ -96,6 +96,14 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         usb = UsbLink(this)
 
+        // UVC 设备需要 CAMERA 权限才会授予 USB 访问
+        if (androidx.core.content.ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.CAMERA
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.CAMERA), 1)
+        }
+
         androidx.core.content.ContextCompat.registerReceiver(
             this, permissionReceiver, IntentFilter(UsbLink.ACTION_PERMISSION),
             androidx.core.content.ContextCompat.RECEIVER_EXPORTED
