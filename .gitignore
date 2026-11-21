@@ -1,0 +1,27 @@
+# 原始第三方文件（禁止入库）
+*.apk
+*.aab
+*.img
+*.so
+*.dex
+apk/
+jadx-*/
+native/
+firmware/
+
+# 构建/临时
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+*.tar
+*.tar.gz
+*.zip
+*.bundle
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

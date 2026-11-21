@@ -1,0 +1,98 @@
+# GLXSS3 投屏协议研究 —— 非商业使用许可协议 v1.0
+# GLXSS3 Cast Protocol Research — Non-Commercial License v1.0
+
+Copyright (c) 2026 the project authors (https://github.com/wzqvip)
+All rights reserved except as expressly granted below.
+
+---
+
+## 中文
+
+### 1. 授权范围（允许）
+在遵守本协议全部条款的前提下，任何人可免费：
+- 为本人的**个人学习、研究、互操作性测试、教学**目的使用、复制、修改本仓库的文档与代码；
+- 在**非商业**项目中集成、修改并再分发本仓库内容，但必须：
+  - 保留本协议全文与原作者署名；
+  - 在显著位置注明来源（本仓库地址）；
+  - 衍生作品继续采用本协议（相同方式共享）。
+
+### 2. 禁止事项（商业使用）
+**未经著作权人事先书面许可，禁止任何形式的商业使用**，包括但不限于：
+- 销售本仓库内容或其衍生作品、收取费用或订阅费；
+- 将本仓库内容集成进商业产品或商业服务（含 SaaS、云服务、付费插件）；
+- 在企业内部用于商业运营、生产环境或盈利性项目；
+- 通过广告、赞助、付费下载等方式直接或间接变现；
+- 以本仓库内容提供收费的技术支持、咨询或定制开发。
+
+商业授权请联系项目作者（GitHub Issue 或仓库主页所列联系方式）。
+
+### 3. 使用限制与合规
+使用者不得将本仓库内容用于：
+- 侵犯他人知识产权、隐私或其他合法权利；
+- 破解付费服务、绕过技术保护措施（在适用法律禁止的范围内）；
+- 攻击、干扰或未授权访问他人设备、网络或系统；
+- 任何违反所在地法律法规的行为。
+
+### 4. 无担保
+本仓库内容按"现状"提供，不附带任何明示或默示的担保，包括但不限于适销性、
+特定用途适用性与不侵权的担保。作者不对因使用本内容造成的任何直接或间接损失负责。
+使用者自行承担全部风险，并应在测试前确认对相关设备的合法所有权/授权。
+
+### 5. 商标与关联声明
+"亮亮视野"、"LLVision"、"GLXSS" 等名称与标识归其权利人所有。
+本项目与 LLVision 无任何关联、合作或授权关系。本项目不代表、也不应被理解为
+厂商官方文档或官方支持。
+
+### 6. 不含第三方专有材料
+本仓库**不包含** APK、固件镜像或任何第三方专有二进制文件。
+本仓库中的分析与代码为作者独立完成，仅用于实现互操作性。
+
+### 7. 终止
+违反本协议任一条款，授权自动终止，使用者应立即停止使用并删除所有副本。
+
+### 8. 其他
+本协议可分割：任一条款被认定无效不影响其余条款的效力。
+本协议以中文与英文双语提供；如有冲突，以中文版本为准。
+
+---
+
+## English
+
+### 1. Grant
+Subject to all terms below, everyone is free to use, copy, and modify the documents and code in
+this repository for **personal study, research, interoperability testing, and teaching**, and to
+integrate and redistribute it in **non-commercial** projects, provided that:
+- this license and the original attribution are retained;
+- the source (this repository) is clearly credited;
+- derivative works are distributed under this same license.
+
+### 2. Commercial use prohibited
+**Any commercial use is prohibited without prior written permission**, including but not limited to:
+selling the contents or derivatives, charging fees or subscriptions, integrating into commercial
+products or services (including SaaS), internal commercial operations, monetization via ads or
+paid downloads, or paid support/consulting based on this repository.
+
+### 3. Restrictions
+You must not use this repository to infringe intellectual property or privacy rights, to break paid
+services or circumvent technical protection measures where prohibited by law, to attack or access
+devices/networks without authorization, or in violation of applicable law.
+
+### 4. No warranty
+Provided "as is", without warranty of any kind, express or implied. The authors are not liable for
+any damages arising from its use. You bear all risk and must ensure you own or are authorized to
+test the relevant hardware.
+
+### 5. Trademarks
+All product names and marks belong to their respective owners. This project is not affiliated with,
+endorsed by, or sponsored by LLVision.
+
+### 6. No proprietary material
+This repository contains **no** APK, firmware image, or third-party proprietary binary.
+The analysis and code are original work for interoperability purposes.
+
+### 7. Termination
+Any violation terminates the grant automatically; you must stop using and delete all copies.
+
+### 8. Miscellaneous
+Severability applies. This license is provided in Chinese and English; the Chinese version prevails
+in case of conflict.
