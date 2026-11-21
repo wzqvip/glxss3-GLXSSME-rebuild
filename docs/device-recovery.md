@@ -257,6 +257,10 @@ private void d() { // 停止投屏
 
 **判定成功**：不是"bulk 写完"，而是 `2e09:0030` 重新出现 **且 UVC 能收到 `n=460812`、首字节 `0C`**。
 
+恢复后的真机截图（同一时刻：UVC 25 fps + 投屏 25.6 fps、累计 250 帧）：
+
+![recovered: UVC + cast](img/uvc-ours-25fps.jpg)
+
 固件镜像自检（本机已做，可复现）：
 
 ```text
