@@ -41,13 +41,22 @@
 | [protocol.md](protocol.md) | [ch-display.md](ch-display.md) |
 | [app-replacement.md](app-replacement.md) | [ch-app.md](ch-app.md) |
 
-## 3. 建议阅读路径
+## 3. 工具
+
+PC 端调试统一入口：[`code/glxss.py`](../code/glxss.py)（单文件 CLI，覆盖
+`list/status/bright/screen/mode/roll/eeprom/version/hid/frame/uvc/flash/decode-uvc`；
+安装、权限、示例见 [`code/README.md`](../code/README.md)）。
+
+## 4. 建议阅读路径
 
 **我只想用起来**
 → [README §5 快速开始](../README.md#5-快速开始) → [ch-firmware.md §7 恢复 SOP](ch-firmware.md#7-半死现象与恢复-sop)
 
 **我要写自己的投屏客户端**
 → [ch-display.md](ch-display.md) → [ch-usb.md](ch-usb.md) → [code/poc_send_frame.py](../code/poc_send_frame.py)
+
+**我想在 PC 上调试眼镜**
+→ [code/README.md](../code/README.md) → [code/glxss.py](../code/glxss.py)（`list` / `status` / `frame` / `hid` / `uvc`）
 
 **我要接摄像头**
 → [ch-uvc.md](ch-uvc.md) → [uvc-camera-plan.md](uvc-camera-plan.md)（选型与坑）
@@ -61,7 +70,7 @@
 **设备不出图了**
 → [device-recovery.md §1 三态判定](device-recovery.md#1-三态判定表30-秒分清) → [ch-firmware.md §7](ch-firmware.md#7-半死现象与恢复-sop)
 
-## 4. 证据分级约定
+## 5. 证据分级约定
 
 文档里每个关键结论都带标记：
 
@@ -71,7 +80,7 @@
 | **【推】** | 由代码/数据结构强推断，未单独验证 | "0x9A 记录是 (寄存器地址, 值)" |
 | **【未】** | 未确认，文中标"待验证" | "1080p 档位的实际帧率" |
 
-## 5. 术语表
+## 6. 术语表
 
 | 术语 | 解释 |
 |---|---|

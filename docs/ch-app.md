@@ -260,7 +260,9 @@ conn.controlTransfer(0xA1, 0x05, 2, 3, ByteArray(1), 1, 5000)  // 显示模式 2
 conn.bulkTransfer(ep, frame16PlusRgba, frame16PlusRgba.size, 5000)
 ```
 
-更完整的 Python 版本见 [code/poc_send_frame.py](../code/poc_send_frame.py)。
+更完整的 Python 版本见 [code/poc_send_frame.py](../code/poc_send_frame.py)；
+PC 端完整调试 CLI（状态/控制/HID/EEPROM/UVC/刷写/解码）见
+[code/glxss.py](../code/glxss.py) 与 [code/README.md](../code/README.md)。
 
 ---
 
