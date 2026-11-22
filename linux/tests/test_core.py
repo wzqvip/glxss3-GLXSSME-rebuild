@@ -12,6 +12,8 @@ import os
 import socket
 import struct
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -174,6 +176,50 @@ class HudTests(unittest.TestCase):
         self.assertTrue(state.compass_valid)
         self.assertTrue(state.acc_valid)
         self.assertAlmostEqual(state.heading, 63.43, delta=0.1)
+
+    @unittest.skipUnless(READY, "需要 Pillow + numpy")
+    def test_hid_fn_key_callback_only_on_fn(self):
+        source = hud.HudSource()
+        released = struct.pack(
+            "<BBH9hBBf", 0, 0x71, 80,
+            100, 200, 300, 10, 20, 30, 0, 0, 0, 0, 0, 36.5)
+        pressed = struct.pack(
+            "<BBH9hBBf", 1, 0x71, 80,
+            100, 200, 300, 10, 20, 30, 0, 0, 0, 0, 0, 36.5)
+        other = struct.pack(
+            "<BBH9hBBf", 1, 0x01, 80,
+            100, 200, 300, 10, 20, 30, 0, 0, 0, 0, 0, 36.5)
+
+        class FakeDev:
+            data = released
+
+            def ctrl_transfer(self, request_type, request, value, index,
+                              length, timeout=None):
+                if request == 0x16:
+                    return bytearray(self.data)
+                return bytearray(length)
+
+        dev = FakeDev()
+        hits = []
+        fired = threading.Event()
+
+        def on_key(report):
+            hits.append(report.key_code)
+            fired.set()
+
+        source.attach_hid(dev, interval=0.01, timeout=100, on_key=on_key)
+        try:
+            time.sleep(0.05)
+            dev.data = pressed
+            self.assertTrue(fired.wait(2.0), "Fn 按下没有触发回调")
+            time.sleep(0.05)
+            dev.data = released
+            time.sleep(0.05)
+            dev.data = other
+            time.sleep(0.15)
+            self.assertEqual(hits, [0x71])
+        finally:
+            source.close()
 
     @unittest.skipUnless(READY, "需要 Pillow + numpy")
     def test_cli_hud_dry_run(self):

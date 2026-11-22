@@ -289,7 +289,8 @@ class HudSource(ImageSource):
                 else:
                     report = hid.read_report(dev, timeout)
                 self.update_report(report)
-                if on_key is not None and report.pressed and not key_was_down:
+                if (on_key is not None and report.is_fn_key
+                        and report.pressed and not key_was_down):
                     try:
                         on_key(report)
                     except Exception as exc:  # 回调失败不能弄死 HID 线程
