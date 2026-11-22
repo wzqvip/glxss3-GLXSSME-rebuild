@@ -515,6 +515,7 @@ sudo python3 pi/stream.py --rtsp rtsp://127.0.0.1:8554/glxss --fps 20   # 另开
 | 监看 `--fps 10` | 发送 **10.0 fps / 10.21 MB/s**，100 帧 0 失败；后台 UVC 读 15 fps（解码 ~40 ms），0 错误/0 超时 |
 | RTSP `--fps 20` | 采集 **30.0 fps**、发送 **19.7–20.2 fps**、0 重启（33 s / 882 帧）；`ffprobe` → `h264 640x480 avg_frame_rate=20/1` |
 | 连续推流（`--fps 25`） | 采集 30.0 fps、发送 25.1 fps，42 s / 1263 帧，0 重启 |
+| `tools/uvc_pi_exp.py --chunk 16384` | 6 s / 172 帧 = 28.7 fps（含启动），0 超时 / 0 无效 header / 0 丢弃 |
 
 > Linux 的 libusb 本来就会把 460822 拆成 16 KiB URB（usbmon 可见 `S Bi:… 16384`），
 > 所以这一步在 Pi 上**不会改变 USB 线上看到的 URB 大小**；它的价值是：不再依赖

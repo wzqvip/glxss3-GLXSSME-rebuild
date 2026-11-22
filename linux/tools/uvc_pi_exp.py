@@ -384,8 +384,10 @@ def main(argv=None):
                     # 保留末尾 11 B（header 可能跨块）
                     keep = 11
                     if len(rx) - pos > keep:
+                        dropped += len(rx) - pos - keep
                         pos = len(rx) - keep
                     break
+                dropped += found
                 pos += found
                 synced = True
             if len(rx) - pos < 2:
@@ -399,6 +401,7 @@ def main(argv=None):
                     print("    无效 header: bHeaderLength=%d info=0x%02x" % (
                         hdr_len, rx[pos + 1]))
                 synced = False
+                dropped += 1
                 pos += 1
                 continue
             need = hdr_len + args.max_frame
@@ -409,7 +412,6 @@ def main(argv=None):
                 print("    帧 #%d hdr=%s len=%d" % (
                     frames, bytes(rx[pos:pos + 12]).hex(), need))
             pos += need
-        dropped += pos
         del rx[:pos]
     elapsed = max(1e-6, time.monotonic() - t0)
     print("结果：%.1f s  读块=%d 帧=%d 超时=%d 错误=%d 无效header=%d 丢弃=%dB  fps=%.1f" % (
