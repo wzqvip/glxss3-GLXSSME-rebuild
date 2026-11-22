@@ -108,6 +108,15 @@ docs/         分析笔记与各子系统章节
 dist/         构建好的 APK
 ```
 
+## Linux / 跨平台版本（`linux` 分支）
+
+本仓库另有一个 **Linux / 跨平台 Python 版本**，代码在 [`linux/`](linux/) 目录，
+位于 **`linux` 分支**（`git checkout linux`），不影响 `main` 分支的 Android App。
+它提供 `glxss` CLI（list/status/bright/screen/mode/roll/eeprom/version/hid/uvc/frame/flash/cast）、
+可复用的 pyusb/numpy 核心库，以及 Raspberry Pi Zero 2 W + Waveshare 1.3inch LCD HAT
+的状态页/按键投屏示例。安装、Windows（Zadig/WinUSB）、macOS（libusb）和 Pi 部署说明见
+[`linux/README.md`](linux/README.md) 与 [`linux/pi/README.md`](linux/pi/README.md)。
+
 ## 文档
 
 | 章节 | 内容 |

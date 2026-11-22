@@ -1,0 +1,26 @@
+[Unit]
+Description=GLXSS cast with Waveshare 1.3inch LCD HAT status page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 按实际用户名/安装路径修改
+User=pi
+Group=pi
+SupplementaryGroups=spi gpio video
+WorkingDirectory=/opt/glxss/linux
+Environment=PYTHONUNBUFFERED=1
+# 没有 X11 的 Raspberry Pi OS Lite 请改成 --source test，
+# 或接 HDMI + 启动桌面/X11 后再用 --source screen。
+ExecStart=/opt/glxss/venv/bin/python /opt/glxss/linux/pi/lcdhat.py \
+    --source screen \
+    --fps 15 \
+    --fit fit \
+    --brightness 180
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
