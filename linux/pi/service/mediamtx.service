@@ -1,0 +1,19 @@
+[Unit]
+Description=mediamtx RTSP server (GLXSS live)
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=taco
+Group=taco
+# 只监听 127.0.0.1:9997 的 API；RTSP :8554 对局域网开放
+ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
+Restart=always
+RestartSec=3
+# 20 MB 左右；Zero 2 W 内存只有 416 MB，别开太多功能
+MemoryMax=96M
+
+[Install]
+WantedBy=multi-user.target

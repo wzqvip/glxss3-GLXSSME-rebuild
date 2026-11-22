@@ -1,0 +1,34 @@
+# GLXSS G25 直播用的最小 mediamtx 配置（Pi Zero 2 W，省内存/CPU）
+#
+# 只开 RTSP（OBS 拉流）和本地 HTTP API（glxss stream 用它读实测码率）。
+# 默认配置还会起 RTMP/HLS/WebRTC/SRT/MoQ，在 416 MB 的 Zero 2 W 上没必要。
+#
+# 用法：
+#   mediamtx /etc/mediamtx/mediamtx.yml
+#
+# 注意：apiAddress 只监听 127.0.0.1；从 PC 上看不到 9997，也不需要。
+# 若想用 WebRTC 低延迟预览（浏览器），把 webrtc 改成 yes 再放行 8889/8189。
+
+logLevel: info
+logDestinations: [stdout]
+
+api: yes
+apiAddress: 127.0.0.1:9997
+metrics: no
+
+rtsp: yes
+rtspAddress: :8554
+# 默认 udp 优先；OBS 走 TCP 更稳，也可以留 udp 让播放器自选。
+rtspTransports: [tcp, udp]
+rtspEncryption: "no"
+
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+moq: no
+playback: no
+
+# 允许任意 path 名（发布端用 /glxss，OBS 也拉 /glxss）
+paths:
+  all_others:

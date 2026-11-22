@@ -1,0 +1,34 @@
+[Unit]
+Description=GLXSS G25 UVC → RTSP 直播
+Documentation=file:/home/taco/glxss3-linux/pi/STREAM.md
+After=network-online.target mediamtx.service
+Wants=network-online.target
+# 设备没插时 glxss-stream 会每 15 s 重试，不要因为启动顺序失败就放弃
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=taco
+Group=taco
+SupplementaryGroups=video
+WorkingDirectory=/home/taco/glxss3-linux
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/taco/glxss3-linux
+# 640×480@20 + 1.5 Mbps + Pi 硬编码：约 0.4 核 + ~40 MB 内存
+# 需要 1080p/更高码率时改这里的参数（见 STREAM.md「参数」一节）
+ExecStart=/usr/bin/python3 /home/taco/glxss3-linux/pi/stream.py \
+    --rtsp rtsp://127.0.0.1:8554/glxss \
+    --size 640x480 \
+    --fps 20 \
+    --bitrate 1500k \
+    --codec h264_v4l2m2m \
+    --transport tcp
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+# 只允许它读写 USB/视频设备，其余保持默认
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
