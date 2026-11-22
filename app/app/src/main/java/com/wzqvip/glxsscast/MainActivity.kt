@@ -1199,23 +1199,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.weight(1f)
                         ) { Text("断开") }
 
-                    // 实验项：改 roll 会让画面翻转，只有拔插眼镜能恢复 —— 所以放在最底下
-                    Text(
-                        "实验项：改了 roll 会导致画面上下翻转，需拔插眼镜恢复",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                    Button(
-                        onClick = {
-                            usb.connection?.let { c ->
-                                rollIdx = (rollIdx + 1) % ROTATE_VALUES.size
-                                val r = ROTATE_VALUES[rollIdx]
-                                status = if (LcdControl.setRoll(c, r)) "roll=$r 已发送（$rollIdx/${ROTATE_VALUES.size-1}）" else "roll 发送失败"
-                            } ?: run { status = "未连接" }
-                        },
-                        enabled = usb.isOpen,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("显示翻转（roll=" + ROTATE_VALUES[rollIdx] + "）") }
+
                     }
                     Row(
                         Modifier.fillMaxWidth(),
@@ -1811,11 +1795,30 @@ class MainActivity : ComponentActivity() {
                             "投屏通知栏可直接「停止投屏」「画面模式」，不用回 App。",
                         style = MaterialTheme.typography.bodySmall
                     )
+
+                    // 实验项：改 roll 会让画面翻转，只有拔插眼镜能恢复 —— 所以放在最底下
+                    Text(
+                        "实验项：改了 roll 会导致画面上下翻转，需拔插眼镜恢复",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Button(
+                        onClick = {
+                            usb.connection?.let { c ->
+                                rollIdx = (rollIdx + 1) % ROTATE_VALUES.size
+                                val r = ROTATE_VALUES[rollIdx]
+                                status = if (LcdControl.setRoll(c, r)) "roll=$r 已发送（$rollIdx/${ROTATE_VALUES.size-1}）" else "roll 发送失败"
+                            } ?: run { status = "未连接" }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("显示翻转（roll=" + ROTATE_VALUES[rollIdx] + "）") }
                 }
             }
         }
     }
 }
+
 
 
 
