@@ -2233,6 +2233,164 @@ class MainActivity : ComponentActivity() {
                     }
 
                     HorizontalDivider()
+                    Text("投屏", style = MaterialTheme.typography.titleSmall)
+                    Button(
+                        onClick = { cycleFillMode() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            "画面模式: " + com.wzqvip.glxsscast.cast.CastService.modeName(fillMode) +
+                                if (com.wzqvip.glxsscast.cast.CastService.running) "（立即生效）" else ""
+                        )
+                    }
+
+                    Button(
+                        onClick = {
+                            // createScreenCaptureIntent / launch 在部分 ROM 上会抛（闪退）
+                            runCatching {
+                                mpLauncher.launch(projectionManager.createScreenCaptureIntent())
+                            }.onFailure {
+                                status = "投屏授权启动失败: ${it.javaClass.simpleName}: ${it.message}"
+                                Oplog.logf(
+                                    "CAST", "launch projection 失败 %s: %s",
+                                    it.javaClass.simpleName, it.message
+                                )
+                            }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("开始投屏（实时镜像）") }
+
+                    // ---- 画面调整（可折叠）：实时微调位置/缩放，值持久化 ----
+                    Button(
+                        onClick = { adjustOpen = !adjustOpen },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            (if (adjustOpen) "▾ " else "▸ ") +
+                                "画面调整（缩放 %.2f×，偏移 %+.2f / %+.2f）"
+                                    .format(zoom, offsetX, offsetY)
+                        )
+                    }
+
+                    if (adjustOpen) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                "缩放 %.2f×（1.0 = 原始裁切，2.0 = 放大一倍）".format(zoom),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Slider(
+                                value = zoom,
+                                onValueChange = { applyAdjust(it, offsetX, offsetY, persist = false) },
+                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
+                                valueRange = 1f..2f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Text(
+                                "水平偏移 %+.2f（0 = 居中，向左/右微调）".format(offsetX),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Slider(
+                                value = offsetX,
+                                onValueChange = { applyAdjust(zoom, it, offsetY, persist = false) },
+                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
+                                valueRange = -1f..1f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Text(
+                                "垂直偏移 %+.2f（0 = 居中，向上/下微调）".format(offsetY),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Slider(
+                                value = offsetY,
+                                onValueChange = { applyAdjust(zoom, offsetX, it, persist = false) },
+                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
+                                valueRange = -1f..1f,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { applyAdjust(1f, 0f, 0f) },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("重置") }
+                                Button(
+                                    onClick = { resyncOrientation() },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("重新适配方向") }
+                            }
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            stopCastService()
+                            status = "已停止投屏"
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("停止投屏") }
+
+                    HorizontalDivider()
+                    Text("LCD 控制", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { readStatusFields() },
+                            enabled = usb.isOpen && !busy,
+                            modifier = Modifier.weight(1f)
+                        ) { Text("读取状态") }
+
+
+                        Button(
+                            onClick = { readProductInfo() },
+                            enabled = usb.isOpen && !busy,
+                            modifier = Modifier.weight(1f)
+                        ) { Text("读产品信息") }
+                    }
+
+                    Button(
+                        onClick = { openScreen() },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("开屏（switch=1 + 显示模式 2）") }
+
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { changeBrightness(brightness - 20) },
+                            enabled = usb.isOpen,
+                            modifier = Modifier.weight(1f)
+                        ) { Text("亮度 −") }
+                        Button(
+                            onClick = { changeBrightness(brightness + 20) },
+                            enabled = usb.isOpen,
+                            modifier = Modifier.weight(1f)
+                        ) { Text("亮度 +") }
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Text("自动亮度", modifier = Modifier.weight(1f))
+                        Switch(
+                            checked = autoBrightness,
+                            onCheckedChange = { setAutoBrightnessByUser(it) }
+                        )
+                    }
+
+                    Button(
+                        onClick = { readFirmwareVersion() },
+                        enabled = usb.isOpen && !busy,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("读取真实固件版本") }
+
+                    HorizontalDivider()
                     Text("UVC 摄像头", style = MaterialTheme.typography.titleSmall)
                     Button(
                         onClick = {
@@ -2403,164 +2561,6 @@ class MainActivity : ComponentActivity() {
                             delay(300)
                         }
                     }
-
-                    HorizontalDivider()
-                    Text("投屏", style = MaterialTheme.typography.titleSmall)
-                    Button(
-                        onClick = { cycleFillMode() },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            "画面模式: " + com.wzqvip.glxsscast.cast.CastService.modeName(fillMode) +
-                                if (com.wzqvip.glxsscast.cast.CastService.running) "（立即生效）" else ""
-                        )
-                    }
-
-                    Button(
-                        onClick = {
-                            // createScreenCaptureIntent / launch 在部分 ROM 上会抛（闪退）
-                            runCatching {
-                                mpLauncher.launch(projectionManager.createScreenCaptureIntent())
-                            }.onFailure {
-                                status = "投屏授权启动失败: ${it.javaClass.simpleName}: ${it.message}"
-                                Oplog.logf(
-                                    "CAST", "launch projection 失败 %s: %s",
-                                    it.javaClass.simpleName, it.message
-                                )
-                            }
-                        },
-                        enabled = usb.isOpen,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("开始投屏（实时镜像）") }
-
-                    // ---- 画面调整（可折叠）：实时微调位置/缩放，值持久化 ----
-                    Button(
-                        onClick = { adjustOpen = !adjustOpen },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            (if (adjustOpen) "▾ " else "▸ ") +
-                                "画面调整（缩放 %.2f×，偏移 %+.2f / %+.2f）"
-                                    .format(zoom, offsetX, offsetY)
-                        )
-                    }
-
-                    if (adjustOpen) {
-                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text(
-                                "缩放 %.2f×（1.0 = 原始裁切，2.0 = 放大一倍）".format(zoom),
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Slider(
-                                value = zoom,
-                                onValueChange = { applyAdjust(it, offsetX, offsetY, persist = false) },
-                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
-                                valueRange = 1f..2f,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            Text(
-                                "水平偏移 %+.2f（0 = 居中，向左/右微调）".format(offsetX),
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Slider(
-                                value = offsetX,
-                                onValueChange = { applyAdjust(zoom, it, offsetY, persist = false) },
-                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
-                                valueRange = -1f..1f,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            Text(
-                                "垂直偏移 %+.2f（0 = 居中，向上/下微调）".format(offsetY),
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Slider(
-                                value = offsetY,
-                                onValueChange = { applyAdjust(zoom, offsetX, it, persist = false) },
-                                onValueChangeFinished = { applyAdjust(zoom, offsetX, offsetY) },
-                                valueRange = -1f..1f,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            Row(
-                                Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Button(
-                                    onClick = { applyAdjust(1f, 0f, 0f) },
-                                    modifier = Modifier.weight(1f)
-                                ) { Text("重置") }
-                                Button(
-                                    onClick = { resyncOrientation() },
-                                    modifier = Modifier.weight(1f)
-                                ) { Text("重新适配方向") }
-                            }
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            stopCastService()
-                            status = "已停止投屏"
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("停止投屏") }
-
-                    HorizontalDivider()
-                    Text("LCD 控制", style = MaterialTheme.typography.titleSmall)
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                            onClick = { readStatusFields() },
-                            enabled = usb.isOpen && !busy,
-                            modifier = Modifier.weight(1f)
-                        ) { Text("读取状态") }
-
-
-                        Button(
-                            onClick = { readProductInfo() },
-                            enabled = usb.isOpen && !busy,
-                            modifier = Modifier.weight(1f)
-                        ) { Text("读产品信息") }
-                    }
-
-                    Button(
-                        onClick = { openScreen() },
-                        enabled = usb.isOpen,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("开屏（switch=1 + 显示模式 2）") }
-
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                            onClick = { changeBrightness(brightness - 20) },
-                            enabled = usb.isOpen,
-                            modifier = Modifier.weight(1f)
-                        ) { Text("亮度 −") }
-                        Button(
-                            onClick = { changeBrightness(brightness + 20) },
-                            enabled = usb.isOpen,
-                            modifier = Modifier.weight(1f)
-                        ) { Text("亮度 +") }
-                    }
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
-                    ) {
-                        Text("自动亮度", modifier = Modifier.weight(1f))
-                        Switch(
-                            checked = autoBrightness,
-                            onCheckedChange = { setAutoBrightnessByUser(it) }
-                        )
-                    }
-
-                    Button(
-                        onClick = { readFirmwareVersion() },
-                        enabled = usb.isOpen && !busy,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("读取真实固件版本") }
 
                     HorizontalDivider()
                     Text("测试图（会先停止投屏）", style = MaterialTheme.typography.titleSmall)
