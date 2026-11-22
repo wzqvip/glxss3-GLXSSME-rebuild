@@ -21,7 +21,8 @@ linux/
 │  ├─ hid.py       # 300ms 轮询 28B 报告、版本串、传感器使能
 │  ├─ firmware.py  # AES-128-ECB 尾部解密 + 03e7:2150 灌写（默认 dry-run）
 │  ├─ capture.py   # ImageSource / TestPatternSource / mss 屏幕采集 / 三种映射
-│  ├─ hud.py       # HUD 渲染源：时间/罗盘/姿态/lux/温度/亮度/固件/导航占位
+│  ├─ hud.py       # HUD 渲染源：时间/罗盘/姿态/lux/亮度/固件/导航占位
+│  ├─ monitor.py   # 相机监看源：UVC 读帧 → 640×400 → 九宫格/水平仪/REC → 眼镜
 │  ├─ control.py   # 与 LCD HAT 的 JSON over Unix socket 控制通道
 │  ├─ app.py       # 采集→640×400→发送主循环，带 fps/MB/s 统计
 │  └─ cli.py       # glxss 子命令（含 hud / ctl）
@@ -47,7 +48,8 @@ linux/
 | UVC probe/commit + 读帧 + PNG | ✅ 已实现；YV12→RGB 用 numpy |
 | HID 轮询/传感器使能 | ✅ 已实现 |
 | HUD 渲染源（默认） | ✅ 已实现：Pillow 640×400 RGBA，2 fps 级别重绘 |
-| Pi LCD HAT 状态页/菜单 | ✅ 已实现：状态页 + 6 项菜单 + Unix socket |
+| 相机监看（monitor） | ✅ `cast --source uvc` / `hud --view monitor`；九宫格 + 水平仪 + 可选 REC；合成帧 10 fps 实测 |
+| Pi LCD HAT 状态页/菜单 | ✅ 已实现：状态页 + 7 项菜单（含 VIEW）+ Unix socket |
 | PyInstaller 三端打包 | ✅ 脚本/spec 完成；Windows onedir 实测可运行 |
 | 屏幕采集 | ✅ `mss`（可选依赖）；无桌面用 HUD/test |
 | 音频/UAC、NPU、录像、MJPEG | ❌ 未实现（不在本次范围） |
@@ -169,6 +171,14 @@ glxss cast --source screen --fps 10
 glxss cast --source test --fps 15 --duration 10
 glxss frame bars --fps 10 --seconds 5
 
+# 6.1) 相机监看：眼镜 UVC → 眼镜显示（自拍/手持构图）
+glxss cast --source uvc --fps 10 --detach --rotate 180 --rec
+# 或让常驻 HUD 主进程切换视图（HAT 菜单 VIEW 同效）
+glxss hud --listen --detach --rotate 180
+glxss ctl view monitor
+glxss ctl view hud
+glxss ctl rec on
+
 # 7) 摄像头 / 传感器 / 版本
 glxss uvc --frames 3 --save first-frame.png
 glxss hid --enable-sensors --count 10
@@ -210,9 +220,9 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 | `uvc` | GET/SET probe + commit，bulk IN 读 YV12；`--save` 存首帧 PNG |
 | `frame` | 测试图案/图片/HUD，按 16B 头发送；`--dry-run` 不碰设备 |
 | `flash` | 03e7:2150 灌写；默认 dry-run，`--yes` 真写 |
-| `cast` | 连续投屏；`--source hud`（默认）/`screen`/`test` |
-| `hud` | HUD 主进程；`--dry-run` 离线出 PNG，`--listen` 开控制 socket |
-| `ctl` | 通过 socket 控制 HUD 主进程（status/bright/screen/mode/hud/test/nav/quit） |
+| `cast` | 连续投屏；`--source hud`（默认）/`uvc`（相机监看）/`screen`/`test` |
+| `hud` | HUD 主进程；`--dry-run` 离线出 PNG，`--listen` 开控制 socket，`--view monitor` 直接进监看 |
+| `ctl` | 通过 socket 控制 HUD 主进程（status/bright/screen/view/mode/rec/hud/test/nav/quit） |
 
 `--fit` 支持：
 
@@ -234,9 +244,9 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 ├──────────┬───────────────────────────────┬─────────────────┤
 │ LIGHT    │             N                 │ ATTITUDE        │
 │  321 lux │        ╭───────────╮          │   ────────      │
-│ TEMP     │      W │   036 deg  │ E        │  PITCH  -2.2    │
-│  36.5 C  │        ╰───────────╯          │  ROLL   +0.7    │
-│ SENSOR OK│             S                 │  GYRO  +2 -1 0  │
+│ SENSOR   │      W │   036 deg  │ E        │  PITCH  -2.2    │
+│  OK      │        ╰───────────╯          │  ROLL   +0.7    │
+│ MAG  OK  │             S                 │  GYRO  +2 -1 0  │
 ├──────────┴───────────────────────────────┴─────────────────┤
 │ BRIGHT 185 ████████      FW G25_MainFW_1.9.1   HUD ON LIVE │
 └────────────────────────────────────────────────────────────┘
@@ -244,8 +254,9 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 
 * 顶部：本地时间、连接状态、fps；
 * 中心：磁罗盘刻度环（N/E/S/W + 15° 刻度）、heading 指针、数值；
-* 左侧：光感 lux、温度、传感器状态；
-* 右侧：加速度姿态仪（pitch/roll）、陀螺数值；
+  **罗盘无数据时显示 `--` + `NO MAG`**，不再显示误导性的 000°；
+* 左侧：光感 lux、传感器/罗盘状态；**不显示温度**（用户实测温度高、无参考价值）；
+* 右侧：加速度姿态仪（pitch/roll）、陀螺数值（保留）；
 * 底部：亮度条、固件版本、HUD/连接状态；
 * 罗盘下方：可选导航占位（相对方位箭头 + 距离 + 标签）。
 
@@ -268,7 +279,10 @@ glxss hud --demo --fps 2
 
 ### 5.2 刷新/发送频率
 
-* HID 固件 300 ms 一包；HUD 每 0.5 s 重绘一次（`render_interval`）；
+* HID 固件 300 ms 一包；HUD 主进程按 100 ms 轮询（`attach_hid(interval=0.1)`），
+  水平仪响应更快；
+* HUD 重绘间隔跟 `--fps` 走（`render_interval=1/fps`）；Pi Zero 2 W 上单次
+  Pillow 渲染约 65 ms，所以 HUD 实际很难超过 ~8 fps；
 * 发送频率由 `--fps` 控制，默认 2 fps；HUD 是静态信息，不需要 25 fps；
 * `--fps 0` 表示不限速（只建议调试）。
 
@@ -295,6 +309,57 @@ glxss ctl nav-clear
 * heading 约定 +X=北、+Y=东，`--heading-offset` 可整体旋转校准。
 * 磁罗盘硬铁/软铁校准**未实现**，只显示原始值；姿态公式按
   `docs/ch-hid.md §5.3`，未在真机标定。
+
+### 5.5 相机监看（monitor）
+
+戴着眼镜时看相机画面（自拍/手持构图），叠加三分线、水平仪和可选 REC 标记。
+
+两种入口：
+
+```bash
+# 1) 独立监看（不跑 HUD 主进程）
+glxss cast --source uvc --fps 10 --detach --rotate 180
+# 叠加 REC 红点/时间；CPU 紧张时先解 320×240 再放大
+glxss cast --source uvc --fps 10 --detach --rotate 180 --rec --uvc-half
+
+# 2) 常驻 HUD 主进程里切换（推荐；LCD HAT 菜单 VIEW 同效）
+glxss hud --listen --detach --rotate 180
+glxss ctl view monitor      # 或 glxss ctl mode monitor
+glxss ctl view hud
+glxss ctl rec on
+```
+
+也可以启动即进监看：`glxss hud --listen --view monitor --detach --rotate 180`。
+
+* 叠加层：三分线（九宫格）、水平仪（HID 加速度计 pitch/roll，地平线 + 准星）、
+  `rec` 时右上角红点 + `REC mm:ss`；
+* 映射：默认 `cover`——640×480 上下各裁 40 行得到 640×400，**不缩放**，最快；
+  `--monitor-fit stretch|fit` 会重采样，Pi Zero 2 W 上明显更慢；
+* `--camera-fps` 只控制 UVC 协商帧率（默认 15），发送帧率仍由 `--fps` 控制；
+  需要更低延迟可设 30，但会多占 USB 带宽；
+* UVC 读帧 + YV12→RGBA 在后台线程，主循环永远取“最新完成的一帧”发送；
+  解码慢只丢旧帧，不拖慢发送；
+* 同一 `UsbDeviceConnection` 上 UVC bulk IN 与 LCD bulk OUT 并发；HID/亮度/模式
+  等控制请求和 LCD 帧走 `usb.UsbGate` 串行，避免控制请求插进 1 MB 帧中间；
+* 切回 HUD 时停流（alt=0）并释放 UVC 接口，下次切监看重开；
+* Linux 必须加 `--detach`（uvcvideo 占着 UVC 接口）；和 `glxss uvc` 一样。
+
+Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
+
+| 路径 | 单帧耗时 |
+|---|---:|
+| YV12→RGBA，全分辨率 cover（默认） | ~44 ms |
+| YV12→RGBA，320×240 半分辨率（`--uvc-half`） | ~17 ms |
+| YV12→RGBA，stretch/fit（需要重采样） | ~79 ms |
+| 旋转 180°（uint32 像素整体反转） | ~1 ms |
+| RGBA 打包 + 16 B 帧头 | ~2 ms |
+| LCD 整帧 bulk OUT + 打包 | 实测 15 fps 时约 54–60 ms/帧（15.3 MB/s） |
+
+> 目标 ≥10 fps：默认 cover 的解码与发送在不同线程，互不阻塞；若设备
+> 实测低于 10 fps，优先用 `--uvc-half`（~17 ms/帧），再看 USB 供电/线材。
+> 合成 YV12 帧 + 真实 LCD 发送的 Pi Zero 2 W 实测：稳定 10.0 fps，后台解码
+> ~20 fps。真机 UVC 若 probe/commit 成功但读不到帧，是固件媒体流水线停摆，
+> 见 `docs/device-recovery.md`（需重灌固件，不在本工具范围内）。
 
 ---
 
@@ -336,8 +401,9 @@ offset 微调、供电/排障）见 **[`pi/SETUP.md`](pi/SETUP.md)**。
 架构：
 
 ```text
-glxss hud --listen  ──USB──►  眼镜 640×400 HUD
-       ▲
+glxss hud --listen  ──USB──►  眼镜 640×400 HUD / 相机监看
+       ▲   UVC bulk IN ◄──┐  （monitor 模式：眼镜相机 → 眼镜显示）
+       │                  │
        │ /run/glxss/glxssctl.sock（JSON）
        │
 pi/lcdhat.py  ──SPI/GPIO──►  ST7789 240×240 + 摇杆/按键
@@ -347,14 +413,15 @@ pi/lcdhat.py  ──SPI/GPIO──►  ST7789 240×240 + 摇杆/按键
 
 ```bash
 cd /opt/glxss/linux
-/opt/glxss/venv/bin/python -m glxss hud --listen --fps 2
+/opt/glxss/venv/bin/python -m glxss hud --listen --detach --fps 2
 # 另一个终端或 systemd：HAT 控制器
 /opt/glxss/venv/bin/python pi/lcdhat.py --socket /run/glxss/glxssctl.sock
 ```
 
 HAT 默认会在 socket 不存在时自动拉起 `glxss hud --listen` 子进程
-（`--no-spawn` 可禁用）。状态页显示眼镜连接、fps、亮度、HUD 状态、lux、温度、
-时间；菜单 6 项：亮度、显示模式、开关屏、HUD 开关、发测试帧、退出：
+（`--no-spawn` 可禁用）。状态页显示眼镜连接、fps、亮度、VIEW（HUD/MONITOR）、
+HUD 状态、lux、显示模式、时间；菜单 7 项：亮度、**视图（HUD/MONITOR）**、显示
+模式、开关屏、HUD 开关、发测试帧、退出：
 
 | 按键 | 状态页 | 菜单页 |
 |---|---|---|
@@ -364,6 +431,10 @@ HAT 默认会在 socket 不存在时自动拉起 `glxss hud --listen` 子进程
 | KEY1 | HUD 开关 | — |
 | KEY2 | 发测试帧 | — |
 | KEY3 | 退出 | 返回状态页 |
+
+眼镜上的 **Fn 键单击**也会在 HUD / MONITOR 之间切换（HID 报告里的按键边沿）。
+`glxss-cast.service` 模板已带 `--detach`，monitor 模式才能打开 UVC；画面上下
+颠倒时给 ExecStart 加 `--rotate 180`。
 
 面板 offset 默认 `x=0, y=80`；不同批次试 `0/80`、`80/0`、`--rotation 1`。
 颜色反相时改 `pi/lcdhat.py` 的 `_INIT`（`0x21` INVON ↔ `0x20` INVOFF）。
@@ -419,7 +490,10 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1 -OneDir
 | `接口忙` / claim 失败 | 退出厂商 App；Linux 加 `--detach`；同一进程不要重复 claim |
 | 发帧成功但屏不亮 | 先 `glxss screen on` + `glxss mode 2`（`frame/cast/hud` 默认会做） |
 | UVC 超时 / 0 帧 | 关掉其他摄像头程序；Linux `--detach` 摘掉 uvcvideo；固件假死需重灌 |
-| HUD 显示 NO MAG / NO IMU | 传感器未使能/全 0；`glxss hid --enable-sensors --count 5` 验证 |
+| `ctl view monitor` 后仍是 HUD | 看 `ctl status` 的 `UVC 错误`；多数是没加 `--detach`（uvcvideo 占用 VS 接口） |
+| monitor 帧率低/延迟大 | 加 `--uvc-half`；确认 USB 供电足够（Pi Zero 2 W 建议带供电 Hub）；`--fps 10` 不要设太高 |
+| 眼镜 Fn 键不能切 HUD/monitor | HID 不可用（`ctl status` 有 HID 错误）；先 `glxss hid --enable-sensors --count 5` 验证 |
+| HUD 显示 NO MAG / NO IMU | 传感器未使能/全 0；`glxss hid --enable-sensors --count 5` 验证；无罗盘时 HUD 显示 `--` |
 | `glxss ctl` 连不上 | 两个进程 `GLXSS_SOCK`/`--socket` 必须一致；先 `glxss hud --listen` |
 | 屏幕采集全黑 | Linux Wayland 用 XWayland，或改 `--source hud`/`test` |
 | LCD HAT 画面偏移 | 调 `pi/lcdhat.py --x-offset/--y-offset`（默认 `0/80`），或换 `--rotation` |

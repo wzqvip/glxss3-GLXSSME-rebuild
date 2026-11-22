@@ -5,8 +5,8 @@
   * 眼镜是主显示，LCD HAT 只做状态/控制面板；
   * 不是完整桌面镜像，只组合需要的图层：
       - 顶部：时间、连接状态、fps
-      - 中心：磁罗盘（N/E/S/W 刻度环 + 指针 + heading）
-      - 左侧：光感 lux、温度
+      - 中心：磁罗盘（N/E/S/W 刻度环 + 指针 + heading；无数据时显示 --）
+      - 左侧：光感 lux、传感器/罗盘状态（不显示温度：用户实测无参考价值）
       - 右侧：加速度姿态（俯仰/横滚）
       - 底部：亮度、固件版本、HUD 开关状态
       - 可选导航占位：相对方位箭头 + 距离 + 标签（不实现真实导航协议）
@@ -170,6 +170,8 @@ class HudSource(ImageSource):
         self._render_interval = max(0.05, float(render_interval))
         self._last_render = 0.0
         self._cache = None
+        self._rgba_cache = None
+        self._rgba_last_render = 0.0
         self._test_until = 0.0
         self._test_rgb = None
         self._hid_stop = threading.Event()
@@ -258,21 +260,26 @@ class HudSource(ImageSource):
 
     def _invalidate(self) -> None:
         self._last_render = 0.0
+        self._rgba_last_render = 0.0
 
     # -- HID 轮询 ----------------------------------------------------------
     def attach_hid(self, dev, interval: float = hid.SENSOR_POLL_INTERVAL,
-                   timeout: int = 1500, lock=None) -> None:
-        """后台按 300 ms 读 28 B 报告；lock 用于和主线程的 bulk OUT 串行化。"""
+                   timeout: int = 1500, lock=None, on_key=None) -> None:
+        """后台按 interval 读 28 B 报告；lock 用于和主线程的 bulk OUT 串行化。
+
+        `on_key(report)` 在检测到 Fn 键“按下”边沿时回调；monitor/HUD 切换用。
+        """
         if self._hid_thread is not None and self._hid_thread.is_alive():
             return
         self._hid_stop.clear()
         self._hid_thread = threading.Thread(
-            target=self._hid_loop, args=(dev, interval, timeout, lock),
+            target=self._hid_loop, args=(dev, interval, timeout, lock, on_key),
             name="glxss-hud-hid", daemon=True)
         self._hid_thread.start()
 
-    def _hid_loop(self, dev, interval: float, timeout: int, lock) -> None:
+    def _hid_loop(self, dev, interval: float, timeout: int, lock, on_key=None) -> None:
         failures = 0
+        key_was_down = False
         next_at = time.monotonic()
         while not self._hid_stop.is_set():
             try:
@@ -282,6 +289,12 @@ class HudSource(ImageSource):
                 else:
                     report = hid.read_report(dev, timeout)
                 self.update_report(report)
+                if on_key is not None and report.pressed and not key_was_down:
+                    try:
+                        on_key(report)
+                    except Exception as exc:  # 回调失败不能弄死 HID 线程
+                        print("[警告] HID 按键回调失败: %s" % exc, file=sys.stderr)
+                key_was_down = report.pressed
                 self._hid_error = ""
                 failures = 0
             except GlxssError as exc:
@@ -328,6 +341,28 @@ class HudSource(ImageSource):
             self._last_render = time.monotonic()
         return rgb
 
+    def grab_rgba(self):
+        """快路径：直接返回 640×400 RGBA，省掉 RGB 转换和再映射。"""
+        now = time.monotonic()
+        if self._test_rgb is not None and now < self._test_until:
+            rgb = self._test_rgb
+            rgba = np.empty((LCD_H, LCD_W, 4), dtype=np.uint8)
+            rgba[:, :, :3] = rgb
+            rgba[:, :, 3] = 255
+            return rgba
+        with self._lock:
+            cached = self._rgba_cache
+            last = self._rgba_last_render
+            state = replace(self.state)
+        if cached is not None and (now - last) < self._render_interval:
+            return cached
+        image = self.render(state)
+        rgba = np.asarray(image, dtype=np.uint8).copy()
+        with self._lock:
+            self._rgba_cache = rgba
+            self._rgba_last_render = time.monotonic()
+        return rgba
+
     def render(self, state: Optional[HudState] = None):
         """渲染一张 640×400 RGBA `PIL.Image`；不传 state 时取内部快照。"""
         if Image is None:  # pragma: no cover - 构造时已检查
@@ -350,12 +385,15 @@ class HudSource(ImageSource):
             self._draw_nav(draw, state)
         return image
 
-    def save_png(self, path: str) -> None:
-        """保存一张 RGBA PNG（离线核对图层/字体用）。"""
+    def save_png(self, path: str, rotate: int = 0) -> None:
+        """保存一张 RGBA PNG（离线核对图层/字体用；rotate=180 与投屏一致）。"""
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self.render().save(path)
+        image = self.render()
+        if int(rotate) % 360 == 180:
+            image = image.rotate(180)
+        image.save(path)
 
     # ------------------------------------------------------------------
     # 绘制辅助
@@ -475,16 +513,16 @@ class HudSource(ImageSource):
                                radius=3, fill=ACCENT_2)
 
         draw.line((30, 194, 126, 194), fill=CARD_EDGE)
-        draw.text((30, 206), "TEMP", font=self._font(11, bold=True), fill=MUTED)
-        draw.text((30, 222), "%.1f" % state.temperature,
-                  font=self._font(27, bold=True), fill=TEXT)
-        draw.text((100, 236), "C", font=self._font(12, bold=True), fill=MUTED)
-
-        draw.line((30, 262, 126, 262), fill=CARD_EDGE)
-        draw.text((30, 272), "SENSOR", font=self._font(10, bold=True), fill=MUTED)
-        draw.text((30, 286), "OK" if state.sensors_valid else "NO DATA",
-                  font=self._font(11, bold=True),
+        draw.text((30, 206), "SENSOR", font=self._font(10, bold=True), fill=MUTED)
+        draw.text((30, 222), "OK" if state.sensors_valid else "NO DATA",
+                  font=self._font(13, bold=True),
                   fill=OK if state.sensors_valid else BAD)
+
+        draw.line((30, 258, 126, 258), fill=CARD_EDGE)
+        draw.text((30, 268), "MAG", font=self._font(10, bold=True), fill=MUTED)
+        draw.text((30, 282), "OK" if state.compass_valid else "NO DATA",
+                  font=self._font(13, bold=True),
+                  fill=OK if state.compass_valid else BAD)
 
     def _draw_compass(self, draw, state: HudState) -> None:
         cx, cy, r = COMPASS_CX, COMPASS_CY, COMPASS_R
@@ -521,13 +559,17 @@ class HudSource(ImageSource):
                      alpha=255 if valid else 80)
         draw.ellipse((cx - 43, cy - 43, cx + 43, cy + 43),
                      fill=(10, 18, 30, 236), outline=(54, 82, 112, 220), width=1)
-        self._center_text(draw, cx, cy - 20, "%03.0f" % heading,
-                          self._font(27, bold=True), TEXT if valid else MUTED)
-        self._center_text(draw, cx, cy + 9, "deg",
-                          self._font(10, bold=True), MUTED)
-        if not valid:
-            self._center_text(draw, cx, cy + 24, "NO MAG",
-                              self._font(9, bold=True), BAD)
+        # 罗盘无数据时不要伪装成 000°：显示 -- + NO MAG。
+        value_text = "%03.0f" % heading if valid else "--"
+        self._center_text(draw, cx, cy - 20, value_text,
+                          self._font(30 if not valid else 27, bold=True),
+                          TEXT if valid else MUTED)
+        if valid:
+            self._center_text(draw, cx, cy + 9, "deg",
+                              self._font(10, bold=True), MUTED)
+        else:
+            self._center_text(draw, cx, cy + 10, "NO MAG",
+                              self._font(10, bold=True), BAD)
 
     def _needle(self, draw, cx: int, cy: int, heading: float, outer: int,
                 inner: int, color_front, color_back, alpha: int = 255) -> None:

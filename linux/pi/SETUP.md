@@ -2,9 +2,9 @@
 
 本文从一张空白 SD 卡开始，装到：
 
-* 眼镜显示 **HUD**（时间/罗盘/光感/温度/姿态/亮度/固件）；
+* 眼镜显示 **HUD**（时间/罗盘/光感/姿态/亮度/固件）或 **相机监看**；
 * 树莓派上的 **LCD HAT 作为状态/控制面板**（不镜像眼镜画面）；
-* 摇杆菜单可以调亮度、切显示模式、开关屏、开关 HUD、发测试帧、退出；
+* 摇杆菜单可以调亮度、切 HUD/MONITOR、切显示模式、开关屏、开关 HUD、发测试帧、退出；
 * 两个 systemd 服务开机自启。
 
 > 硬件操作前先读 §4 接线和 §12 供电。烧录/改 `config.txt` 前确认路径是
@@ -339,8 +339,9 @@ scp pi@glxss-pi.local:/tmp/glxss/hud.png .
 scp -r pi@glxss-pi.local:/tmp/glxss/hat .
 ```
 
-HUD 应包含：顶部时间/连接/fps、中心罗盘、左侧 lux/温度、右侧姿态、
-底部亮度/固件、导航占位箭头。HAT 预览应是 240×240 的深色状态页和菜单页。
+HUD 应包含：顶部时间/连接/fps、中心罗盘、左侧 lux/传感器状态、右侧姿态、
+底部亮度/固件、导航占位箭头（不显示温度）。HAT 预览应是 240×240 的深色
+状态页（含 VIEW 行）和 7 项菜单页。
 
 ---
 
@@ -350,8 +351,11 @@ HUD 应包含：顶部时间/连接/fps、中心罗盘、左侧 lux/温度、右
 
 ```bash
 cd /opt/glxss/linux
-/opt/glxss/venv/bin/python -m glxss hud --listen --fps 2 --brightness 180
+/opt/glxss/venv/bin/python -m glxss hud --listen --detach --fps 2 --brightness 180
 ```
+
+`--detach` 用于让运行中的 VIEW → MONITOR 能打开眼镜 UVC（uvcvideo 占着
+VS 接口）；只在 HUD 用时也可以不加。
 
 预期输出：
 
@@ -391,7 +395,7 @@ export GLXSS_SOCK=/tmp/glxssctl.sock   # 与上面一致
 |---|---|
 | 顶部 | 本地时间 HH:MM、`GLASSES ONLINE/OFFLINE`、fps、HUD ON/PAUSED |
 | 中心 | 罗盘刻度环（N/E/S/W + 15° 刻度）、heading 指针、`036 deg` |
-| 左侧 | 光感 lux、温度 °C、传感器 OK/NO DATA |
+| 左侧 | 光感 lux、传感器 OK/NO DATA、罗盘 OK/NO DATA（无温度） |
 | 右侧 | 姿态仪（地平线按 pitch/roll）、pitch/roll/gyro 数值 |
 | 底部 | 亮度条、固件串、HUD 状态、连接状态 |
 | 罗盘下方 | 可选导航占位：相对方位箭头 + 距离 + 标签 |
@@ -401,9 +405,21 @@ export GLXSS_SOCK=/tmp/glxssctl.sock   # 与上面一致
 
 ### 7.2 刷新/发送频率
 
-* HID 固件 300 ms 一包；
-* HUD 默认每 0.5 s 重绘一次（`render_interval`），2 fps 足够；
+* HID 固件 300 ms 一包；主进程按 100 ms 轮询，水平仪响应更快；
+* HUD 重绘间隔跟 `--fps` 走（`1/fps`）；Pi Zero 2 W 上单次 Pillow 渲染约 65 ms；
 * 实际发包频率由 `--fps` 控制；HUD 是静态信息，不要用 25 fps 白烧 USB/CPU。
+
+### 7.2.1 相机监看（VIEW → MONITOR）
+
+```bash
+/opt/glxss/venv/bin/python -m glxss ctl view monitor
+/opt/glxss/venv/bin/python -m glxss ctl view hud
+```
+
+眼镜 UVC 640×480 YV12 → 640×400 RGBA，叠加三分线/水平仪/可选 REC 后发回眼镜。
+`glxss-cast.service` 必须带 `--detach`，否则 UVC VS 接口被 uvcvideo 占用。
+CPU 紧张时给主进程加 `--uvc-half`（先解 320×240 再放大）。独立运行：
+`glxss cast --source uvc --fps 10 --detach --rotate 180 --rec`。
 
 ### 7.3 罗盘/姿态约定（未真机标定）
 
@@ -457,19 +473,21 @@ cd /opt/glxss/linux
 | KEY2 | 发 3 秒测试帧 |
 | KEY3 | 退出 |
 
-**菜单页**（6 项）：
+**菜单页**（7 项）：
 
 | 菜单项 | LEFT/RIGHT 调整 | PRESS 确认 |
 |---|---|---|
 | BRIGHTNESS | 100..254，步进 10 | 下发亮度 |
+| VIEW | HUD / MONITOR | 切 HUD 或眼镜相机监看 |
 | DISPLAY | 1=STANDBY / 2=CAST | 切显示模式 |
 | SCREEN | ON/OFF | 开关屏（开屏自动切 CAST） |
 | HUD | ON/PAUSED | 主进程 HUD 开关 |
-| TEST FRAME | — | 显示 3 秒测试图案 |
+| TEST FRAME | — | 显示 3 秒测试图案（自动切回 HUD） |
 | EXIT | — | 退出 lcdhat（自动拉起的 HUD 子进程也会退出） |
 
 * UP/DOWN 选择，LEFT/RIGHT 调值，PRESS 确认；
-* KEY3 返回状态页（不退出）。
+* KEY3 返回状态页（不退出）；
+* 眼镜 Fn 键单击也能在 HUD / MONITOR 之间切换。
 
 > HAT 界面是英文，避免 Pi 默认字体缺中文字形；日志/journal 是中文。
 
@@ -577,8 +595,10 @@ sudo systemctl restart glxss-cast.service glxss-lcdhat.service
 - [ ] `pi/lcdhat.py --preview` 的状态页/菜单页是 240×240
 - [ ] 接眼镜后 `glxss list` 看到 `2e09:0030`
 - [ ] `glxss hud --listen` 能开屏并显示 HUD
-- [ ] `glxss ctl status` 返回 connected=true、亮度/固件/lux/温度
-- [ ] HAT 状态页 1 秒内刷新，摇杆菜单各项能生效
+- [ ] `glxss ctl status` 返回 connected=true、亮度/固件/lux、view=hud
+- [ ] HAT 状态页 1 秒内刷新，摇杆菜单各项能生效（VIEW 可切 HUD/MONITOR）
+- [ ] `glxss ctl view monitor` 后眼镜显示相机画面 + 三分线/水平仪
+- [ ] `glxss ctl view hud` 能切回 HUD
 - [ ] 两个 systemd 服务都是 `active (running)`
 - [ ] `vcgencmd get_throttled` 输出 `throttled=0x0`（无欠压）
 

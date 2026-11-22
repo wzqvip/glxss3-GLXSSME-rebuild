@@ -21,6 +21,11 @@ from . import usb
 from .errors import GlxssError, ProtocolError
 from .util import hexs
 
+try:  # monitor 快路径需要 numpy；缺失时 uvc --help / 协议命令仍可用
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - 取决于环境
+    np = None  # type: ignore
+
 UVC_GET_CUR = 0x81
 UVC_GET_MIN = 0x82
 UVC_GET_MAX = 0x83
@@ -34,6 +39,11 @@ DEFAULT_HEIGHT = 480
 DEFAULT_FRAME_SIZE = DEFAULT_WIDTH * DEFAULT_HEIGHT * 3 // 2  # 460800
 DEFAULT_INTERVAL = 333333  # 100 ns 单位 → 30 fps
 DEFAULT_MAX_PAYLOAD = 16384
+
+
+def _require_numpy() -> None:
+    if np is None:
+        raise GlxssError("YV12→RGBA 需要 numpy：python -m pip install numpy")
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +217,9 @@ class UvcStream:
         self.width = DEFAULT_WIDTH
         self.height = DEFAULT_HEIGHT
         self._frame_index = 0
+        self.session = None
+        self.vc = None
+        self.urb_size = DEFAULT_MAX_PAYLOAD + 32
 
     @classmethod
     def open(cls, dev, session, timeout: int = 5000, verbose: bool = False) -> "UvcStream":
@@ -222,11 +235,26 @@ class UvcStream:
                     print("  set_interface(%d, alt=%d) 失败（继续）: %s" % (
                         vs.bInterfaceNumber, vs.bAlternateSetting, exc))
         stream = cls(dev, vs, ep, timeout=timeout, verbose=verbose)
+        stream.session = session
+        stream.vc = vc
         if verbose:
             print("  VC: %s" % ("if=%d" % vc.bInterfaceNumber if vc is not None else "未发现"))
             print("  VS: if=%d alt=%d ep=0x%02x" % (
                 vs.bInterfaceNumber, vs.bAlternateSetting, ep.bEndpointAddress))
         return stream
+
+    def close(self) -> None:
+        """停流（alt=0）并释放 VC/VS；可重复调用。"""
+        try:
+            self.dev.set_interface(self.vs.bInterfaceNumber, 0)
+        except Exception:
+            pass
+        session = self.session
+        if session is not None:
+            for intf in (self.vs, self.vc):
+                if intf is not None:
+                    session.release_interface(intf)
+        self.session = None
 
     def _ctrl_in(self, request: int, value: int, length: int, timeout: int) -> bytes:
         return usb.ctrl_in(self.dev, request, value, self.vs.bInterfaceNumber,
@@ -302,6 +330,13 @@ class UvcStream:
             self.width, self.height = DEFAULT_WIDTH, DEFAULT_HEIGHT
         # 以当前档位为准；CLI 可显式传 max_frame 覆盖。
         self.frame_size = max_frame or probe.max_frame or (self.width * self.height * 3 // 2)
+        # 每个 URB 只携带 maxPayload 字节；按它分配读缓冲，避免每次 read 都申请
+        # 460 KB（monitor 每秒要读几十次）。
+        # 留 64 KiB 余量：不同设备/固件的 dwMaxPayloadTransferSize 口径不完全一致，
+        # 读缓冲偏大只会多一次分配，偏小会截断 URB 头导致整帧错位。
+        payload = int(probe.max_payload or DEFAULT_MAX_PAYLOAD)
+        self.urb_size = min(max(65536, payload + 32),
+                            max(1024, self.frame_size + 22))
         return probe
 
     def set_dimensions(self, width: int, height: int) -> None:
@@ -312,8 +347,8 @@ class UvcStream:
         self.frame_size = width * height * 3 // 2
 
     def read_urb(self, timeout: Optional[int] = None) -> bytes:
-        size = max(64, self.frame_size + 22)
-        return usb.bulk_read(self.dev, self.ep.bEndpointAddress, size,
+        return usb.bulk_read(self.dev, self.ep.bEndpointAddress,
+                             max(64, int(self.urb_size)),
                              timeout or self.timeout)
 
     def read_frame(self, timeout: Optional[int] = None) -> UvcFrame:
@@ -361,7 +396,176 @@ class UvcStream:
 
 
 # ---------------------------------------------------------------------------
-# YV12 → RGB（numpy）
+# YV12 → RGBA 快路径（monitor 用；numpy）
+# ---------------------------------------------------------------------------
+def _upsample2_i16(plane):
+    """半分辨率平面 → 2×（最近邻）；手写 4 象限赋值比 np.repeat 快一个数量级。"""
+    height, width = plane.shape
+    out = np.empty((height * 2, width * 2), dtype=np.int16)
+    out[::2, ::2] = plane
+    out[1::2, ::2] = plane
+    out[::2, 1::2] = plane
+    out[1::2, 1::2] = plane
+    return out
+
+
+def _upsample2_rgba(rgba):
+    """RGBA 320×200 → 640×400 最近邻 2×（按 4 B 像素整体复制）。"""
+    height, width = rgba.shape[:2]
+    pixels = np.ascontiguousarray(rgba).view(np.uint32).reshape(height, width)
+    out = np.empty((height * 2, width * 2), dtype=np.uint32)
+    out[::2, ::2] = pixels
+    out[1::2, ::2] = pixels
+    out[::2, 1::2] = pixels
+    out[1::2, 1::2] = pixels
+    return out.view(np.uint8).reshape(height * 2, width * 2, 4)
+
+
+def _resize_rgba_nearest(rgba, out_width: int, out_height: int):
+    """任意尺寸最近邻缩放（只给 stretch/fit 等非默认模式兜底）。"""
+    height, width = rgba.shape[:2]
+    if (width, height) == (out_width, out_height):
+        return rgba
+    ys = ((np.arange(out_height) + 0.5) * height / out_height).astype(np.intp)
+    xs = ((np.arange(out_width) + 0.5) * width / out_width).astype(np.intp)
+    np.clip(ys, 0, height - 1, out=ys)
+    np.clip(xs, 0, width - 1, out=xs)
+    pixels = np.ascontiguousarray(rgba).view(np.uint32).reshape(height, width)
+    return pixels[ys[:, None], xs[None, :]].view(np.uint8).reshape(
+        out_height, out_width, 4)
+
+
+def _fit_rgba(rgba, out_width: int, out_height: int):
+    """等比缩放 + 居中黑边（fit）。"""
+    height, width = rgba.shape[:2]
+    scale = min(out_width / width, out_height / height)
+    new_w = max(1, min(out_width, int(round(width * scale))))
+    new_h = max(1, min(out_height, int(round(height * scale))))
+    canvas = np.zeros((out_height, out_width, 4), dtype=np.uint8)
+    canvas[..., 3] = 255
+    left = (out_width - new_w) // 2
+    top = (out_height - new_h) // 2
+    canvas[top:top + new_h, left:left + new_w] = _resize_rgba_nearest(
+        rgba, new_w, new_h)
+    return canvas
+
+
+def _pack_rgba_from_i16(r, g, b):
+    """int16 R/G/B → 640×400 RGBA uint8（uint32 打包，避免 4 通道跨步赋值）。"""
+    for plane in (r, g, b):
+        np.maximum(plane, 0, out=plane)
+        np.minimum(plane, 255, out=plane)
+    # 小端内存布局：uint32 = 0xAABBGGRR → 字节 R,G,B,A。
+    r32 = r.astype(np.uint32)
+    g32 = g.astype(np.uint32)
+    g32 <<= 8
+    b32 = b.astype(np.uint32)
+    b32 <<= 16
+    r32 |= g32
+    r32 |= b32
+    r32 |= np.uint32(0xFF000000)
+    height, width = r.shape
+    return r32.view(np.uint8).reshape(height, width, 4)
+
+
+def _convert_yuv(y, u, v, upsample: bool):
+    """Y/U/V 平面 → RGBA；u/v 与 y 同尺寸或半尺寸（upsample=True）。"""
+    y16 = np.maximum(y.astype(np.int16) - 16, 0).astype(np.uint16)
+    # 298*y = 256*y + 42*y，先右移再相加，等价且不会让 298*255 溢出
+    # uint16：42*255+128=10838，yterm 最大 278，再 clip 到 0..255。
+    yterm = (y16 + ((y16 * 42 + 128) >> 8)).astype(np.int16)
+    u32 = u.astype(np.int32) - 128
+    v32 = v.astype(np.int32) - 128
+    rv = ((409 * v32) >> 8).astype(np.int16)
+    bu = ((516 * u32) >> 8).astype(np.int16)
+    guv = ((-100 * u32 - 208 * v32) >> 8).astype(np.int16)
+    if upsample:
+        rv = _upsample2_i16(rv)
+        bu = _upsample2_i16(bu)
+        guv = _upsample2_i16(guv)
+    return _pack_rgba_from_i16(yterm + rv, yterm + guv, yterm + bu)
+
+
+def decode_yv12_rgba(data: bytes, width: int = DEFAULT_WIDTH,
+                     height: int = DEFAULT_HEIGHT,
+                     out_width: int = 640, out_height: int = 400,
+                     fit: str = "cover", half: bool = False):
+    """YV12 → out_width×out_height RGBA uint8，给 monitor 的 10 fps 快路径。
+
+    * fit="cover"（默认）：等比填满、居中裁切；640×480 → 640×400 只裁上下，
+      不缩放，是最快的路径；
+    * fit="stretch"：直接缩放到目标尺寸；
+    * fit="fit"：等比缩放 + 黑边；
+    * half=True：Y 隔行隔列取样（320×240），色度用原半分辨率平面，再放大：
+      解码量约 1/4，适合 Pi Zero 2 W 上保帧率/降延迟。
+    """
+    _require_numpy()
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise GlxssError("YUV420 宽高必须是正偶数（当前 %dx%d）" % (width, height))
+    if out_width <= 0 or out_height <= 0:
+        raise GlxssError("输出宽高必须为正")
+    fit = (fit or "cover").lower()
+    if fit == "crop":
+        fit = "cover"
+    if fit not in ("cover", "stretch", "fit"):
+        raise GlxssError("映射模式必须是 cover / stretch / fit，收到 %r" % fit)
+    y_size = width * height
+    c_size = y_size // 4
+    expected = y_size + 2 * c_size
+    if len(data) < expected:
+        raise ProtocolError("YUV 数据不足：需要 %d B，实际 %d B" % (expected, len(data)))
+    raw = np.frombuffer(data, dtype=np.uint8, count=expected)
+    y_plane = raw[:y_size].reshape(height, width)
+    v_plane = raw[y_size:y_size + c_size].reshape(height // 2, width // 2)
+    u_plane = raw[y_size + c_size:y_size + 2 * c_size].reshape(
+        height // 2, width // 2)
+
+    if fit == "cover":
+        scale = max(out_width / width, out_height / height)
+        crop_w = min(width, max(2, int(round(out_width / scale))))
+        crop_h = min(height, max(2, int(round(out_height / scale))))
+        # 4:2:0 要求裁切宽高和起点都是偶数，否则色度会错位一行。
+        crop_w = max(2, crop_w - crop_w % 2)
+        crop_h = max(2, crop_h - crop_h % 2)
+        left = max(0, ((width - crop_w) // 2) // 2 * 2)
+        top = max(0, ((height - crop_h) // 2) // 2 * 2)
+        crop_w = min(crop_w, (width - left) - (width - left) % 2)
+        crop_h = min(crop_h, (height - top) - (height - top) % 2)
+        if half:
+            y_crop = y_plane[top:top + crop_h:2, left:left + crop_w:2]
+            u_crop = u_plane[top // 2:(top + crop_h) // 2,
+                             left // 2:(left + crop_w) // 2]
+            v_crop = v_plane[top // 2:(top + crop_h) // 2,
+                             left // 2:(left + crop_w) // 2]
+            rgba = _convert_yuv(y_crop, u_crop, v_crop, upsample=False)
+            if (rgba.shape[1] * 2, rgba.shape[0] * 2) == (out_width, out_height):
+                return _upsample2_rgba(rgba)
+            return _resize_rgba_nearest(rgba, out_width, out_height)
+        y_crop = y_plane[top:top + crop_h, left:left + crop_w]
+        u_crop = u_plane[top // 2:(top + crop_h) // 2,
+                         left // 2:(left + crop_w) // 2]
+        v_crop = v_plane[top // 2:(top + crop_h) // 2,
+                         left // 2:(left + crop_w) // 2]
+        rgba = _convert_yuv(y_crop, u_crop, v_crop, upsample=True)
+        if (rgba.shape[1], rgba.shape[0]) == (out_width, out_height):
+            return rgba
+        return _resize_rgba_nearest(rgba, out_width, out_height)
+
+    # stretch / fit：先按整幅解码（可选半分辨率），再缩放。
+    if half:
+        y_crop = y_plane[::2, ::2]
+        u_crop = u_plane
+        v_crop = v_plane
+        rgba = _convert_yuv(y_crop, u_crop, v_crop, upsample=False)
+    else:
+        rgba = _convert_yuv(y_plane, u_plane, v_plane, upsample=True)
+    if fit == "fit":
+        return _fit_rgba(rgba, out_width, out_height)
+    return _resize_rgba_nearest(rgba, out_width, out_height)
+
+
+# ---------------------------------------------------------------------------
+# YV12 → RGB（通用路径；uvc --save / 测试用）
 # ---------------------------------------------------------------------------
 def yv12_to_rgb(data: bytes, width: int, height: int, order: str = "yv12"):
     """把 YUV420 平面数据转换成 HxWx3 uint8 RGB。

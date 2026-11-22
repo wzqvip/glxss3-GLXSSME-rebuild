@@ -16,8 +16,12 @@ Environment=GLXSS_SOCK=/run/glxss/glxssctl.sock
 RuntimeDirectory=glxss
 RuntimeDirectoryMode=0750
 # HUD 是眼镜的主显示内容；--listen 让 LCD HAT 能读状态/发命令。
+# --detach 让 monitor 模式能绕过 Linux uvcvideo 对 UVC 接口的占用；
+# 运行中可用 `glxss ctl view monitor`（或 HAT 菜单 VIEW）切到相机监看。
+# 画面上下颠倒时加 `--rotate 180`。
 # 没有眼镜时程序会报错退出，systemd 会按 Restart 重试。
 ExecStart=/opt/glxss/venv/bin/python -m glxss hud \
+    --detach \
     --listen \
     --fps 2 \
     --brightness 180

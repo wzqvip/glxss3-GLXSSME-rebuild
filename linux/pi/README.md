@@ -6,6 +6,7 @@
 目标：
 
 * **眼镜 = 主显示**：`glxss hud --listen` 在 Pi 上渲染 640×400 HUD 并按帧发送；
+  菜单 VIEW 可切到 **MONITOR 相机监看**（眼镜 UVC → 眼镜显示）；
 * **LCD HAT = 状态/控制面板**：240×240 状态页 + 菜单，不镜像眼镜画面；
 * 两者通过 Unix socket（`glxss.control`）通信；HAT 默认会自动拉起 HUD 主进程。
 
@@ -113,11 +114,29 @@ sudo systemctl stop glxss-lcdhat.service   # 让出自检要用的 GPIO
 ```bash
 cd /opt/glxss/linux
 export GLXSS_SOCK=/tmp/glxssctl.sock
-/opt/glxss/venv/bin/python -m glxss hud --listen --fps 2 --brightness 180
+/opt/glxss/venv/bin/python -m glxss hud --listen --detach --fps 2 --brightness 180
 ```
 
-默认 2 fps、每 0.5 s 重绘一次；HID 300 ms 一包。HUD 内容：
-时间/连接/fps、罗盘、lux/温度、姿态、亮度/固件、可选导航占位。
+默认 2 fps；HID 100 ms 轮询。HUD 内容：时间/连接/fps、罗盘、lux/传感器状态、
+姿态、亮度/固件、可选导航占位（**不再显示温度**；罗盘无数据时显示 `--`）。
+
+`--detach` 是为了让运行中的 VIEW → MONITOR 能打开眼镜 UVC（uvcvideo 会占着
+VS 接口）。相机监看：
+
+```bash
+# 在 HUD 主进程里切换（推荐；HAT 菜单 VIEW 同效）
+/opt/glxss/venv/bin/python -m glxss ctl view monitor
+/opt/glxss/venv/bin/python -m glxss ctl view hud
+/opt/glxss/venv/bin/python -m glxss ctl rec on
+
+# 或者独立跑，不启动 HUD 主进程
+/opt/glxss/venv/bin/python -m glxss cast --source uvc --fps 10 \
+    --detach --rotate 180 --rec
+```
+
+监看叠加三分线、水平仪（HID 加速度计）和可选 REC 红点/时间；默认 cover
+裁切（640×480 → 640×400，不缩放）。Pi Zero 2 W 上若帧率/延迟不理想，
+加 `--uvc-half`（先解 320×240 再放大）。
 
 ### 4.2 HAT 控制器
 
@@ -147,19 +166,22 @@ export GLXSS_SOCK=/tmp/glxssctl.sock
 ## 5. 菜单
 
 **状态页**：PRESS 进菜单；KEY1 HUD 开关；KEY2 发 3 秒测试帧；KEY3 退出。
+状态页新增 **VIEW** 行（HUD / MONITOR），不再显示 TEMP。
 
-**菜单页**：
+**菜单页**（7 项）：
 
 | 项 | LEFT/RIGHT | PRESS |
 |---|---|---|
 | BRIGHTNESS | 100..254 步进 10 | 下发亮度 |
+| VIEW | HUD / MONITOR | 切相机监看（眼镜 UVC → 眼镜显示） |
 | DISPLAY | 1=STANDBY / 2=CAST | 切显示模式 |
 | SCREEN | ON/OFF | 开关屏（开屏自动 CAST） |
 | HUD | ON/PAUSED | HUD 开关 |
-| TEST FRAME | — | 发测试图案 3 秒 |
+| TEST FRAME | — | 发测试图案 3 秒（自动切回 HUD） |
 | EXIT | — | 退出（自动拉起的 HUD 子进程一起退出） |
 
 UP/DOWN 选择，LEFT/RIGHT 调值，PRESS 确认，KEY3 返回。
+**眼镜 Fn 键单击**也可在 HUD / MONITOR 之间切换，不占用 HAT 按键。
 
 `glxss ctl` 也能直接控制主进程：
 
@@ -180,6 +202,7 @@ export GLXSS_SOCK=/tmp/glxssctl.sock
 两个 unit：
 
 * `service/glxss-cast.service`：HUD 主进程 + `/run/glxss/glxssctl.sock`；
+  模板已带 `--detach`（monitor 模式需要），画面颠倒时加 `--rotate 180`；
 * `service/glxss-lcdhat.service`：HAT，`--no-spawn` 只连 socket。
 
 ```bash
@@ -201,6 +224,10 @@ journalctl -u glxss-cast.service -f
   硬铁/软铁校准**，真机方向可能需要 `--heading-offset` 微调。
 * ST7789 240×240 的 offset/反相随批次不同，需要按 §4 调。
 * `--source screen` 需要 X11/XWayland；Raspberry Pi OS Lite 用 HUD/test。
+* monitor（UVC）在 Linux 需要 `--detach` 摘掉 uvcvideo；同一时间只能有一个
+  进程占用眼镜摄像头（HUD 主进程切监看，或独立 `cast --source uvc`）。
+* 相机监看的发送帧率受 LCD bulk OUT 吞吐限制；默认 cover 解码约 44 ms/帧
+  （Pi Zero 2 W @1 GHz），帧率不够时用 `--uvc-half`（约 17 ms/帧）。
 * Pi Zero 2 W USB 供电有限；眼镜 + HAT 建议带供电 Hub 或独立供电。
 * 本项目不修改眼镜固件；首次使用仍需主机向 `03e7:2150` 灌合法固件
   （`glxss flash IMAGE --yes`），详见 SETUP.md §12。
@@ -248,6 +275,7 @@ ExecStart=/usr/bin/python3 /home/taco/glxss3-linux/pi/lcdhat.py \
     --rotation 0 --x-offset 0 --y-offset 80 --spi-hz 40000000
 ```
 
+`--detach` 加在 `glxss-cast.service` 的 ExecStart 里（monitor 需要），
 `--no-spawn` 是刻意的：眼镜不在线时 `glxss hud --listen` 会直接退出，
 HAT 只连 socket、显示 `GLASSES OFFLINE`，所以**没眼镜也能正常当状态面板用**。
 `glxss-cast.service` 也**没有**在本机启用（无眼镜时会反复重启），插上眼镜后再

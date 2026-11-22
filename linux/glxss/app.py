@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
-from .capture import ImageSource, map_to_rgba, rgba_bytes
+from .capture import (ImageSource, map_to_rgba, rgba_bytes, rotate180_rgba)
 from .errors import GlxssError
 from .lcd import FRAME_TOTAL, build_frame
 from .util import human_rate
@@ -47,7 +47,7 @@ class CastApp:
     """可注入 sender 的主循环；sender=None 即 dry-run（仍生成完整帧）。"""
 
     def __init__(self, source: ImageSource, sender: Sender = None,
-                 fps: float = 15.0, fit: str = "fit",
+                 fps: float = 15.0, fit: str = "fit", rotate: int = 0,
                  duration: float = 0.0, max_frames: int = 0,
                  timeout: int = 5000, on_stats: StatsCallback = None,
                  close_source: bool = False, report_interval: float = 1.0):
@@ -55,6 +55,7 @@ class CastApp:
         self.sender = sender
         self.fps = max(0.0, fps)
         self.fit = fit
+        self.rotate = 180 if int(rotate) % 360 == 180 else 0
         self.duration = max(0.0, duration)
         self.max_frames = max(0, max_frames)
         self.timeout = timeout
@@ -81,8 +82,15 @@ class CastApp:
                     break
                 frame_started = time.monotonic()
                 try:
-                    rgb = self.source.grab()
-                    rgba = map_to_rgba(rgb, mode=self.fit)
+                    # 采集源可以直接给出 640×400 RGBA（monitor/UVC 快路径），
+                    # 省掉 map_to_rgba 的缩放、通道拼接和一次 1 MB 拷贝。
+                    grab_rgba = getattr(self.source, "grab_rgba", None)
+                    rgba = grab_rgba() if callable(grab_rgba) else None
+                    if rgba is None:
+                        rgb = self.source.grab()
+                        rgba = map_to_rgba(rgb, mode=self.fit)
+                    if self.rotate == 180:
+                        rgba = rotate180_rgba(rgba)
                     packet = build_frame(rgba_bytes(rgba))
                     if len(packet) != FRAME_TOTAL:
                         raise GlxssError("内部错误：帧包长度 %d != %d" % (

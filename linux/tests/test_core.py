@@ -16,7 +16,8 @@ import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
-from glxss import capture, control, firmware, hid, hud, lcd, uvc
+from glxss import capture, control, firmware, hid, hud, lcd, monitor, uvc
+from glxss.errors import GlxssError
 from glxss.cli import build_parser
 from glxss.cli import main as cli_main
 
@@ -191,8 +192,8 @@ class ControlTests(unittest.TestCase):
     def test_server_client_roundtrip(self):
         def handler(request):
             if request.get("cmd") == "ping":
-                return {"ok": True, "pong": True, "status": {"connected": True}}
-            return {"ok": True, "echo": request}
+                return {"ok": True, "pong": True}
+            return {"ok": True, "status": {"connected": True}, "echo": request}
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "glxss.sock")
@@ -229,6 +230,192 @@ class YuvTests(unittest.TestCase):
     def test_size_check(self):
         with self.assertRaises(Exception):
             uvc.yv12_to_rgb(b"\x00" * 10, 8, 8)
+
+
+class FastRgbaTests(unittest.TestCase):
+    """monitor 的 YV12→RGBA 快路径；无硬件也能验证颜色/尺寸/旋转。"""
+
+    @staticmethod
+    def _frame(w=640, h=480):
+        rng = __import__("numpy").random.default_rng(1)
+        y = rng.integers(0, 256, w * h, dtype=__import__("numpy").uint8)
+        u = rng.integers(0, 256, w * h // 4, dtype=__import__("numpy").uint8)
+        v = rng.integers(0, 256, w * h // 4, dtype=__import__("numpy").uint8)
+        return y.tobytes() + v.tobytes() + u.tobytes()
+
+    def test_cover_matches_reference(self):
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy 未安装")
+        w, h = 640, 480
+        data = self._frame(w, h)
+        reference = uvc.yv12_to_rgb(data, w, h)
+        rgba = uvc.decode_yv12_rgba(data, w, h, 640, 400, fit="cover")
+        self.assertEqual(rgba.shape, (400, 640, 4))
+        self.assertEqual(rgba.dtype.name, "uint8")
+        self.assertTrue((rgba[..., 3] == 255).all())
+        diff = np.abs(rgba[:, :, :3].astype(np.int16) -
+                      reference[40:440].astype(np.int16))
+        # 分开取整/截断与参考实现最多差 1。
+        self.assertLessEqual(int(diff.max()), 2)
+        self.assertLess(float(diff.mean()), 2.0)
+
+    def test_modes_and_half(self):
+        try:
+            __import__("numpy")
+        except Exception:
+            self.skipTest("numpy 未安装")
+        data = self._frame()
+        for fit in ("cover", "stretch", "fit"):
+            with self.subTest(fit=fit):
+                rgba = uvc.decode_yv12_rgba(data, 640, 480, 640, 400, fit=fit)
+                self.assertEqual(rgba.shape, (400, 640, 4))
+        half = uvc.decode_yv12_rgba(data, 640, 480, 640, 400,
+                                    fit="cover", half=True)
+        self.assertEqual(half.shape, (400, 640, 4))
+
+    def test_rotate180_matches_reference(self):
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy 未安装")
+        rgba = np.arange(400 * 640 * 4, dtype=np.uint8).reshape(400, 640, 4)
+        rotated = capture.rotate180_rgba(rgba)
+        expected = np.ascontiguousarray(rgba[::-1, ::-1])
+        self.assertTrue((rotated == expected).all())
+
+
+class MonitorTests(unittest.TestCase):
+    READY = hud.Image is not None and hud.np is not None
+
+    class _TimeoutStream:
+        def __init__(self):
+            self.closed = False
+
+        def read_frame(self, timeout=None):
+            import time
+            time.sleep(0.01)
+            raise GlxssError("UVC 读帧超时（测试）")
+
+        def close(self):
+            self.closed = True
+
+    def test_overlay_grid_level_and_rec(self):
+        if not self.READY:
+            self.skipTest("需要 Pillow + numpy")
+        import numpy as np
+        source = monitor.MonitorSource(
+            self._TimeoutStream(), timeout=100,
+            state_provider=hud.demo_state, rec=True)
+        try:
+            rgba = np.zeros((400, 640, 4), dtype=np.uint8)
+            rgba[..., 3] = 255
+            source._compose(rgba)
+            # 三分线：x=213 与 y=133 不应再是全黑。
+            self.assertGreater(int(rgba[:, 213, :3].sum()), 0)
+            self.assertGreater(int(rgba[133, :, :3].sum()), 0)
+            # REC 红点/文字叠加在右上角，红色通道明显。
+            corner = rgba[4:34, 486:640, 0]
+            self.assertGreater(int(corner.max()), 200)
+            self.assertTrue((rgba[..., 3] == 255).all())
+        finally:
+            source.close()
+
+    def test_mode_source_switch_and_fallback(self):
+        if not self.READY:
+            self.skipTest("需要 Pillow + numpy")
+        import numpy as np
+
+        class FakeHud:
+            name = "hud"
+
+            def grab(self):
+                return np.zeros((400, 640, 3), dtype=np.uint8)
+
+            def grab_rgba(self):
+                return np.zeros((400, 640, 4), dtype=np.uint8)
+
+            def close(self):
+                pass
+
+        opened = []
+
+        class FakeMonitor:
+            name = "uvc"
+
+            def __init__(self):
+                self.closed = False
+
+            def grab_rgba(self):
+                return np.full((400, 640, 4), 7, dtype=np.uint8)
+
+            def grab(self):
+                return np.zeros((400, 640, 3), dtype=np.uint8)
+
+            def set_rec(self, value):
+                pass
+
+            def stats_dict(self):
+                return {"read_fps": 1.0}
+
+            def close(self):
+                self.closed = True
+
+        def opener():
+            item = FakeMonitor()
+            opened.append(item)
+            return item
+
+        source = monitor.ModeSource(FakeHud(), opener)
+        self.assertEqual(source.mode, "hud")
+        self.assertEqual(int(source.grab_rgba().max()), 0)
+        source.request_view("monitor")
+        self.assertEqual(int(source.grab_rgba().max()), 7)
+        self.assertEqual(source.mode, "monitor")
+        self.assertEqual(len(opened), 1)
+        source.request_view("hud")
+        source.grab_rgba()
+        self.assertEqual(source.mode, "hud")
+        self.assertTrue(opened[0].closed)
+
+        def broken():
+            raise GlxssError("UVC 不可用（测试）")
+
+        fallback = monitor.ModeSource(FakeHud(), broken)
+        fallback.request_view("monitor")
+        self.assertEqual(int(fallback.grab_rgba().max()), 0)
+        self.assertEqual(fallback.mode, "hud")
+        self.assertIn("UVC", fallback.error)
+
+
+class MonitorCliTests(unittest.TestCase):
+    def test_cast_uvc_args(self):
+        args = build_parser().parse_args(
+            ["cast", "--source", "uvc", "--fps", "10", "--rec",
+             "--camera-fps", "15", "--uvc-half", "--rotate", "180"])
+        self.assertEqual(args.source, "uvc")
+        self.assertEqual(args.fps, 10)
+        self.assertTrue(args.rec)
+        self.assertTrue(args.uvc_half)
+        self.assertEqual(args.rotate, 180)
+        self.assertIsNone(args.fit)  # uvc 默认在 cmd_cast 里解析为 cover
+
+    def test_hud_view_args(self):
+        args = build_parser().parse_args(
+            ["hud", "--view", "monitor", "--listen", "--detach",
+             "--monitor-fit", "cover", "--rotate", "180"])
+        self.assertEqual(args.view, "monitor")
+        self.assertEqual(args.monitor_fit, "cover")
+        self.assertEqual(args.rotate, 180)
+
+    def test_ctl_view_and_rec(self):
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(["ctl", "view", "monitor"]).value,
+                         "monitor")
+        self.assertEqual(parser.parse_args(["ctl", "rec", "on"]).value, "on")
+        self.assertEqual(parser.parse_args(["ctl", "mode", "monitor"]).value,
+                         "monitor")
 
 
 class UvcHeaderTests(unittest.TestCase):

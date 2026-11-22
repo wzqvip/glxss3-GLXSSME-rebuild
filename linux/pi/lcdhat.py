@@ -16,6 +16,7 @@
 操作：
   状态页：PRESS 进菜单；KEY1 HUD 开关；KEY2 发测试帧；KEY3 退出。
   菜单页：UP/DOWN 选项；LEFT/RIGHT 调值；PRESS 确认；KEY3 返回。
+  VIEW 项在 HUD / MONITOR（眼镜相机监看）之间切换；眼镜 Fn 键单击也可切换。
 
 无树莓派硬件时可以用 `--preview` 生成状态页/菜单页 PNG：
     python pi/lcdhat.py --preview /tmp/glxss-hat-preview
@@ -359,6 +360,7 @@ class ST7789:
 # ---------------------------------------------------------------------------
 MENU_ITEMS = (
     ("brightness", "BRIGHTNESS"),
+    ("view", "VIEW"),
     ("mode", "DISPLAY"),
     ("screen", "SCREEN"),
     ("hud", "HUD"),
@@ -430,14 +432,15 @@ class Pages:
         draw.text((78, 32), "ONLINE" if state.get("connected") else "OFFLINE",
                   font=font, fill=dot)
 
+        view = state.get("view") or "hud"
         rows = [
             ("FPS", "%.1f" % float(state.get("fps", 0.0)), (225, 230, 238)),
             ("BRIGHT", str(state.get("brightness", "-")), (225, 230, 238)),
+            ("VIEW", "MONITOR" if view == "monitor" else "HUD",
+             (120, 220, 255) if view == "monitor" else (120, 230, 150)),
             ("HUD", "ON" if state.get("hud") else "PAUSED",
              (120, 230, 150) if state.get("hud") else (255, 190, 72)),
             ("LUX", "%s lx" % state.get("lux", "-"), (255, 208, 120)),
-            ("TEMP", "%.1f C" % float(state.get("temperature", 0.0)),
-             (255, 208, 120)),
             ("MODE", "CAST" if state.get("mode") == 2 else "STANDBY",
              (225, 230, 238)),
             ("TIME", state.get("time") or time.strftime("%H:%M:%S"),
@@ -479,10 +482,11 @@ class Pages:
                     small, (210, 228, 245))
 
         for i, (key, label) in enumerate(MENU_ITEMS):
-            y = 38 + i * 26
+            # 7 项：行距 22 px，最后一项在 y=168，不压到底部分隔线（198）。
+            y = 36 + i * 22
             selected = i == index
             if selected:
-                draw.rounded_rectangle((5, y - 3, LCD_W - 5, y + 20), radius=5,
+                draw.rounded_rectangle((5, y - 2, LCD_W - 5, y + 18), radius=5,
                                        fill=(28, 62, 98))
             color = (255, 255, 255) if selected else (180, 192, 206)
             draw.text((12, y), label, font=font, fill=color)
@@ -506,6 +510,9 @@ class Pages:
     def _menu_value(key: str, state: dict, edit) -> str:
         if key == "brightness":
             return str(edit if edit is not None else state.get("brightness", "-"))
+        if key == "view":
+            value = edit if edit is not None else (state.get("view") or "hud")
+            return "MONITOR" if value == "monitor" else "HUD"
         if key == "mode":
             mode = edit if edit is not None else state.get("mode", 2)
             return "CAST" if mode == 2 else "STANDBY"
@@ -730,6 +737,8 @@ class LcdHatApp:
                 return max(100, min(254, int(self.status.get("brightness", 180))))
             except (TypeError, ValueError):
                 return 180
+        if key == "view":
+            return "monitor" if (self.status.get("view") or "hud") == "monitor" else "hud"
         if key == "mode":
             return 2 if self.status.get("mode") == 2 else 1
         if key == "screen":
@@ -749,6 +758,8 @@ class LcdHatApp:
         if key == "brightness":
             current = self.edit if isinstance(self.edit, int) else 180
             self.edit = max(100, min(254, current + 10 * direction))
+        elif key == "view":
+            self.edit = "hud" if self.edit == "monitor" else "monitor"
         elif key == "mode":
             self.edit = 1 if self.edit == 2 else 2
         elif key in ("screen", "hud"):
@@ -762,6 +773,8 @@ class LcdHatApp:
         key = MENU_ITEMS[self.index][0]
         if key == "brightness":
             self._command("bright", value=self.edit)
+        elif key == "view":
+            self._command("view", value=self.edit)
         elif key == "mode":
             self._command("mode", value=self.edit)
         elif key == "screen":
@@ -847,7 +860,7 @@ def preview(out_dir: str) -> int:
     pages = Pages()
     state = {
         "connected": True, "fps": 2.0, "brightness": 185, "hud": True,
-        "lux": 321, "temperature": 36.5, "mode": 2, "screen": True,
+        "lux": 321, "view": "hud", "mode": 2, "screen": True,
         "time": time.strftime("%H:%M:%S"),
     }
     status_path = os.path.join(out_dir, "hat-status.png")

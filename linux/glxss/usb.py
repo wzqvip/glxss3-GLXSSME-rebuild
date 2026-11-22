@@ -14,6 +14,7 @@ hid.py 里。pyusb 是可选导入：只跑 `--help`、`frame --dry-run` 时不�
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from typing import Iterator, List, Optional, Sequence
 
@@ -239,8 +240,16 @@ def find_interface(dev, number: int, alt: Optional[int] = None):
 
 
 def interface_label(intf) -> str:
-    return "cfg=%d if=%d alt=%d class=0x%02x sub=0x%02x proto=0x%02x" % (
-        intf.bConfigurationValue,
+    # pyusb 的 Interface 对象没有 bConfigurationValue（只有 Configuration 有），
+    # 老代码在 -v 下会抛 AttributeError 并误报 claim 失败。
+    try:
+        config = getattr(intf, "configuration", None)
+        config_value = getattr(config, "bConfigurationValue", None)
+    except Exception:
+        config_value = None
+    config_text = ("cfg=%d " % config_value) if config_value is not None else ""
+    return "%sif=%d alt=%d class=0x%02x sub=0x%02x proto=0x%02x" % (
+        config_text,
         intf.bInterfaceNumber,
         intf.bAlternateSetting,
         intf.bInterfaceClass,
@@ -341,6 +350,43 @@ def pick_uvc(dev):
 
 
 # ---------------------------------------------------------------------------
+# 全进程 USB 串行闸门
+# ---------------------------------------------------------------------------
+class UsbGate:
+    """控制面 + LCD bulk OUT 的串行闸门（对应 Android 版 UsbGate）。
+
+    背景：投屏每帧是一次 1,024,016 B 的 bulk OUT，而 HID 轮询（300/100 ms）、
+    亮度/模式控制、UVC probe/commit 会同时在其它线程发出。这些请求插进
+    1 MB 帧中间最容易触发固件异常，所以：
+
+      * 所有 control transfer、claim/set_interface、LCD bulk OUT 都走闸门；
+      * UVC 的 bulk IN 读流**不走**闸门（长驻读，原厂也是 LCD+UVC 并发）。
+
+    使用 RLock 允许同一线程嵌套（例如 monitor 打开时 claim + negotiate）。
+    """
+
+    def __init__(self, verbose: bool = False):
+        self._lock = threading.RLock()
+        self.verbose = verbose
+        self.last_owner = ""
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._lock.release()
+        return False
+
+    def acquire(self, owner: str = "") -> None:
+        self._lock.acquire()
+        self.last_owner = owner or self.last_owner
+
+    def release(self) -> None:
+        self._lock.release()
+
+
+# ---------------------------------------------------------------------------
 # 打开 / claim / 释放
 # ---------------------------------------------------------------------------
 class DeviceSession:
@@ -405,6 +451,17 @@ class DeviceSession:
                       "  控制请求仍会尝试；若失败请关闭厂商 App、Linux 加 --detach、"
                       "Windows 用 Zadig。" % (name, exc))
             return False
+
+    def release_interface(self, intf) -> None:
+        """单独释放一个已 claim 的接口（monitor 退出时停 UVC 流用）。"""
+        try:
+            usb.util.release_interface(self.dev, intf)  # type: ignore[union-attr]
+        except Exception:
+            pass
+        try:
+            self.claimed.remove(intf)
+        except ValueError:
+            pass
 
     def close(self) -> None:
         if self._closed:

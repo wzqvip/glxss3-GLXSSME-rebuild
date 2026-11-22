@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Optional, Tuple
 
-from . import __version__, capture, control, firmware, hid, hud, lcd, usb, uvc
+from . import __version__, capture, control, firmware, hid, hud, lcd, monitor, usb, uvc
 from .app import CastApp, stats_summary
 from .errors import GlxssError
 from .util import hexdump, hexs, now_str
@@ -36,10 +36,13 @@ def _add_device_args(parser: argparse.ArgumentParser, timeout: int = 2000) -> No
     parser.add_argument("-v", "--verbose", action="store_true", help="打印接口/claim 细节")
 
 
-def _add_fit_arg(parser: argparse.ArgumentParser) -> None:
+def _add_fit_arg(parser: argparse.ArgumentParser, default=None) -> None:
+    parser.add_argument("--rotate", type=int, choices=(0, 180), default=0,
+                        help="画面旋转：0=正常 / 180=上下左右翻转（眼镜装反时用）")
     parser.add_argument("--fit", choices=("fit", "cover", "crop", "stretch"),
-                        default="fit",
-                        help="映射：fit=留黑边（默认）/ cover=裁切 / stretch=拉伸")
+                        default=default,
+                        help="映射：fit=留黑边 / cover=裁切 / stretch=拉伸"
+                             "（默认 hud=stretch、uvc=cover、其它=fit）")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -136,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="test(默认)/bars/black/solid/image/png/hud")
     p.add_argument("path", nargs="?", help="image/png 的路径；solid 时可直接给颜色")
     p.add_argument("--color", default=None, help="solid 颜色，例如 ff8000")
-    _add_fit_arg(p)
+    _add_fit_arg(p, default="fit")
     p.add_argument("--dry-run", action="store_true", help="只生成帧并打印 SHA256，不打开设备")
     p.add_argument("--save-png", metavar="PNG", help="保存映射后的 640×400 RGBA PNG")
     p.add_argument("--fps", type=float, default=10.0, help="发送帧率（0=不限速）")
@@ -158,35 +161,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_flash)
 
     # cast -----------------------------------------------------------------
-    p = sub.add_parser("cast", help="实时投屏（HUD/屏幕/测试图案 → 眼镜）")
-    p.add_argument("--source", choices=("hud", "screen", "test"), default="hud",
-                   help="采集源：hud（默认 HUD）、screen（mss）或 test")
+    p = sub.add_parser("cast", help="实时投屏（HUD/相机监看/屏幕/测试图案 → 眼镜）")
+    p.add_argument("--source", choices=("hud", "uvc", "screen", "test"),
+                   default="hud",
+                   help="采集源：hud（默认 HUD）、uvc（眼镜相机监看）、screen 或 test")
     p.add_argument("--monitor", type=int, default=1, help="mss 显示器编号（0=全部）")
     p.add_argument("--fps", type=float, default=None,
-                   help="目标帧率（HUD 默认 2，screen/test 默认 15）")
+                   help="目标帧率（HUD 默认 2，uvc 默认 10，screen/test 默认 15）")
     _add_fit_arg(p)
     p.add_argument("--duration", type=float, default=0.0, help="持续秒数（0=一直）")
     p.add_argument("--frames", type=int, default=0, help="发送帧数上限（0=不限）")
-    p.add_argument("--dry-run", action="store_true", help="只采集/映射，不打开眼镜")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只采集/映射，不打开眼镜（uvc 源需要真机）")
     p.add_argument("--test-pattern", choices=("bars", "gradient"), default="bars",
                    help="--source test 时的图案")
     p.add_argument("--brightness", type=int, default=180, help="HUD 源显示的初始亮度")
-    p.add_argument("--demo", action="store_true", help="HUD 使用演示传感器数据")
+    p.add_argument("--demo", action="store_true", help="HUD/监看使用演示传感器数据")
     p.add_argument("--heading-offset", type=float, default=0.0,
                    help="罗盘 heading 校准偏移（度）")
     p.add_argument("--listen", action="store_true",
                    help="HUD 源启动 Unix socket 控制服务（供 LCD HAT 使用）")
     p.add_argument("--socket", default=None, help="控制 socket 路径")
+    p.add_argument("--view", choices=("hud", "monitor"), default="hud",
+                   help="HUD 主进程初始视图（可运行中用 ctl view 切换）")
+    p.add_argument("--rec", action="store_true",
+                   help="监看模式右上角显示录制红点/时间")
+    p.add_argument("--camera-fps", type=float, default=15.0,
+                   help="UVC 协商帧率（默认 15；发送帧率由 --fps 控制）")
+    p.add_argument("--uvc-half", action="store_true",
+                   help="UVC 先解 320×240 再放大（Pi Zero 2 W 上更省 CPU/延迟）")
+    p.add_argument("--monitor-fit", choices=("cover", "stretch", "fit"),
+                   default="cover", help="监看模式映射（默认 cover 裁切）")
     p.add_argument("--no-init", action="store_true", help="不先发开屏/模式命令")
     _add_device_args(p, timeout=5000)
     p.set_defaults(func=cmd_cast)
 
     # hud ------------------------------------------------------------------
-    p = sub.add_parser("hud", help="HUD 渲染源：时钟/罗盘/姿态/光感/温度 → 眼镜",
+    p = sub.add_parser("hud", help="HUD 渲染源：时钟/罗盘/姿态/光感 → 眼镜",
                        description="眼镜作为主显示，默认 2 fps 渲染 640×400 HUD；"
+                                   "--view monitor 可切到相机监看；"
                                    "--dry-run 离线生成 PNG 便于核对图层。")
     p.add_argument("--fps", type=float, default=2.0,
-                   help="HUD 发送帧率（默认 2，0=不限速）")
+                   help="HUD 发送帧率（默认 2，0=不限速；monitor 建议 10）")
+    p.add_argument("--rotate", type=int, choices=(0, 180), default=0,
+                   help="画面旋转：0=正常 / 180=上下左右翻转（眼镜装反时用）")
     p.add_argument("--brightness", type=int, default=180,
                    help="HUD 底栏/初始亮度（默认 180，实测有效 100..254）")
     p.add_argument("--duration", type=float, default=0.0, help="持续秒数（0=一直）")
@@ -201,6 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--listen", action="store_true",
                    help="启动 Unix socket 控制服务（LCD HAT 用）")
     p.add_argument("--socket", default=None, help="控制 socket 路径")
+    p.add_argument("--view", choices=("hud", "monitor"), default="hud",
+                   help="启动视图（默认 hud；monitor 需要眼镜 UVC，通常配合 --detach）")
+    p.add_argument("--rec", action="store_true",
+                   help="监看模式右上角显示录制红点/时间")
+    p.add_argument("--camera-fps", type=float, default=15.0,
+                   help="UVC 协商帧率（默认 15；发送帧率仍由 --fps 控制）")
+    p.add_argument("--uvc-half", action="store_true",
+                   help="UVC 先解 320×240 再放大（更省 CPU/延迟）")
+    p.add_argument("--monitor-fit", choices=("cover", "stretch", "fit"),
+                   default="cover", help="监看模式映射（默认 cover 裁切）")
     p.add_argument("--no-init", action="store_true", help="不先发开屏/模式命令")
     _add_device_args(p, timeout=5000)
     p.set_defaults(func=cmd_hud)
@@ -209,8 +237,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ctl", help="通过 Unix socket 控制正在运行的 HUD 主进程")
     p.add_argument("action",
                    choices=("status", "ping", "bright", "screen", "mode",
-                            "hud", "test", "nav", "nav-clear", "quit"),
-                   help="要发送的命令")
+                            "view", "rec", "hud", "test", "nav", "nav-clear",
+                            "quit"),
+                   help="要发送的命令（view/mode 可切 hud|monitor）")
     p.add_argument("value", nargs="?", help="命令参数（brightness/on/off/度数等）")
     p.add_argument("--distance", type=float, default=0.0, help="nav 的距离（米）")
     p.add_argument("--label", default="", help="nav 的文字标签")
@@ -506,6 +535,8 @@ def _resolve_frame_source(args):
 def _frame_packet(args):
     rgb, desc = _resolve_frame_source(args)
     rgba = capture.map_to_rgba(rgb, mode=args.fit)
+    if int(getattr(args, "rotate", 0) or 0) % 360 == 180:
+        rgba = capture.rotate180_rgba(rgba)
     payload = capture.rgba_bytes(rgba)
     packet = lcd.build_frame(payload)
     return packet, desc, rgba
@@ -647,7 +678,7 @@ def cmd_flash(args) -> int:
 # ---------------------------------------------------------------------------
 def cmd_cast(args) -> int:
     if args.fps is None:
-        args.fps = 2.0 if args.source == "hud" else 15.0
+        args.fps = {"hud": 2.0, "uvc": 10.0}.get(args.source, 15.0)
     if args.fps < 0:
         raise GlxssError("--fps 不能为负")
     if args.duration < 0:
@@ -655,6 +686,12 @@ def cmd_cast(args) -> int:
     if args.source == "hud":
         _hud_defaults(args)
         return cmd_hud(args)
+    if args.source == "uvc":
+        if args.fit is None:
+            args.fit = "cover"
+        return _cast_uvc(args)
+    if args.fit is None:
+        args.fit = "fit"
     source = capture.create_source(args.source, monitor=args.monitor,
                                    test_pattern=args.test_pattern)
     session = None
@@ -662,7 +699,8 @@ def cmd_cast(args) -> int:
         if args.dry_run:
             print("DRY-RUN：采集源=%s，不打开眼镜。" % source.name)
             app = CastApp(source, sender=None, fps=args.fps, fit=args.fit,
-                          duration=args.duration, max_frames=args.frames,
+                          rotate=args.rotate, duration=args.duration,
+                          max_frames=args.frames,
                           on_stats=lambda st: print("[%s] %s" % (
                               time.strftime("%H:%M:%S"), st.line())))
             stats = app.run()
@@ -681,10 +719,12 @@ def cmd_cast(args) -> int:
                 print("已开屏并切到投屏模式。")
             except GlxssError as exc:
                 print("[警告] 初始化失败（继续投屏）: %s" % exc, file=sys.stderr)
-        print("开始投屏：源=%s fit=%s fps=%s（Ctrl-C 停止）" % (
-            source.name, args.fit, args.fps if args.fps > 0 else "不限"))
+        print("开始投屏：源=%s fit=%s fps=%s rot=%d（Ctrl-C 停止）" % (
+            source.name, args.fit, args.fps if args.fps > 0 else "不限",
+            args.rotate))
         app = CastApp(source, sender=link.send_packet, fps=args.fps, fit=args.fit,
-                      duration=args.duration, max_frames=args.frames,
+                      rotate=args.rotate, duration=args.duration,
+                      max_frames=args.frames,
                       on_stats=lambda st: print("[%s] %s" % (
                           time.strftime("%H:%M:%S"), st.line())))
         try:
@@ -695,6 +735,104 @@ def cmd_cast(args) -> int:
         print(stats_summary(stats))
     finally:
         source.close()
+        if session is not None:
+            session.close()
+    return 0
+
+
+def _cast_uvc(args) -> int:
+    """独立相机监看：claim LCD+HID+UVC，UVC 读帧线程 + LCD 发送线程。"""
+    if args.dry_run:
+        raise GlxssError(
+            "uvc 源需要眼镜在线，不能 dry-run。\n"
+            "  离线预览 HUD 用 `glxss hud --dry-run --save-png x.png`；\n"
+            "  验证投屏管线用 `glxss cast --source test --dry-run`。")
+    if args.listen:
+        print("[警告] --listen 只用于 HUD 源；独立 uvc 监看不启动控制 socket。",
+              file=sys.stderr)
+    render_interval = (1.0 / args.fps) if args.fps > 0 else 0.5
+    hud_source = hud.HudSource(brightness=args.brightness, demo=args.demo,
+                               heading_offset=args.heading_offset,
+                               render_interval=max(0.1, render_interval))
+    hud_source.set_fps(args.fps)
+    gate = usb.UsbGate(verbose=args.verbose)
+    session = None
+    monitor_source = None
+
+    def on_stats(stats) -> None:
+        extra = ""
+        if monitor_source is not None:
+            monitor_stats = monitor_source.stats_dict()
+            extra = " | uvc %.1f fps 读 %.0f ms 解码 %.0f ms 旧帧 %d" % (
+                monitor_stats.get("read_fps", 0.0),
+                monitor_stats.get("read_ms", 0.0),
+                monitor_stats.get("decode_ms", 0.0),
+                monitor_stats.get("frames_stale", 0))
+        print("[%s] %s%s" % (time.strftime("%H:%M:%S"), stats.line(), extra))
+
+    try:
+        dev = usb.find_normal()
+        print("设备: " + usb.device_label(dev))
+        session = usb.DeviceSession(dev, detach=args.detach, verbose=args.verbose)
+        intf, ep = usb.pick_bulk_out(dev)
+        session.claim_interface(intf, label="LCD")
+        link = lcd.LcdLink(dev, ep.bEndpointAddress, timeout=args.timeout)
+        if not args.no_init:
+            try:
+                link.initialize(args.timeout)
+                print("已开屏并切到投屏模式。")
+            except GlxssError as exc:
+                print("[警告] 初始化失败（继续监看）: %s" % exc, file=sys.stderr)
+        if not args.demo:
+            try:
+                with gate:
+                    session.claim(usb.IFACE_HID, label="HID")
+                    print("  使能传感器（加速度计做水平仪）...")
+                    for line in hid.enable_sensors(dev, args.timeout, verbose=False):
+                        print("    " + line)
+                    version = hid.read_version(dev, args.timeout)
+                    hud_source.set_firmware(version.version)
+                    print("  固件: " + (version.version or "UNKNOWN"))
+                hud_source.attach_hid(dev, interval=0.1,
+                                      timeout=min(1500, max(200, args.timeout)),
+                                      lock=gate)
+            except GlxssError as exc:
+                print("[警告] HID/传感器不可用，水平仪无数据: %s" % exc,
+                      file=sys.stderr)
+        hud_source.set_connected(True)
+        print("打开 UVC（需要 --detach 才能在 Linux 上绕过 uvcvideo）...")
+        monitor_source = monitor.MonitorSource.open(
+            dev, session, gate=gate,
+            timeout=min(500, max(200, args.timeout)),
+            fit=args.fit, half=args.uvc_half, camera_fps=args.camera_fps,
+            rec=args.rec, state_provider=hud_source.snapshot,
+            verbose=args.verbose)
+        print("开始相机监看：fps=%s fit=%s half=%s rec=%s（Ctrl-C 停止）" % (
+            args.fps if args.fps > 0 else "不限", args.fit, args.uvc_half,
+            args.rec))
+        app = CastApp(monitor_source,
+                      sender=lambda packet: _locked_send(gate, link, packet),
+                      fps=args.fps, fit="stretch", rotate=args.rotate,
+                      duration=args.duration, max_frames=args.frames,
+                      on_stats=on_stats)
+        try:
+            stats = app.run()
+        except KeyboardInterrupt:
+            print("\n已停止相机监看（Ctrl-C）。")
+            return 0
+        print(stats_summary(stats))
+        monitor_stats = monitor_source.stats_dict()
+        print("UVC 统计：读帧 %d、读错误 %d、解码错误 %d、超时 %d" % (
+            monitor_stats.get("frames_ready", 0),
+            monitor_stats.get("read_errors", 0),
+            monitor_stats.get("decode_errors", 0),
+            monitor_stats.get("timeouts", 0)))
+        if monitor_stats.get("last_error"):
+            print("  最近错误: " + str(monitor_stats["last_error"]))
+    finally:
+        if monitor_source is not None:
+            monitor_source.close()
+        hud_source.close()
         if session is not None:
             session.close()
     return 0
@@ -715,7 +853,10 @@ def _hud_defaults(args) -> None:
     """让 `cast --source hud` 复用 `hud` 子命令的参数。"""
     for name, default in (("brightness", 180), ("demo", False),
                           ("heading_offset", 0.0), ("listen", False),
-                          ("socket", None), ("save_png", None)):
+                          ("socket", None), ("save_png", None),
+                          ("view", "hud"), ("rec", False),
+                          ("camera_fps", 15.0), ("uvc_half", False),
+                          ("monitor_fit", "cover"), ("rotate", 0)):
         if not hasattr(args, name):
             setattr(args, name, default)
 
@@ -741,40 +882,46 @@ def _hud_dry_run(args) -> int:
                            heading_offset=args.heading_offset)
     source.set_fps(args.fps)
     image = source.render()
+    if int(getattr(args, "rotate", 0) or 0) % 360 == 180:
+        image = image.rotate(180)
     state = source.snapshot()
     packet = lcd.build_frame(capture.rgba_bytes(np.asarray(image, dtype=np.uint8)))
     _print_frame_header(packet, "HUD 640×400 RGBA（演示数据）")
-    print("  图层    : 顶栏(时间/连接/fps) + 罗盘 + lux/温度 + 姿态 + 底栏(亮度/固件)")
+    print("  图层    : 顶栏(时间/连接/fps) + 罗盘 + lux/传感器 + 姿态 + 底栏(亮度/固件)")
     print("  heading : %6.1f deg（罗盘 X/Y 原始值推算）" % state.heading)
     pitch, roll = state.pitch_roll
     print("  姿态    : pitch=%+.1f° roll=%+.1f°" % (pitch, roll))
-    print("  传感器  : lux=%d 温度=%.1f°C" % (state.lux, state.temperature))
+    print("  传感器  : lux=%d 罗盘=%s" % (
+        state.lux, "OK" if state.compass_valid else "NO DATA"))
     if state.nav is not None:
         print("  导航占位: bearing=%.0f° distance=%.0f m label=%r" % (
             state.nav.bearing, state.nav.distance, state.nav.label))
     if args.save_png:
-        source.save_png(args.save_png)
+        source.save_png(args.save_png, rotate=args.rotate)
         print("  已保存 640×400 RGBA PNG: " + args.save_png)
     print("DRY-RUN：只渲染 HUD，不打开设备、不发送。")
     return 0
 
 
 def _hud_live(args) -> int:
-    """真实 HUD：claim LCD + HID，按 --fps 发帧，可选 Unix socket 控制服务。"""
-    source = hud.HudSource(brightness=args.brightness, demo=args.demo,
-                           heading_offset=args.heading_offset)
-    source.set_fps(args.fps)
+    """HUD 主进程：claim LCD + HID，按 --fps 发帧；可随时切相机监看。"""
+    render_interval = (1.0 / args.fps) if args.fps > 0 else 0.05
+    hud_source = hud.HudSource(brightness=args.brightness, demo=args.demo,
+                               heading_offset=args.heading_offset,
+                               render_interval=max(0.05, render_interval))
+    hud_source.set_fps(args.fps)
     session = None
     server = None
     app = None
-    lock = threading.Lock()
+    mode_source = None
+    gate = usb.UsbGate(verbose=args.verbose)
     mode = {"value": 2}
     screen = {"value": True}
     sock_path = None
 
     def status_dict():
-        state = source.snapshot()
-        return {
+        state = hud_source.snapshot()
+        data = {
             "connected": state.connected,
             "fps": round(state.fps, 1),
             "brightness": state.brightness,
@@ -782,17 +929,34 @@ def _hud_live(args) -> int:
             "screen": screen["value"],
             "hud": state.hud_enabled,
             "lux": state.lux,
-            "temperature": round(state.temperature, 2),
             "firmware": state.firmware,
             "time": time.strftime("%H:%M:%S"),
-            "source": source.name,
+            "source": mode_source.mode if mode_source is not None else "hud",
+            "rotate": args.rotate,
             "socket": sock_path or "",
-            "error": source.hid_error,
+            "error": hud_source.hid_error,
         }
+        if mode_source is not None:
+            data.update(mode_source.status_dict())
+        return data
 
     def on_stats(stats) -> None:
-        source.set_fps(stats.fps)
-        print("[%s] %s" % (time.strftime("%H:%M:%S"), stats.line()))
+        hud_source.set_fps(stats.fps)
+        extra = ""
+        if mode_source is not None and mode_source.mode == "monitor":
+            monitor = mode_source.monitor
+            if monitor is not None:
+                m = monitor.stats_dict()
+                extra = " | uvc %.1f fps 解码 %.0f ms 旧帧 %d" % (
+                    m.get("read_fps", 0.0), m.get("decode_ms", 0.0),
+                    m.get("frames_stale", 0))
+        print("[%s] %s%s" % (time.strftime("%H:%M:%S"), stats.line(), extra))
+
+    def on_fn_key(report) -> None:
+        if mode_source is None:
+            return
+        target = mode_source.request_toggle()
+        print("[%s] Fn 键单击：视图 → %s" % (time.strftime("%H:%M:%S"), target))
 
     try:
         dev = usb.find_normal()
@@ -808,32 +972,53 @@ def _hud_live(args) -> int:
             except GlxssError as exc:
                 print("[警告] 初始化失败（继续发 HUD）: %s" % exc, file=sys.stderr)
         try:
-            status = link.status(args.timeout)
+            with gate:
+                status = link.status(args.timeout)
             screen["value"] = status.screen_open
-            source.set_brightness(status.luminance)
+            hud_source.set_brightness(status.luminance)
             print("  回读: " + status.format())
         except GlxssError as exc:
             print("[警告] 回读 LCD 状态失败: %s" % exc, file=sys.stderr)
 
+        def open_monitor():
+            return monitor.MonitorSource.open(
+                dev, session, gate=gate,
+                timeout=min(500, max(200, args.timeout)),
+                fit=args.monitor_fit, half=args.uvc_half,
+                camera_fps=args.camera_fps, rec=args.rec,
+                state_provider=hud_source.snapshot, verbose=args.verbose)
+
+        mode_source = monitor.ModeSource(hud_source, open_monitor,
+                                         initial=args.view)
+
         if not args.demo:
             try:
-                session.claim(usb.IFACE_HID, label="HID")
-                print("  使能传感器（光感/罗盘/加速度/陀螺）...")
-                for line in hid.enable_sensors(dev, args.timeout, verbose=False):
-                    print("    " + line)
-                version = hid.read_version(dev, args.timeout)
-                source.set_firmware(version.version)
-                print("  固件: " + (version.version or "UNKNOWN"))
-                source.attach_hid(dev, timeout=min(1500, max(200, args.timeout)),
-                                  lock=lock)
+                with gate:
+                    session.claim(usb.IFACE_HID, label="HID")
+                    print("  使能传感器（光感/罗盘/加速度/陀螺）...")
+                    for line in hid.enable_sensors(dev, args.timeout, verbose=False):
+                        print("    " + line)
+                    version = hid.read_version(dev, args.timeout)
+                    hud_source.set_firmware(version.version)
+                    print("  固件: " + (version.version or "UNKNOWN"))
+                hud_source.attach_hid(dev, interval=0.1,
+                                      timeout=min(1500, max(200, args.timeout)),
+                                      lock=gate, on_key=on_fn_key)
             except GlxssError as exc:
                 print("[警告] HID/传感器不可用，HUD 只显示时钟/连接状态: %s"
                       % exc, file=sys.stderr)
-        source.set_connected(True)
+        hud_source.set_connected(True)
 
         if args.save_png:
-            source.save_png(args.save_png)
+            hud_source.save_png(args.save_png, rotate=args.rotate)
             print("  已保存首张 HUD PNG: " + args.save_png)
+
+        def switch_view(value):
+            try:
+                mode_source.request_view(str(value))
+            except GlxssError as exc:
+                return {"ok": False, "error": str(exc)}
+            return None
 
         def handle(request):
             cmd = str(request.get("cmd", "")).strip().lower()
@@ -843,45 +1028,60 @@ def _hud_live(args) -> int:
                     response["pong"] = True
                 return response
             if cmd in ("bright", "brightness"):
-                value = int(request.get("value", source.snapshot().brightness))
+                value = int(request.get("value", hud_source.snapshot().brightness))
                 if not 0 <= value <= 255:
                     return {"ok": False, "error": "亮度必须在 0..255"}
-                with lock:
+                with gate:
                     ack = link.brightness(value, args.timeout)
-                source.set_brightness(value)
+                hud_source.set_brightness(value)
                 return {"ok": True, "ack": ack, "status": status_dict()}
             if cmd == "screen":
                 value = _as_bool(request.get("value", True))
-                with lock:
+                with gate:
                     ack = link.screen(value, args.timeout)
                     if value:
                         link.mode(2, args.timeout)
                 screen["value"] = value
                 mode["value"] = 2 if value else 1
                 return {"ok": True, "ack": ack, "status": status_dict()}
-            if cmd == "mode":
-                value = int(request.get("value", 2))
-                if not 0 <= value <= 2:
-                    return {"ok": False, "error": "显示模式必须在 0..2"}
-                with lock:
-                    ack = link.mode(value, args.timeout)
-                mode["value"] = value
-                return {"ok": True, "ack": ack, "status": status_dict()}
+            if cmd in ("view", "mode"):
+                raw = request.get("value", "monitor" if cmd == "view" else 2)
+                text = str(raw).strip().lower()
+                if cmd == "mode" and text not in ("hud", "monitor", "uvc"):
+                    try:
+                        value = int(raw)
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "mode 需要 0..2 或 hud/monitor"}
+                    if not 0 <= value <= 2:
+                        return {"ok": False, "error": "显示模式必须在 0..2"}
+                    with gate:
+                        ack = link.mode(value, args.timeout)
+                    mode["value"] = value
+                    return {"ok": True, "ack": ack, "status": status_dict()}
+                error = switch_view(text)
+                if error is not None:
+                    return error
+                return {"ok": True, "status": status_dict()}
+            if cmd == "rec":
+                mode_source.set_rec(_as_bool(request.get("value", True)))
+                return {"ok": True, "status": status_dict()}
             if cmd == "hud":
                 enabled = _as_bool(request.get("value", True))
-                source.set_hud_enabled(enabled)
+                hud_source.set_hud_enabled(enabled)
                 return {"ok": True, "status": status_dict()}
             if cmd == "test":
                 seconds = float(request.get("seconds", 3.0))
-                source.flash_test(seconds)
+                if mode_source.mode != "hud":
+                    mode_source.request_view("hud")
+                hud_source.flash_test(max(0.2, seconds))
                 return {"ok": True, "status": status_dict()}
             if cmd == "nav":
-                source.set_nav(float(request.get("bearing", 0.0)),
-                               float(request.get("distance", 0.0)),
-                               str(request.get("label", "")))
+                hud_source.set_nav(float(request.get("bearing", 0.0)),
+                                   float(request.get("distance", 0.0)),
+                                   str(request.get("label", "")))
                 return {"ok": True, "status": status_dict()}
             if cmd == "nav-clear":
-                source.clear_nav()
+                hud_source.clear_nav()
                 return {"ok": True, "status": status_dict()}
             if cmd == "quit":
                 if app is not None:
@@ -889,17 +1089,21 @@ def _hud_live(args) -> int:
                 return {"ok": True, "message": "正在退出"}
             return {"ok": False, "error": "未知命令 %r" % cmd}
 
-        app = CastApp(source, sender=lambda packet: _locked_send(lock, link, packet),
-                      fps=args.fps, fit="stretch", duration=args.duration,
-                      max_frames=args.frames, close_source=False, on_stats=on_stats)
+        app = CastApp(mode_source,
+                      sender=lambda packet: _locked_send(gate, link, packet),
+                      fps=args.fps, fit="stretch", rotate=args.rotate,
+                      duration=args.duration, max_frames=args.frames,
+                      close_source=False, on_stats=on_stats)
         if args.listen:
             sock_path = args.socket or control.default_socket_path()
             server = control.ControlServer(sock_path, handle)
             server.start()
             print("控制 socket: " + sock_path)
             print("  HAT: pi/lcdhat.py --socket %s" % sock_path)
-        print("开始 HUD：fps=%s，%s" % (
-            args.fps if args.fps > 0 else "不限",
+        print("开始 %s：fps=%s fit=%s rot=%d，%s" % (
+            "相机监看" if args.view == "monitor" else "HUD",
+            args.fps if args.fps > 0 else "不限", args.monitor_fit,
+            args.rotate,
             "按 Ctrl-C 停止" if not args.listen else "Ctrl-C 或 ctl quit 停止"))
         stats = app.run()
         print(stats_summary(stats))
@@ -907,7 +1111,10 @@ def _hud_live(args) -> int:
     finally:
         if server is not None:
             server.stop()
-        source.close()
+        if mode_source is not None:
+            mode_source.close()
+        else:
+            hud_source.close()
         if session is not None:
             session.close()
 
@@ -921,15 +1128,25 @@ def _print_ctl_status(status) -> None:
     print("  眼镜    : %s" % ("ONLINE" if status.get("connected") else "OFFLINE"))
     print("  fps     : %.1f" % float(status.get("fps", 0.0)))
     print("  亮度    : %s" % status.get("brightness"))
-    print("  模式    : %s" % status.get("mode"))
+    print("  视图    : %s" % (status.get("view") or "hud"))
+    print("  显示模式: %s" % status.get("mode"))
     print("  屏      : %s" % ("开" if status.get("screen") else "关"))
     print("  HUD     : %s" % ("ON" if status.get("hud") else "PAUSED"))
-    print("  光感    : %s lux   温度: %s°C" % (
-        status.get("lux"), status.get("temperature")))
+    print("  录制红点: %s" % ("ON" if status.get("rec") else "OFF"))
+    print("  光感    : %s lux" % status.get("lux"))
     print("  固件    : %s" % (status.get("firmware") or "UNKNOWN"))
+    monitor = status.get("monitor")
+    if isinstance(monitor, dict):
+        print("  UVC     : %.1f fps 读 %.0f ms 解码 %.0f ms 旧帧 %d" % (
+            float(monitor.get("read_fps", 0.0)),
+            float(monitor.get("read_ms", 0.0)),
+            float(monitor.get("decode_ms", 0.0)),
+            int(monitor.get("frames_stale", 0))))
     print("  时间    : %s" % status.get("time"))
     if status.get("socket"):
         print("  socket  : %s" % status.get("socket"))
+    if status.get("monitor_error"):
+        print("  UVC 错误: %s" % status.get("monitor_error"))
     if status.get("error"):
         print("  错误    : %s" % status.get("error"))
 
@@ -957,11 +1174,26 @@ def cmd_ctl(args) -> int:
         payload["value"] = _as_bool(value)
     elif action == "mode":
         if value is None:
-            raise GlxssError("mode 需要 0/1/2")
-        try:
-            payload["value"] = int(value)
-        except ValueError as exc:
-            raise GlxssError("显示模式必须是 0/1/2: %r" % value) from exc
+            raise GlxssError("mode 需要 0/1/2 或 hud/monitor")
+        text = str(value).strip().lower()
+        if text in ("hud", "monitor", "uvc"):
+            payload["value"] = "monitor" if text == "uvc" else text
+        else:
+            try:
+                payload["value"] = int(value)
+            except ValueError as exc:
+                raise GlxssError("mode 需要 0/1/2 或 hud/monitor: %r" % value) from exc
+    elif action == "view":
+        if value is None:
+            raise GlxssError("view 需要 hud 或 monitor")
+        text = str(value).strip().lower()
+        if text not in ("hud", "monitor", "uvc"):
+            raise GlxssError("view 需要 hud 或 monitor，收到 %r" % value)
+        payload["value"] = "monitor" if text == "uvc" else text
+    elif action == "rec":
+        if value is None:
+            raise GlxssError("rec 需要 on/off")
+        payload["value"] = _as_bool(value)
     elif action == "hud":
         if value is None:
             raise GlxssError("hud 需要 on/off")

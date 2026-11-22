@@ -41,6 +41,14 @@ class ImageSource(ABC):
     def grab(self) -> Any:
         raise NotImplementedError
 
+    def grab_rgba(self):
+        """可选快路径：直接返回 640×400×4 RGBA uint8；默认 None=走 grab()+映射。
+
+        UVC 监看源在解码 YV12 时顺手转成 RGBA，避免再缩放/拼 alpha；HUD 也可以
+        直接用 Pillow 的 RGBA 结果。`CastApp` 会优先调用本方法。
+        """
+        return None
+
     def close(self) -> None:
         pass
 
@@ -228,6 +236,22 @@ def rgba_bytes(rgba) -> bytes:
     if rgba.shape != (LCD_H, LCD_W, 4):
         raise GlxssError("RGBA 数组形状必须是 (400,640,4)，实际 %r" % (rgba.shape,))
     return np.ascontiguousarray(rgba, dtype=np.uint8).tobytes()
+
+
+def rotate180_rgba(rgba):
+    """RGBA 图像旋转 180°（同像素顺序反转，比 [::-1,::-1] 快很多）。
+
+    眼镜装反时用 `--rotate 180`；这里把每个 4 B 像素当作一个整体反转，
+    不改变通道顺序（R/G/B/A 仍属于同一像素）。
+    """
+    require_numpy()
+    array = np.ascontiguousarray(rgba, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 4:
+        raise GlxssError("rotate180_rgba 需要 H×W×4 数组，实际 %r" % (array.shape,))
+    height, width = array.shape[:2]
+    pixels = array.view(np.uint32).reshape(-1)
+    rotated = np.ascontiguousarray(pixels[::-1])
+    return rotated.view(np.uint8).reshape(height, width, 4)
 
 
 def save_rgba_png(path: str, rgba) -> None:
