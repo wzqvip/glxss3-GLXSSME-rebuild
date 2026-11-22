@@ -14,8 +14,9 @@ SupplementaryGroups=video
 WorkingDirectory=/home/taco/glxss3-linux
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/home/taco/glxss3-linux
-# 640×480@20 + 1.5 Mbps + Pi 硬编码：约 0.4 核 + ~40 MB 内存
-# 需要 1080p/更高码率时改这里的参数（见 STREAM.md「参数」一节）
+# 640×480@20 + 1.5 Mbps + Pi 硬编码：约 0.2–0.3 核、~150 MB 内存
+# （ffmpeg 占 90 MB 左右；416 MB 的 Zero 2 W 上别同时再跑重负载）
+# 需要更高码率/分辨率时改这里的参数（见 STREAM.md「参数」一节）
 ExecStart=/usr/bin/python3 /home/taco/glxss3-linux/pi/stream.py \
     --rtsp rtsp://127.0.0.1:8554/glxss \
     --size 640x480 \

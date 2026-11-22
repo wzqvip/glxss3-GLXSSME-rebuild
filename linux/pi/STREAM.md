@@ -237,7 +237,7 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 | `--codec` | `h264_v4l2m2m` | 备选 `libx264`（CPU 高，但兼容性最好） |
 | `--transport` | `tcp` | 局域网稳定优先 |
 | `--format-index` | 设备当前 | UVC `bFormatIndex`，一般 1 |
-| `--frame-index` | 设备当前 | UVC `bFrameIndex`；本机 640×480 是 **4**（见 §8.2） |
+| `--frame-index` | 设备当前 | UVC `bFrameIndex`；按 v4l2 枚举顺序本机 640×480 是第 **4** 个（见 §8.2，待真机复核） |
 | `--detach` / `--no-detach` | detach | 摘 `uvcvideo`；纯直播用 v4l2 时可关 |
 | `--mjpeg-port` | 0（关） | 同时开 MJPEG HTTP |
 | `--mirror-fps` | 0（关） | 投眼镜的帧率，建议 2–3，别和 HUD 同开 |
@@ -424,6 +424,10 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 > `usb 1-1: USB disconnect`。怀疑是热插拔/复位后相机固件状态异常，或与该时段
 > 另一个进程并发 detach/claim 有关。**真实帧率/码率/CPU 数据待设备稳定后复测**。
 > 复测步骤见 §9.1；请勿在 uvcvideo 被占用时反复 `dev.reset()`。
+>
+> 另外，反复 `kill -9` ffmpeg 后 `dmesg` 可能出现 `bcm2835-codec: Mutex fail`
+> （Pi 的 MMAL 硬编状态卡住）；重启 Pi 可清掉，编码器恢复。日常用 systemd
+> 停止（SIGTERM）不会出现这个问题。
 
 ### 8.3 OBS
 
