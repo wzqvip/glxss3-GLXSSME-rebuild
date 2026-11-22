@@ -95,6 +95,15 @@ cd /opt/glxss/linux
 
 把 PNG `scp` 回开发机核对图层/字体，再上硬件。
 
+上了硬件先跑自检（不连眼镜、不开 HUD，只验证屏幕和按键）：
+
+```bash
+sudo systemctl stop glxss-lcdhat.service   # 让出自检要用的 GPIO
+/opt/glxss/venv/bin/python pi/lcdhat_selftest.py colors   # 红/绿/蓝/白/黑
+/opt/glxss/venv/bin/python pi/lcdhat_selftest.py text     # 识别页，停留 25 s
+/opt/glxss/venv/bin/python pi/lcdhat_selftest.py keys     # 打印按键事件
+```
+
 ---
 
 ## 4. 运行
@@ -128,7 +137,10 @@ export GLXSS_SOCK=/tmp/glxssctl.sock
 --rotation 1                   # 旋转
 ```
 
-颜色反相：改 `pi/lcdhat.py` 的 `_INIT`，`0x21`(INVON) ↔ `0x20`(INVOFF)。
+颜色反相：`--invert`（默认，发 INVON）或 `--no-invert`（发 INVOFF）。
+红蓝互换说明面板批次不同，不用改代码。
+
+实测过的整组参数见 [§8 实测参数](#8-实参数实测)。
 
 ---
 
@@ -192,3 +204,51 @@ journalctl -u glxss-cast.service -f
 * Pi Zero 2 W USB 供电有限；眼镜 + HAT 建议带供电 Hub 或独立供电。
 * 本项目不修改眼镜固件；首次使用仍需主机向 `03e7:2150` 灌合法固件
   （`glxss flash IMAGE --yes`），详见 SETUP.md §12。
+
+---
+
+## 8. 实测参数
+
+在 `rpi0w2`（Pi Zero 2 W Rev 1.0）上一次真机点亮的环境与参数，供同批次 HAT 直接抄：
+
+| 项 | 实测值 | 备注 |
+|---|---|---|
+| OS / kernel | Debian 12 bookworm / 6.12.109+rpt-rpi-v8 aarch64 | |
+| Python | 3.11.2 | |
+| 驱动库 | spidev 3.5、Pillow 9.4.0、numpy 1.24.2 | apt 包，非 pip |
+| GPIO 后端 | `RPi.GPIO`（RPi.GPIO 0.7.1） | lgpio / gpiod 为兜底 |
+| SPI 设备 | `/dev/spidev0.0` | `/boot/firmware/config.txt` 里 `dtparam=spi=on` |
+| SPI 频率 | **40 MHz** | 满屏 115200 B ≈ 23 ms，无花屏 |
+| x offset | **0** | |
+| y offset | **80** | 240×240 面板在 240×320 GRAM 里的起始行 |
+| rotation | **0** | 0..3 对应 MADCTL 0x00/0x60/0xC0/0xA0；旋转 1/3 会自动交换 x/y offset |
+| invert | **INVON（0x21）** | 默认值；若红蓝互换改 `--no-invert` |
+| DC / RST / BL | 25 / 27 / 24 | 背光高电平有效 |
+| 按键 | 内部上拉、低有效 | UP=6 DOWN=19 LEFT=5 RIGHT=26 PRESS=13 KEY1=21 KEY2=20 KEY3=16 |
+
+**按键实测**：UP、DOWN、LEFT、RIGHT、PRESS、KEY1、KEY2、KEY3 八个键全部在运行中的
+`glxss-lcdhat.service` 里捕获到（`journalctl -u glxss-lcdhat.service` 里的
+`按键: <name>` 行），无需额外消抖参数，`RPi.GPIO` 的 BCM 上拉即可直接读。
+
+配置 `config.txt` 前已备份为
+`/boot/firmware/config.txt.bak.YYYYmmdd-HHMMSS`；本次未改其它系统配置。
+
+实际部署（用户名 `taco`，目录 `/home/taco/glxss3-linux`，装的是改过路径的
+unit 副本，`pi/service/glxss-lcdhat.service` 本身仍是 `/opt/glxss` 模板）：
+
+```ini
+[Service]
+User=taco
+SupplementaryGroups=spi gpio video
+WorkingDirectory=/home/taco/glxss3-linux
+Environment=PYTHONPATH=/home/taco/glxss3-linux
+Environment=GLXSS_SOCK=/run/glxss/glxssctl.sock
+ExecStart=/usr/bin/python3 /home/taco/glxss3-linux/pi/lcdhat.py \
+    --socket /run/glxss/glxssctl.sock --no-spawn \
+    --rotation 0 --x-offset 0 --y-offset 80 --spi-hz 40000000
+```
+
+`--no-spawn` 是刻意的：眼镜不在线时 `glxss hud --listen` 会直接退出，
+HAT 只连 socket、显示 `GLASSES OFFLINE`，所以**没眼镜也能正常当状态面板用**。
+`glxss-cast.service` 也**没有**在本机启用（无眼镜时会反复重启），插上眼镜后再
+`systemctl enable --now glxss-cast.service` 即可让状态页变成 ONLINE。

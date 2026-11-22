@@ -230,7 +230,7 @@ class ST7789:
         (0xD0, b"\xa4\xa1", 0.0),
         (0xE0, b"\xd0\x04\x11\x0b\x0b\x14\x2a\x30\x42\x4b\x56\x5b\x62\x6c", 0.0),
         (0xE1, b"\xd0\x04\x10\x0b\x0b\x13\x29\x31\x43\x4b\x55\x5b\x62\x6c", 0.0),
-        (0x21, b"", 0.0),       # INVON
+        # INVON/INVOFF 由 invert 参数在 _init_panel 里于 DISPON 前写入。
         (0x13, b"", 0.0),       # NORON
         (0x29, b"", 0.08),      # DISPON
     ]
@@ -241,7 +241,8 @@ class ST7789:
                  speed_hz: int = 40_000_000, dc: int = PIN_LCD_DC,
                  rst: int = PIN_LCD_RST, bl: int = PIN_LCD_BL,
                  x_offset: int = 0, y_offset: int = 80,
-                 rotation: int = 0, verbose: bool = False):
+                 rotation: int = 0, invert: bool = True,
+                 verbose: bool = False):
         if spidev is None:
             raise GlxssError("缺少 spidev：sudo apt install python3-spidev")
         if Image is None:
@@ -255,6 +256,7 @@ class ST7789:
         self.x_offset = x_offset
         self.y_offset = y_offset
         self.rotation = rotation
+        self.invert = bool(invert)
         self.verbose = verbose
         if rotation in (1, 3):
             self.x_offset, self.y_offset = y_offset, x_offset
@@ -293,6 +295,9 @@ class ST7789:
 
     def _init_panel(self) -> None:
         for command, data, delay in self._INIT:
+            # 打开显示前按面板批次决定是否反相：IPS 屏常需 INVON，否则红蓝互换。
+            if command == 0x29:
+                self._cmd(0x21 if self.invert else 0x20)
             self._cmd(command, data)
             # SWRESET 会清掉 MADCTL；必须在 SLPOUT 之后再写。
             if command == 0x11:
@@ -300,8 +305,8 @@ class ST7789:
             if delay:
                 time.sleep(delay)
         if self.verbose:
-            print("ST7789 初始化完成，rotation=%d offsets=(%d,%d)" % (
-                self.rotation, self.x_offset, self.y_offset))
+            print("ST7789 初始化完成，rotation=%d offsets=(%d,%d) invert=%s" % (
+                self.rotation, self.x_offset, self.y_offset, self.invert))
 
     def _window(self) -> None:
         x0, y0 = self.x_offset, self.y_offset
@@ -882,6 +887,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ST7789 窗口 x 偏移（默认 0）")
     parser.add_argument("--y-offset", type=int, default=80,
                         help="ST7789 窗口 y 偏移（默认 80；不同批次面板可能不同）")
+    parser.add_argument("--invert", dest="invert", action="store_true",
+                        default=True,
+                        help="发 INVON 反相（默认开；红蓝互换时用 --no-invert）")
+    parser.add_argument("--no-invert", dest="invert", action="store_false",
+                        help="发 INVOFF，关闭反相")
     parser.add_argument("--dc", type=int, default=PIN_LCD_DC)
     parser.add_argument("--rst", type=int, default=PIN_LCD_RST)
     parser.add_argument("--bl", type=int, default=PIN_LCD_BL)
