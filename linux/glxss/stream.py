@@ -1358,8 +1358,7 @@ class Streamer:
         else:
             self._print("UVC 读：同步 16 KiB（--async-urb 0）")
         if cfg.fn_keys:
-            self._print("Fn 按键：单击=显示 %s ↔ preview；长按 ≥%.1f s=%s" % (
-                "preview" if cfg.mirror_fps else "hud",
+            self._print("Fn 按键：单击=显示 camera preview ↔ HUD；长按 ≥%.1f s=%s" % (
                 cfg.fn_long_press,
                 "停止/恢复 RTSP" if cfg.rtsp_url else "无效（未配置 RTSP）"))
         if cfg.mirror_fps:
