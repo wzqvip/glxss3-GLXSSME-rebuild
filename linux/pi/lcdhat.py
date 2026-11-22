@@ -451,7 +451,11 @@ class Pages:
 
         draw.line((8, 202, LCD_W - 8, 202), fill=(44, 62, 82), width=1)
         if error:
-            draw.text((8, 207), "ERR " + error[:33], font=tiny, fill=(255, 110, 120))
+            # DejaVu 没有中文字形：非 ASCII 的错误串会变成一排方框，统一换成短英文。
+            message = "ERR " + error[:33]
+            if not message.isascii():
+                message = "ERR DAEMON OFFLINE"
+            draw.text((8, 207), message, font=tiny, fill=(255, 110, 120))
             draw.text((8, 220), "K3 QUIT   PRESS MENU", font=tiny,
                       fill=(130, 140, 156))
         else:
