@@ -956,6 +956,13 @@ def _hud_live(args) -> int:
                 extra = " | uvc %.1f fps 解码 %.0f ms 旧帧 %d" % (
                     m.get("read_fps", 0.0), m.get("decode_ms", 0.0),
                     m.get("frames_stale", 0))
+        # HUD 2 fps 足够；切到监看时自动提到 >=10 fps（HAT/Fn 切换也会走到这里）。
+        if app is not None and mode_source is not None:
+            target_fps = max(args.fps, 10.0) if mode_source.mode == "monitor" else args.fps
+            if abs(app.fps - target_fps) > 1e-6:
+                app.fps = target_fps
+                print("[%s] 视图 -> %s，发送帧率调整为 %.1f fps" % (
+                    time.strftime("%H:%M:%S"), mode_source.mode, target_fps))
         print("[%s] %s%s" % (time.strftime("%H:%M:%S"), stats.line(), extra))
 
     def on_fn_key(report) -> None:
@@ -1024,6 +1031,9 @@ def _hud_live(args) -> int:
                 mode_source.request_view(str(value))
             except GlxssError as exc:
                 return {"ok": False, "error": str(exc)}
+            if app is not None:
+                app.fps = (max(args.fps, 10.0)
+                           if mode_source.desired == "monitor" else args.fps)
             return None
 
         def handle(request):

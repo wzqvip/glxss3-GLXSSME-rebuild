@@ -71,7 +71,6 @@ class CastApp:
         stats = CastStats(source=self.source.name, fit=self.fit, target_fps=self.fps)
         started = time.monotonic()
         last_report = started
-        period = (1.0 / self.fps) if self.fps > 0 else 0.0
         failures_in_a_row = 0
         try:
             while not self._stop:
@@ -122,6 +121,8 @@ class CastApp:
                     if self.on_stats:
                         self.on_stats(replace(stats))
                     last_report = now
+                # 每帧重算 period：HUD↔monitor 切换时上层会动态改 self.fps。
+                period = (1.0 / self.fps) if self.fps > 0 else 0.0
                 if period:
                     spend = time.monotonic() - frame_started
                     if spend < period:
