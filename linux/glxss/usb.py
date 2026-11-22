@@ -516,15 +516,21 @@ def ctrl_out(dev, request: int, value: int, index: int, data: bytes,
         raise GlxssError(usb_error_hint(exc, "控制写 0x%02x/0x%02x" % (request_type, request))) from exc
 
 
-def bulk_write_all(dev, ep_addr: int, data: bytes, timeout: int = 5000,
+def bulk_write_all(dev, ep_addr: int, data, timeout: int = 5000,
                    attempts: int = 3) -> int:
-    """写完整块；短写只补剩余字节，保持设备端帧边界。"""
+    """写完整块；短写只补剩余字节，保持设备端帧边界。
+
+    LCD 一帧是 1 MB，所以 ``offset == 0`` 时把 ``data`` **原样**交给 pyusb：
+    对 ``array.array('B')`` 而言 pyusb 的 ``_interop.as_array`` 直接返回原对象
+    （不拷贝），每帧省掉两次 1 MB memcpy；只有短写（罕见）才退回切片。
+    """
     offset = 0
     total = len(data)
     failures = 0
     while offset < total:
         try:
-            written = dev.write(ep_addr, data[offset:], timeout)
+            written = dev.write(ep_addr, data if offset == 0 else data[offset:],
+                                timeout)
         except Exception as exc:
             if is_no_device(exc):
                 raise GlxssError("设备已断开（bulk OUT 0x%02x，已写 %d/%d B）" % (

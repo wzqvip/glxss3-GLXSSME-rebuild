@@ -18,7 +18,8 @@ import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
-from glxss import capture, control, firmware, hid, hud, lcd, monitor, usb, uvc
+from glxss import (capture, control, firmware, hid, hud, lcd, monitor,
+                   pipeline, stream, usb, uvc)
 from glxss.errors import GlxssError
 from glxss.cli import build_parser
 from glxss.cli import main as cli_main
@@ -787,6 +788,239 @@ class CliParserTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 parser.parse_args(["--help"])
         self.assertEqual(raised.exception.code, 0)
+
+
+class LatestFrameTests(unittest.TestCase):
+    """共享帧槽：发布者永不阻塞、消费者各取最新、旧的直接丢。"""
+
+    def test_publish_and_take(self):
+        hub = pipeline.LatestFrame()
+        first = object()
+        second = object()
+        self.assertEqual(hub.take(0, timeout=0.01), (None, 0))
+        hub.publish(first)
+        self.assertEqual(hub.take(0, timeout=0.01), (first, 1))
+        # 同一序号再取 = 没有新帧，不会重复投喂
+        self.assertEqual(hub.take(1, timeout=0.01), (None, 1))
+        hub.publish(second)
+        self.assertEqual(hub.take(1, timeout=0.01), (second, 2))
+
+    def test_old_frames_are_dropped_not_queued(self):
+        hub = pipeline.LatestFrame()
+        for index in range(100):
+            hub.publish(index)          # 中间 99 帧直接丢
+        self.assertEqual(hub.published, 100)
+        frame, seq = hub.take(0, timeout=0.01)
+        self.assertEqual(seq, 100)
+        self.assertEqual(frame, 99)
+
+    def test_two_consumers_see_the_same_frame(self):
+        hub = pipeline.LatestFrame()
+        payload = b"x" * 16
+        hub.publish(payload)
+        a, seq_a = hub.take(0, timeout=0.1)
+        b, seq_b = hub.take(0, timeout=0.1)
+        self.assertIs(a, payload)       # 同一个 bytes 对象，不拷贝
+        self.assertIs(b, payload)
+        self.assertEqual(seq_a, seq_b)
+
+    def test_take_waits_for_publish(self):
+        hub = pipeline.LatestFrame()
+        got = []
+
+        def consumer():
+            got.append(hub.take(0, timeout=2.0))
+
+        thread = threading.Thread(target=consumer)
+        thread.start()
+        time.sleep(0.05)
+        hub.publish("frame")
+        thread.join(timeout=2.0)
+        self.assertEqual(got[0][0], "frame")
+
+    def test_close_wakes_consumer(self):
+        hub = pipeline.LatestFrame()
+        got = []
+
+        def consumer():
+            got.append(hub.take(0, timeout=5.0))
+
+        thread = threading.Thread(target=consumer)
+        thread.start()
+        time.sleep(0.05)
+        hub.close()
+        thread.join(timeout=2.0)
+        self.assertEqual(got[0], (None, 0))
+
+
+class Yv12PlaneTests(unittest.TestCase):
+    """YV12→yuv420p 只换写入顺序：零拷贝 + 字节级等价。"""
+
+    @staticmethod
+    def _frame(w=640, h=480):
+        np = __import__("numpy")
+        rng = np.random.default_rng(7)
+        y = rng.integers(0, 256, w * h, dtype=np.uint8)
+        u = rng.integers(0, 256, w * h // 4, dtype=np.uint8)
+        v = rng.integers(0, 256, w * h // 4, dtype=np.uint8)
+        return y.tobytes() + v.tobytes() + u.tobytes()
+
+    def test_plane_order_and_zero_copy(self):
+        w, h = 640, 480
+        data = self._frame(w, h)
+        y_view, u_view, v_view = pipeline.yv12_plane_views(data, w, h)
+        y_size = w * h
+        c_size = y_size // 4
+        self.assertEqual(bytes(y_view), data[:y_size])
+        self.assertEqual(bytes(u_view), data[y_size + c_size:])
+        self.assertEqual(bytes(v_view), data[y_size:y_size + c_size])
+        # memoryview.obj 还是原 bytes → 没有复制像素
+        self.assertIs(y_view.obj, data)
+        self.assertIs(u_view.obj, data)
+        self.assertIs(v_view.obj, data)
+
+    def test_three_writes_equal_i420(self):
+        w, h = 640, 480
+        data = self._frame(w, h)
+        self.assertEqual(
+            b"".join(bytes(view) for view in pipeline.yv12_plane_views(data, w, h)),
+            stream.yv12_to_i420(data, w, h))
+        buffer = io.BytesIO()
+        written = pipeline.write_yv12_as_i420(buffer, data, w, h)
+        self.assertEqual(written, w * h * 3 // 2)
+        self.assertEqual(buffer.getvalue(), stream.yv12_to_i420(data, w, h))
+
+    def test_short_frame_rejected(self):
+        with self.assertRaises(GlxssError):
+            pipeline.yv12_plane_views(b"\x00" * 10, 8, 8)
+
+    def test_encoder_writes_i420_to_stdin(self):
+        """`FfmpegEncoder.write_frame` 分三次写 stdin，结果 = 一次写 I420。"""
+        w, h = 640, 480
+        data = self._frame(w, h)
+        config = stream.StreamConfig(rtsp_url="", mjpeg_port=1, fps=25)
+        encoder = stream.FfmpegEncoder(config)
+        buffer = io.BytesIO()
+        encoder.proc = SimpleNamespace(stdin=buffer)
+        written = encoder.write_frame(stream.StreamFrame(1, data, w, h))
+        self.assertEqual(written, w * h * 3 // 2)
+        self.assertEqual(buffer.getvalue(), stream.yv12_to_i420(data, w, h))
+
+
+class LcdRendererTests(unittest.TestCase):
+    """半分辨率渲染 + 2× 放大 + 三分线/水平仪（无硬件）。"""
+
+    @staticmethod
+    def _frame(w=640, h=480, y_value=128):
+        np = __import__("numpy")
+        y_size = w * h
+        c_size = y_size // 4
+        return stream.StreamFrame(
+            1, bytes([y_value]) * y_size + bytes([128]) * (2 * c_size), w, h)
+
+    def setUp(self):
+        try:
+            import numpy  # noqa: F401
+            import PIL  # noqa: F401
+        except Exception:  # pragma: no cover
+            self.skipTest("numpy/Pillow 未安装")
+
+    def test_packet_header_and_size(self):
+        renderer = pipeline.LcdRenderer(fit="cover")
+        packet = renderer.render(self._frame())
+        self.assertEqual(len(packet), lcd.FRAME_TOTAL)
+        self.assertEqual(bytes(packet[:4]), b"\x01\x00\x00\x00")
+        self.assertEqual(struct.unpack_from("<I", packet, 4)[0], lcd.FRAME_TOTAL)
+        self.assertEqual(bytes(packet[8:16]), b"\x00" * 8)
+
+    def test_alpha_is_opaque_everywhere(self):
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="cover").render(self._frame())
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        self.assertTrue((rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)[:, :, 3] == 255).all())
+
+    def test_cover_uses_full_frame_without_bars(self):
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="cover").render(self._frame())
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
+        # 灰底 128 + 三分线/准星之外，边角不应是黑边
+        for x, y in ((5, 5), (lcd.FRAME_W - 6, 5), (5, lcd.FRAME_H - 6)):
+            self.assertGreater(int(image[y, x, 0]), 100)
+
+    def test_fit_leaves_black_bars(self):
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="fit").render(self._frame())
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
+        self.assertEqual(tuple(int(v) for v in image[5, 5, :3]), pipeline.BACKDROP[:3])
+        self.assertGreater(int(image[5, lcd.FRAME_W // 2, 0]), 100)
+
+    def test_grid_lines_are_drawn(self):
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="cover").render(self._frame())
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
+        x = (pipeline.LCD_HALF_W // 3) * 2      # 半分辨率画线，放大后 2 px
+        plain = int(image[5, 100, 0])            # 没线的位置
+        on_grid = int(image[5, x, 0])
+        self.assertGreater(on_grid, plain)
+
+    def test_color_matches_reference_formula(self):
+        """PIL 的 YCbCr 转换（经过范围 LUT）要和 numpy 定点公式一致。"""
+        np = __import__("numpy")
+        from PIL import Image
+        rng = np.random.default_rng(3)
+        w, h = 320, 200
+
+        def diff_for(u_range):
+            y = rng.integers(16, 236, (h, w), dtype=np.uint8)
+            u = rng.integers(u_range[0], u_range[1], (h, w), dtype=np.uint8)
+            v = rng.integers(u_range[0], u_range[1], (h, w), dtype=np.uint8)
+            reference = pipeline.yuv_to_rgba(y, u, v)[:, :, :3].astype(np.int16)
+            got = np.asarray(pipeline.yuv_to_lcd_rgb(
+                Image.fromarray(y.copy()), Image.fromarray(u.copy()),
+                Image.fromarray(v.copy()))).astype(np.int16)
+            return np.abs(reference - got)
+
+        # 真实画面：色度都挤在 128 附近，误差应该 ≤2 LSB
+        real = diff_for((96, 160))
+        self.assertLess(real.mean(), 0.5)
+        self.assertLessEqual(int(real.max()), 3)
+        # 极端饱和色（0/255）：两套公式在裁剪点附近本来就会差几个 LSB
+        worst = diff_for((0, 256))
+        self.assertLess(worst.mean(), 3.0)
+
+    def test_level_moves_the_horizon(self):
+        np = __import__("numpy")
+        plain = pipeline.LcdRenderer(fit="cover").render(self._frame())
+        # pitch=20° → 地平线下移 20 px（半分辨率 1 px/度），放大后 40 px
+        level = pipeline.LcdRenderer(
+            fit="cover", level=lambda: (20.0, 0.0)).render(self._frame())
+        a = np.frombuffer(bytes(plain), np.uint8, offset=lcd.FRAME_HEADER)
+        b = np.frombuffer(bytes(level), np.uint8, offset=lcd.FRAME_HEADER)
+        row = (lcd.FRAME_H // 2 // 2 + 20) * 2
+        left_a = a.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)[row, 10]
+        left_b = b.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)[row, 10]
+        self.assertNotEqual(tuple(int(v) for v in left_a), tuple(int(v) for v in left_b))
+        # 有线的地方应该偏青（B > R）
+        self.assertGreater(int(left_b[2]), int(left_b[0]))
+
+    def test_cover_box_for_640x480(self):
+        self.assertEqual(pipeline.cover_box(640, 480), (640, 400))
+        # 1280×720 要填满 640×400 → 按高度放大、左右各裁 64 列
+        self.assertEqual(pipeline.cover_box(1280, 720), (1152, 720))
+
+    def test_renderer_rejects_bad_fit(self):
+        with self.assertRaises(GlxssError):
+            pipeline.LcdRenderer(fit="bogus")
+
+    def test_stretch_fills_frame(self):
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="stretch").render(self._frame())
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
+        self.assertGreater(int(image[5, 5, 0]), 100)
 
 
 if __name__ == "__main__":

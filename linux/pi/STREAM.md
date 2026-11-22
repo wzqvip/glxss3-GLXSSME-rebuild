@@ -16,9 +16,10 @@
 | 推荐拓扑 | **A**：mediamtx 跑在 Pi 上（`rtsp://<pi>:8554/glxss`），OBS 直接拉 |
 | 备选 | Pi 上 mediamtx 换成 PC 上（Pi 直推到 PC，省 Pi 内存） |
 | 兜底 | **MJPEG HTTP**：`http://<pi>:8080/stream`，不需要 mediamtx/ffmpeg |
+| 眼镜预览 | `--mirror-fps N`：**同一帧共享**给编码线程和 LCD 线程，不额外读 UVC |
 | 延迟（估） | 0.3–0.6 s（局域网、OBS 网络缓冲 1–2 MB） |
-| Pi 负载（估） | 约 0.3–0.5 个 A53 核；内存约 150 MB（ffmpeg 是大头） |
-| 带宽 | USB 侧 ~9.2 MB/s（YUV 原始帧）；局域网 H.264 ~1.5 Mbps（≈0.19 MB/s） |
+| Pi 负载（实测） | 只推流 **~0.41 核**；再同时投眼镜 10 fps **~0.65–0.69 核**（见 §8.5） |
+| 带宽 | USB 侧 ~9.2–13.6 MB/s（YUV 原始帧）；局域网 H.264 ~1.5 Mbps（≈0.19 MB/s） |
 
 最短路径（Pi 上）：
 
@@ -111,8 +112,9 @@ OBS: 媒体源 rtsp://127.0.0.1:8554/glxss
 | 阶段 | 实测/估算 | 说明 |
 |---|---|---|
 | UVC 采集 | 30–40 ms | 640×480 YV12 @30fps（2026-11-22 起 16 KiB 分块组帧，实测 30.0fps） |
-| YV12→I420 | <1 ms | 交换 U/V 平面（Debian ffmpeg 5.1 没有 `yv12` 像素格式） |
+| YV12→yuv420p | 0 拷贝 | 只换 U/V 的**写入顺序**，分三次写 ffmpeg stdin（见 §8.5） |
 | H.264 硬编 | 20–40 ms | `h264_v4l2m2m`，`-g 40 -bf 0` |
+| 眼镜预览（旁路） | ~13 ms 渲染 + 24–37 ms USB | 独立线程，10 fps，不阻塞推流 |
 | mediamtx 转发 | <10 ms | 本机回环 + 局域网 |
 | OBS 解复用/解码/缓冲 | 100–400 ms | 「网络缓冲」1–2 MB；调小更低但更怕抖动 |
 | **合计（估）** | **0.3–0.6 s** | 没有做端到端打点，属估算 |
@@ -224,7 +226,10 @@ python3 pi/stream.py --no-rtsp --mjpeg-port 8080
 python3 pi/stream.py --mjpeg-port 8080
 
 # 同时把画面投到眼镜（会占用 LCD 接口，和 HUD 冲突）
-python3 pi/stream.py --mirror-fps 3
+# 同一帧共享给编码线程 + LCD 线程，不额外读 UVC；10 fps 时总 CPU 约 0.66 核
+python3 pi/stream.py --fps 25 --mirror-fps 10
+python3 pi/stream.py --mirror-fps 3              # 只想对准时 3 fps 就够
+python3 pi/stream.py --mirror-fps 10 --mirror-fit cover --no-mirror-level
 
 # 推到 PC 上的 mediamtx（拓扑 B）
 python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
@@ -244,7 +249,9 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 | `--frame-index` | 设备当前 | UVC `bFrameIndex`；按 v4l2 枚举顺序本机 640×480 是第 **4** 个（见 §8.2，待真机复核） |
 | `--detach` / `--no-detach` | detach | 摘 `uvcvideo`；纯直播用 v4l2 时可关 |
 | `--mjpeg-port` | 0（关） | 同时开 MJPEG HTTP |
-| `--mirror-fps` | 0（关） | 投眼镜的帧率，建议 2–3，别和 HUD 同开 |
+| `--mirror-fps` | 0（关） | 投眼镜的帧率，建议 3–10；**共享帧，不影响采集/编码** |
+| `--mirror-fit` | `fit` | `cover`（裁满、无黑边）/ `fit`（等比、黑边）/ `stretch` |
+| `--mirror-level` | 开 | 读 HID 加速度计画水平仪；`--no-mirror-level` 只画三分线 + 准星 |
 | `--api-url` | 自动 | 推本机时用 `http://127.0.0.1:9997` 读实测码率；`--api-url ""` 可关 |
 | `--duration` / `--frames` | 0（不限） | 定时/定量跑，方便测 CPU |
 
@@ -338,7 +345,7 @@ OBS 实际解码出的画面（测试图案，640×480 4:3）：
 | 相机监看 | `glxss cast --source uvc` | 占用 UVC；和直播互斥 |
 | 读帧调试 | `glxss uvc --detach` | 占用 UVC；和直播互斥 |
 | HUD 显示 | `glxss hud --listen` | 只占 LCD，可与直播共存 |
-| 直播 + 眼镜预览 | `pi/stream.py --mirror-fps 3` | 额外占 LCD，**不能**和 HUD 同开 |
+| 直播 + 眼镜预览 | `pi/stream.py --mirror-fps 10` | 额外占 LCD，**不能**和 HUD 同开；共享帧，不额外读 UVC |
 
 切换方式（服务化运行）：
 
@@ -376,6 +383,40 @@ YV12 更累；H.264 是必须的。
 
 ### 7.2 Pi Zero 2 W（4×Cortex-A53 1 GHz，416 MB RAM）实测
 
+**当前实现：一次采集 + 多消费者分发**（2026-11-22 真机 `2e09:0030`，眼镜插在 Pi 上；
+CPU 为 `/proc/<pid>/stat` 的 utime+stime 增量，单位 = 1 个 A53 核）：
+
+| 场景（`pi/stream.py`） | 采集 | 编码 | 眼镜 | python | ffmpeg | 合计 |
+|---|---|---|---|---|---|---|
+| `--fps 25`（只推流） | 30.0 fps | 25.1 fps | — | 36.7% | 9.6% | **41.0%** |
+| `--fps 25 --mirror-fps 10` | 30.0 fps | 25.0 fps | 10.0 fps | 60.3% | 10.0% | **65.7%** |
+| **优化前**同一命令 | **4.6 fps** | 4.6 fps | 4.6 fps | 85.8% | 5.3% | **87.8%** |
+
+> 双路那行重复测了 3 次：**64.4% / 65.7% / 68.5%**（Pi Zero 2 W 的
+> ondemand 调频 + 同机其它进程会有几个百分点抖动）。
+
+四个目标全部达标（CPU ≤ 80%、采集 ≥ 25、编码 ≥ 20、眼镜 ≥ 8）：
+
+```text
+[stream] 帧=948 编码=760 丢弃=153 采集=29.9fps 编码=24.5fps YUV=13.54MB/s
+         实测=302kbps 观众=0 重启=0/0 眼镜=10.0fps/49.9ms 运行=00:00:32
+```
+
+`ffprobe` 同步校验：`codec_name=h264 width=640 height=480 avg_frame_rate=25/1`。
+
+眼镜这一路的单帧成本（10 fps 时约占 1 个核的 13%）：
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| YV12 → 半分辨率 YCbCr | 6.2 ms | `Image.frombuffer` 零拷贝 + PIL 缩小 + 范围 LUT + `merge/convert`（全在 C） |
+| 三分线 / 水平仪 | 0.4 ms | 在 320×200 上画；2× 放大后线宽正好 2 px |
+| 2× 放大 + 写帧包 | 3.8 ms | numpy 四象限 uint32 赋值（见 §8.5） |
+| 1 MB bulk OUT | 24 ms 墙钟 / 4 ms CPU | 和 UVC bulk IN 并发时墙钟涨到 ~37 ms |
+
+> 参考：`monitor.py`（`glxss cast --source uvc`）还是老的整帧解码路径
+> （640×480 cover 全分辨率 ~35 ms/帧、`--uvc-half` ~13 ms/帧），LCD 发送侧
+> 10 fps 实测稳定；直播的眼镜预览走的是 `glxss/pipeline.py` 的新路径。
+
 测试图案（无 UVC，完整编码+RTSP 链路，20 fps / 1.5 Mbps）：
 
 | 进程 | CPU（单核百分比） | RSS |
@@ -384,10 +425,6 @@ YV12 更累；H.264 是必须的。
 | `ffmpeg h264_v4l2m2m` | 0–13%（均值约 5%） | 90–95 MB |
 | `mediamtx`（最小配置） | <1% | 19–28 MB |
 | 合计 | ~0.2–0.3 核 | ~150 MB |
-
-真实 UVC（640×480@30fps，16 KiB 分块组帧）实测：Python 读帧线程单帧 33.3 ms、
-组帧 0 丢弃；`--fps 20` 推流时采集 30.0fps、发送 20.0fps、0 重启。CPU/内存与
-测试图案模式同量级（多一次 USB 拷贝 + 组帧），ffmpeg/mediamtx 不变。
 
 MJPEG 模式（测试图案、单观众、10 fps）：Python ~20–27%，带宽约 0.7 Mbps；
 无观众时编码线程跳过，CPU 回落到 ~10%（只剩采集/图案生成）。
@@ -449,6 +486,79 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 * `ffprobe http://127.0.0.1:8080/stream` → `mjpeg 640x480`；
 * 3 s 拉流 274 KB（≈0.7 Mbps，静态测试图）。
 
+### 8.5 一次采集、多消费者分发（2026-11-22 优化）
+
+**问题**：旧实现把 `--mirror-fps` 做在读 UVC 的主循环里——同步跑
+`uvc.yv12_to_rgb`（全分辨率 640×480，**实测 83–112 ms/帧**）+ `_fit_rgba` +
+1 MB bulk OUT，于是读线程被拖住：`--fps 25 --mirror-fps 10` 实测
+**采集 4.6 fps**，推流跟着掉到 4.6 fps，CPU 反而更高（87.8%）。
+两个消费者各读一次 UVC 的老路（`pi/stream.py` + `glxss cast`）也一样会抢 CPU。
+
+**架构**（对齐原厂 `:llvision_G25`：单线程读、共享一帧、各消费者取最新）：
+
+```text
+读线程（主循环，16 KiB 分块组帧，30 fps）
+  → 发布：只把 bytes 引用放进「最新帧槽」LatestFrame（旧的直接丢，不排队）
+       ├─ 编码线程 EncoderSink：取最新帧 → YV12→yuv420p 零拷贝 → ffmpeg stdin
+       │                        （令牌桶按 --fps 节流，跟不上就丢旧帧）
+       └─ LCD 线程 LcdSink：取最新帧 → 320×200 → YUV→RGB(C) → 640×400
+                              → 三分线/水平仪 → bulk OUT（按 --mirror-fps 限速）
+```
+
+三条不变量：**读线程永不阻塞**（`publish()` 只加锁换个引用）、
+**消费者各自丢帧**（LCD 10 fps 时自然丢掉 3 帧里的 2 帧，不影响编码）、
+**不排队**（慢消费者拿到的永远是最新画面，延迟不累积）。
+
+实测（同一台 Pi、同一条命令 `--fps 25 --mirror-fps 10`，各 20–30 s 稳态）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| 采集 fps | 4.6 | **30.0** |
+| 编码 fps（ffprobe 25/1） | 4.6 | **25.0** |
+| 眼镜 fps | 4.6 | **10.0** |
+| CPU（python + ffmpeg） | 87.8% | **65.7%**（三次 64.4–68.5%） |
+| 眼镜路径单帧 | ~150 ms | **~13 ms**（渲染）+ 24–37 ms（发送，墙钟） |
+
+**发现 1：`-vf shuffleplanes` 不是零转换。** ffmpeg 5.1 的 `shuffleplanes`
+只接受带 alpha 的 `yuva420p`，会在它前后各自动插入一个 `auto_scale`
+（`yuv420p → yuva420p → …`，`-loglevel verbose` 能看到），等于多做一次 swscale
+外加一整块 alpha 平面，比 Python 侧的交换还慢。正确做法是**按 Y→U→V 分三次写
+ffmpeg stdin**：YV12 = Y|V|U、yuv420p = Y|U|V，rawvideo 解复用按字节流读满一整帧
+（`avio_read` 会循环读），三次 `write()` 与一次 `write()` 完全等价。已用
+`ffmpeg -f rawvideo … -f rawvideo pipe.i420` 做字节级比对：输出与
+`yv12_to_i420()` **逐字节相同**，Python 侧零拷贝。
+
+**发现 2：Pi 上 PIL 的 `BILINEAR` 要 29 ms**（320×240→640×400），`NEAREST`
+只要 2.7 ms；但连 `resize()+tobytes()` 都不要——每帧那两次 1 MB 新分配光缺页就
+要 ~7 ms。直接把 2× 最近邻放大做成**四象限 uint32 赋值写进复用的帧包**，
+3.8 ms 完成，并且 `bulk_write_all` 对 `offset == 0` 走原对象直通
+（pyusb 的 `as_array` 对 `array('B')` 不拷贝），每帧又省两次 1 MB memcpy。
+
+**发现 3：限速要按截止时间睡，不能按「等下一帧」。** 相机 30 fps、眼镜目标
+10 fps 时，如果发送循环在 `next_at` 之前用 `hub.take()`（阻塞到下一帧）来等，
+每轮会被相机的 33 ms 帧间隔拖后十几毫秒，实测只能到 **8.4–8.7 fps**；改成
+`Event.wait(deadline - now)` 到点再取当前最新帧，才稳定 **10.0 fps**。
+
+配套改动：
+
+* `glxss/pipeline.py`（新）：`LatestFrame` 最新帧槽、`write_yv12_as_i420`、
+  `LcdRenderer`（半分辨率 + 范围 LUT + PIL C 转换 + 四象限放大）、
+  `LcdSink`（LCD 线程）、`LevelPoller`（HID 加速度计做水平仪，10 fps 下 ~1%
+  CPU，`--no-mirror-level` 可关）；
+* `glxss/stream.py`：`EncoderPipeline`（有界队列）→ `EncoderSink`（拉最新帧 +
+  令牌桶）；`GlassesMirror` → `pipeline.LcdSink`；主循环只剩「读 + 发布」；
+* `glxss/usb.py`：`bulk_write_all` 的零拷贝直通；
+* `pi/stream.py`：新增 `--mirror-level / --no-mirror-level`（默认开）。
+
+回归/边界实测：
+
+| 场景 | 结果 |
+|---|---|
+| `--mirror-fps 5` | 眼镜 5.0 fps，采集仍 30.0–30.2 fps |
+| 运行中 `pkill ffmpeg` | 1 s 内报「编码器退出…重启」，新 pid 起来后编码恢复 25 fps，采集不受影响 |
+| `--check --fps 30` | 30.3 fps / 13.96 MB/s |
+| 只推流 40 s | 采集 30.0 / 编码 25.1 / 0 重启 / CPU 41% |
+
 ---
 
 ## 9. 常见问题
@@ -467,8 +577,12 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 ### 9.2 花屏 / 绿屏 / 颜色不对
 
 * 本设备的 YV12 是 **Y | V | U**，不是 I420 的 Y | U | V；`glxss/stream.py`
-  已经做交换。若你直接用 ffmpeg 读 `/dev/video0`，注意 `-input_format yv12`
+  现在按 **Y→U→V 分三次写 stdin** 完成交换（零拷贝，见 §8.5 发现 1），不再拼
+  460 KB 新 buffer。若你直接用 ffmpeg 读 `/dev/video0`，注意 `-input_format yv12`
   或让 v4l2 输出 `yuyv422`（颜色由驱动转换）。
+* 眼镜上的预览颜色发灰/发白：说明色度没做**有限范围 → 全范围**的换算
+  （`pipeline._Y_LUT/_C_LUT`）。PIL 的 `YCbCr` 模式按 JPEG 全范围解释，
+  直接喂 16–235 的 Y 会整体发灰。
 * OBS 花屏先取消「使用硬件解码」，再降 `--bitrate`，最后才怀疑 USB。
 * 画面上下/左右错位：多半是 URB 头 12 B 没跳对（本模块用 `uvc.py` 处理）。
 
@@ -506,7 +620,8 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 
 | 文件 | 作用 |
 |---|---|
-| `glxss/stream.py` | 核心：UVC 读帧、YV12→I420、ffmpeg 子进程、队列/重连、MJPEG、眼镜预览、统计 |
+| `glxss/pipeline.py` | **共享帧分发**：`LatestFrame` 最新帧槽、`write_yv12_as_i420`（零拷贝）、`LcdRenderer`、`LcdSink`、`LevelPoller` |
+| `glxss/stream.py` | 核心：UVC 读帧/发布、`EncoderSink`（ffmpeg + 令牌桶）、重连、MJPEG、统计 |
 | `pi/stream.py` | 一键启动 CLI（参数映射、`--check`、打印 OBS 地址） |
 | `pi/service/glxss-stream.service` | systemd：开机推流、失败重启 |
 | `pi/mediamtx.yml` | 最小 mediamtx 配置（RTSP + 本地 API） |
@@ -515,10 +630,14 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 
 实现要点：
 
-* 采集线程（主循环）与编码线程通过 `queue.Queue(maxsize=2)` 解耦，写满丢最旧帧；
-* 按 `--fps` 用令牌桶节流，保证「采集 25、目标 20」时输出严格 20 fps，不累积延迟；
-* UVC 读失败 → 关设备（attach uvcvideo）+ 指数退避重开；ffmpeg 退出 → 独立退避重启，
-  期间继续读 UVC 并丢帧，避免 USB 缓冲溢出；
+* 读线程只做「读 + 发布」，`pipeline.LatestFrame` 是一个槽（旧的直接丢）；
+  编码线程和 LCD 线程各自 `take/latest`，谁慢谁丢自己的帧，互不影响；
+* 编码线程按 `--fps` 用令牌桶节流，保证「采集 30、目标 25」时输出严格 25 fps，
+  不累积延迟；
+* YV12→yuv420p 是**换写入顺序**而不是换 buffer（零像素拷贝、零色彩转换）；
+* LCD 线程按 `--mirror-fps` 用「睡到截止时间」限速，到点取当时最新帧；
+* UVC 读失败 → 关设备（attach uvcvideo）+ 指数退避重开；ffmpeg 退出 → 独立退避
+  重启，期间继续读 UVC 并丢帧，避免 USB 缓冲溢出；
 * `--fps` 若高于相机实际帧率会提示一次「建议改成实测值」，避免画面变慢。
 
 ---

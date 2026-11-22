@@ -23,6 +23,7 @@ linux/
 │  ├─ capture.py   # ImageSource / TestPatternSource / mss 屏幕采集 / 三种映射
 │  ├─ hud.py       # HUD 渲染源：时间/罗盘/姿态/lux/亮度/固件/导航占位
 │  ├─ monitor.py   # 相机监看源：UVC 读帧 → 640×400 → 九宫格/水平仪/REC → 眼镜
+│  ├─ pipeline.py  # 一次采集多消费者：最新帧槽 / YV12→yuv420p 零拷贝 / LCD 渲染线程
 │  ├─ control.py   # 与 LCD HAT 的 JSON over Unix socket 控制通道
 │  ├─ app.py       # 采集→640×400→发送主循环，带 fps/MB/s 统计
 │  └─ cli.py       # glxss 子命令（含 hud / ctl）
@@ -49,6 +50,7 @@ linux/
 | HID 轮询/传感器使能 | ✅ 已实现 |
 | HUD 渲染源（默认） | ✅ 已实现：Pillow 640×400 RGBA，2 fps 级别重绘 |
 | 相机监看（monitor） | ✅ `cast --source uvc` / `hud --view monitor`；九宫格 + 水平仪 + 可选 REC；合成帧 10 fps 实测 |
+| 直播 + 眼镜预览（共享帧） | ✅ `pi/stream.py --mirror-fps 10`：一次采集分发两路，真机 采集 30 / 编码 25 / 眼镜 10 fps，总 CPU 65–69% |
 | Pi LCD HAT 状态页/菜单 | ✅ 已实现：状态页 + 7 项菜单（含 VIEW）+ Unix socket |
 | PyInstaller 三端打包 | ✅ 脚本/spec 完成；Windows onedir 实测可运行 |
 | 屏幕采集 | ✅ `mss`（可选依赖）；无桌面用 HUD/test |
@@ -379,6 +381,35 @@ Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
 | 稳态读帧 | **30.0 fps**，33.3 ms/帧，0 丢弃字节 |
 | `glxss cast --source uvc --fps 10 --rotate 180` | 发送 10.0 fps / 10.21 MB/s，100 帧 0 失败，UVC 读 15 fps |
 | RTSP `--fps 20` | 采集 30.0 fps、发送 20.0 fps、0 重启；ffprobe `h264 640x480 20/1` |
+| RTSP `--fps 25` | 采集 30.0 fps、编码 25.1 fps，CPU（python+ffmpeg）**41.0%** |
+
+### 5.6 直播 + 眼镜预览：一次采集、多消费者分发
+
+`pi/stream.py --mirror-fps N` 不再是「再读一次 UVC、再解一次码」，而是：
+
+```text
+UVC 读线程（16 KiB 分块组帧，30 fps）
+  → LatestFrame.publish()                  # 一个槽，旧的直接丢，不排队
+       ├─ EncoderSink 线程 → ffmpeg stdin（YV12→yuv420p 只换写入顺序，零拷贝）
+       └─ LcdSink 线程   → 320×200 → YUV→RGB(C) → 640×400 → OSD → bulk OUT
+```
+
+* 读线程只「读 + 发布」，**任何消费者慢都不会拖慢采集**；
+* LCD 线程按 `--mirror-fps` 睡到截止时间再取当时最新帧（10 fps 时丢掉 3 帧里的
+  2 帧），叠加三分线 + 水平仪（`--no-mirror-level` 可关水平仪）；
+* 眼镜这一路的额外成本：~13 ms 渲染 + 1 MB bulk OUT（4 ms CPU），10 fps 合计
+  约 0.13 个 A53 核。
+
+Pi Zero 2 W 真机（同一条命令 `--fps 25 --mirror-fps 10`，20 s 以上稳态）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| 采集 / 编码 / 眼镜 fps | 4.6 / 4.6 / 4.6 | **30.0 / 25.0 / 10.0** |
+| CPU（python + ffmpeg） | 87.8% | **65–69%**（三次：64.4 / 65.7 / 68.5） |
+
+> 为什么不用 `-vf shuffleplanes`（它会插入 yuva420p 转换，不是零成本）、
+> 为什么半分辨率 + PIL `NEAREST` 而不是 `BILINEAR`、怎么把渲染压到 ~13 ms，
+> 见 [`pi/STREAM.md` §8.5](pi/STREAM.md#85-一次采集多消费者分发2026-11-22-优化)。
 
 ---
 

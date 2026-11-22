@@ -227,6 +227,10 @@ val uOff = if (uFirst) ySize else ySize + cSize
 Yuv.yuv420ToArgb(argb, src, uOff, vOff, w, h)
 ```
 
+> **喂给 ffmpeg 时不需要任何整帧拷贝**：`yuv420p` = `Y | U | V`，只要按
+> `data[0:307200]`、`data[384000:460800]`、`data[307200:384000]` 的顺序分三次
+> `write()` 到 stdin 即可（rawvideo 解复用按字节流读满一帧）。实测见 §7.3。
+
 ---
 
 ## 5. 驱动步骤（与代码一一对应）
@@ -515,6 +519,7 @@ sudo python3 pi/stream.py --rtsp rtsp://127.0.0.1:8554/glxss --fps 20   # 另开
 | 监看 `--fps 10` | 发送 **10.0 fps / 10.21 MB/s**，100 帧 0 失败；后台 UVC 读 15 fps（解码 ~40 ms），0 错误/0 超时 |
 | RTSP `--fps 20` | 采集 **30.0 fps**、发送 **19.7–20.2 fps**、0 重启（33 s / 882 帧）；`ffprobe` → `h264 640x480 avg_frame_rate=20/1` |
 | 连续推流（`--fps 25`） | 采集 30.0 fps、发送 25.1 fps，42 s / 1263 帧，0 重启 |
+| 推流 + 投屏并发（`--fps 25 --mirror-fps 10`） | 采集 **30.0 fps**、编码 **25.0 fps**、眼镜 **10.0 fps**，0 重启，CPU 65–69%；`ffprobe` → `h264 640x480 25/1`（详见 [`linux/pi/STREAM.md` §8.5](../linux/pi/STREAM.md)） |
 | `tools/uvc_pi_exp.py --chunk 16384` | 6 s / 172 帧 = 28.7 fps（含启动），0 超时 / 0 无效 header / 0 丢弃 |
 
 > Linux 的 libusb 本来就会把 460822 拆成 16 KiB URB（usbmon 可见 `S Bi:… 16384`），
@@ -523,6 +528,37 @@ sudo python3 pi/stream.py --rtsp rtsp://127.0.0.1:8554/glxss --fps 20   # 另开
 > 只支持单 URB ≤16 KiB 的 usbfs 上都成立（Android 就是被这个上限挡住）。
 > Pi 修复前“0 帧”是设备固件媒体流水线卡死（状态 B）；设备恢复后同一套代码
 > 直接 30 fps，说明主机侧（分块读 + 组帧 + 原厂序列）已经齐了。
+
+### 7.3 YV12 喂 ffmpeg：零拷贝换平面顺序（2026-11-22）
+
+相机出的是 YV12（`Y | V | U`），ffmpeg 的 `yuv420p` 是 `Y | U | V`。
+Debian 12 的 ffmpeg 5.1 已经没有 `yv12` 像素格式，历史做法是在 Python 里拼一个
+460 KB 的新 buffer（`yv12_to_i420`，实测 1.0–2.1 ms/帧，30 fps 下 3–6% CPU）。
+
+两条「更省」的路都真机实测过：
+
+| 方案 | 结论 |
+|---|---|
+| `-vf shuffleplanes=0:2:1` | ❌ **不是零转换**。5.1 的 shuffleplanes 只接受带 alpha 的 `yuva420p`，`-loglevel verbose` 可见它自动插了 `auto_scale`（`yuv420p → yuva420p`），等于多做一次 swscale + 一整块 alpha 平面，比 Python 拼 buffer 还慢 |
+| 分三次写 stdin | ✅ Y、U、V 各写一段（`memoryview` 切片，**零拷贝**）。rawvideo 解复用按字节流读满 `frame_size`（`avio_read` 会循环读），三次 `write()` 与一次完全等价 |
+
+字节级验证（Pi 上真跑一遍 ffmpeg 回灌）：
+
+```bash
+# 期望值：Python 侧的 yv12_to_i420()
+# 实际值：把 YV12 分三次写进 ffmpeg stdin，再让它把 rawvideo 原样吐回来
+ffmpeg -f rawvideo -pix_fmt yuv420p -s 640x480 -i pipe:0 \
+       -f rawvideo -pix_fmt yuv420p -y pipe.i420
+cmp pipe.i420 expect.i420      # 逐字节相同
+```
+
+实现：`linux/glxss/pipeline.py` 的 `yv12_plane_views()` /
+`write_yv12_as_i420()`；单测 `Yv12PlaneTests` 除了比对字节，还断言
+`memoryview.obj` 仍是原始 `bytes`（证明没有复制像素）。
+
+> 同一份帧还给眼镜的 LCD 线程用（`LcdSink`），所以「一次采集、一次解码、
+> 多消费者分发」里**没有任何一次 460 KB 的整帧拷贝**——读路径本来就是
+> `_take_frame()` 从组帧缓冲里切一份 `bytes`，之后全是共享引用。
 
 ---
 

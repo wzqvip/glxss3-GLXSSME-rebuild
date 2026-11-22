@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """UVC 摄像头 → H.264 → RTSP 直播（Pi Zero 2 W / 通用 Linux）。
 
-链路：
+链路（**一次采集、一次解码、多消费者分发**，对齐原厂 `:llvision_G25`）：
 
     GLXSS G25（UVC bulk IN，YV12 640×480）
-      → pyusb 读帧（和 `glxss uvc` 同一条路，需要 --detach 摘掉 uvcvideo）
-      → YV12→I420（Debian 的 ffmpeg 5.1 没有 yv12 像素格式，交换 U/V 平面）
-      → ffmpeg 子进程：h264_v4l2m2m（Pi 硬编码 /dev/video11）或 libx264
-      → RTSP 推给 mediamtx（跑在 Pi 或 PC 上）
-      → PC OBS「媒体源」拉 rtsp://<pi>:8554/glxss
+      → pyusb 读帧线程（和 `glxss uvc` 同一条路，需要 --detach 摘掉 uvcvideo）
+      → 发布到「最新帧槽」`pipeline.LatestFrame`（旧的直接丢，不排队）
+           ├─ 编码线程 → ffmpeg stdin（YV12→yuv420p 只换写入顺序，零像素拷贝）
+           │            → h264_v4l2m2m（Pi 硬编码 /dev/video11）→ RTSP
+           └─ LCD 线程 → 2×2 抽样 320×200 → YUV→RGB → 640×400 → 眼镜 bulk OUT
+                        （--mirror-fps 限速，丢旧帧）
 
 备选输出：
 
@@ -19,10 +20,12 @@
 
 设计要点：
 
-    * 采集与编码用有界队列解耦，编码跟不上时丢旧帧，延迟不会越攒越大；
+    * 读线程只做「读 + 发布」，**绝不做解码/编码/发送**，任何消费者慢了都不会
+      拖慢采集（这是 `--mirror-fps 10` 时采集掉到 4.6 fps 的根因修复）；
+    * 编码线程按 --fps 用令牌桶节流，取最新帧，跟不上就丢旧帧，延迟不累积；
+    * LCD 线程按 --mirror-fps 限速，渲染 + 发送都在自己线程里；
     * 断线自动重连：UVC 掉线重开设备，ffmpeg 退出自动重启；
-    * 按 --fps 主动节流（相机 20-25 fps，目标 20 时多余的帧直接丢）；
-    * 统计：采集/发送 fps、丢弃、YUV 入带宽、mediamtx API 实测码率、观众数。
+    * 统计：采集/编码/眼镜三路 fps、丢弃、YUV 入带宽、mediamtx API 实测码率、观众数。
 
 同一时间只有一个进程能占用 UVC 接口：`glxss uvc` / 监看模式 / 本模块 三者
 互斥；HUD 只占 LCD 接口，可以和直播共存（除非开了 --mirror-fps）。
@@ -31,7 +34,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import shutil
 import socket
 import subprocess
@@ -44,11 +46,11 @@ from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, List, Optional, Tuple
 
-from . import lcd, usb, uvc
+from . import lcd, pipeline, usb, uvc
 from .errors import GlxssError
 
 DEFAULT_RTSP = "rtsp://127.0.0.1:8554/glxss"
-LCD_W, LCD_H = 640, 400
+LCD_W, LCD_H = lcd.FRAME_W, lcd.FRAME_H  # 640×400（眼镜屏）
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,8 @@ class StreamConfig:
     timeout_ms: int = 5000
     ffmpeg: str = "ffmpeg"
     extra_ffmpeg: Tuple[str, ...] = ()
+    # 旧版「编码器队列深度」；现在改成最新帧槽（深度 1，旧的直接丢），保留字段
+    # 只为兼容旧调用方，不参与运行。
     backlog: int = 2
     # 备选输出
     mjpeg_port: int = 0
@@ -83,6 +87,7 @@ class StreamConfig:
     mjpeg_quality: int = 70
     mirror_fps: float = 0.0
     mirror_fit: str = "fit"
+    mirror_level: bool = True
     # 观测
     api_url: str = ""
     stats_interval: float = 2.0
@@ -153,6 +158,7 @@ class StreamConfig:
             mjpeg_quality=int(getattr(args, "mjpeg_quality", 70)),
             mirror_fps=float(getattr(args, "mirror_fps", 0.0) or 0.0),
             mirror_fit=str(getattr(args, "mirror_fit", "fit")),
+            mirror_level=bool(getattr(args, "mirror_level", True)),
             api_url=str(getattr(args, "api_url", "") or ""),
             stats_interval=float(getattr(args, "stats_interval", 2.0)),
             duration=float(getattr(args, "duration", 0.0) or 0.0),
@@ -324,6 +330,22 @@ class FfmpegEncoder:
         except (BrokenPipeError, ValueError, OSError):
             return False
 
+    def write_frame(self, frame: StreamFrame) -> int:
+        """把一帧 YV12 按 yuv420p 顺序写进 stdin，返回字节数；管道断了返回 0。
+
+        YV12 = Y|V|U、yuv420p = Y|U|V，所以只要按 Y→U→V 的顺序分三次写，
+        不用在 Python 里拼 460 KB 的新 buffer（见 pipeline.yv12_plane_views）。
+        数据长度不对会抛 GlxssError，调用方只丢这一帧。
+        """
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            return 0
+        try:
+            return pipeline.write_yv12_as_i420(
+                proc.stdin, frame.data, frame.width, frame.height)
+        except (BrokenPipeError, ValueError, OSError):
+            return 0
+
     def poll(self) -> Optional[int]:
         if self.proc is None:
             return -1
@@ -372,75 +394,80 @@ def _close_quietly(stream) -> None:
         pass
 
 
-class EncoderPipeline:
-    """有界队列 + 写线程：ffmpeg 卡住时丢旧帧，不让 USB 读循环停摆。"""
+class EncoderSink:
+    """编码线程：从「最新帧槽」取帧 → ffmpeg stdin。
 
-    def __init__(self, config: StreamConfig):
+    * YV12→yuv420p 只交换 U/V 的**写入顺序**（`pipeline.write_yv12_as_i420`），
+      Python 侧零像素拷贝、零色彩转换；
+    * 按 ``--fps`` 用令牌桶节流：相机 30 fps、目标 25 fps 时丢掉多余的帧，
+      送进编码器的永远是最新画面，延迟不累积；
+    * 写不进（管道满 / ffmpeg 死了）就置 ``fatal`` 让主循环重启编码器，
+      **绝不让读线程等**。
+    """
+
+    def __init__(self, config: StreamConfig, hub: "pipeline.LatestFrame"):
         self.config = config
+        self.hub = hub
         self.encoder = FfmpegEncoder(config)
-        self._queue: "queue.Queue[Optional[bytes]]" = queue.Queue(
-            maxsize=max(1, config.backlog))
-        self._thread: Optional[threading.Thread] = None
-        self._running = False
-        self._lock = threading.Lock()
-        self.frames_written = 0
+        self.fps = max(0.0, float(config.fps))
+        self.frames = 0
         self.bytes_written = 0
         self.dropped = 0
         self.fatal: str = ""
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
 
     def start(self) -> None:
         self.encoder.start()
         self._running = True
         self._thread = threading.Thread(
-            target=self._writer_loop, name="encoder-writer", daemon=True)
+            target=self._loop, name="encoder-sink", daemon=True)
         self._thread.start()
 
-    def _writer_loop(self) -> None:
+    def _loop(self) -> None:
+        seq = 0
+        tokens = 1.0
+        last_tick = time.monotonic()
         while self._running:
-            item = self._queue.get()
-            if item is None or not self._running:
-                return
-            if not self.encoder.write(item):
+            frame, seq = self.hub.take(seq, timeout=0.25)
+            if frame is None:
+                if not self._running or self.hub.closed:
+                    return
+                continue
+            now = time.monotonic()
+            if self.fps:
+                # 允许攒 2 帧的抖动余量，避免调度抖动导致成对丢帧。
+                tokens = min(2.0, tokens + max(0.0, now - last_tick) * self.fps)
+                last_tick = now
+                if tokens < 1.0:
+                    self.dropped += 1
+                    continue
+                tokens -= 1.0
+            try:
+                written = self.encoder.write_frame(frame)
+            except GlxssError:
+                self.dropped += 1
+                continue
+            if not written:
                 self.fatal = "ffmpeg 写入失败：" + self.encoder.error_tail()
                 self._running = False
                 return
-            with self._lock:
-                self.frames_written += 1
-                self.bytes_written += len(item)
-
-    def push(self, data: bytes) -> bool:
-        if not self.alive():
-            return False
-        try:
-            self._queue.put_nowait(data)
-            return True
-        except queue.Full:
-            # 丢最旧的，保证编码器拿到的总是新画面（低延迟优先）
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                pass
-            self.dropped += 1
-            try:
-                self._queue.put_nowait(data)
-                return True
-            except queue.Full:
-                self.dropped += 1
-                return False
+            self.frames += 1
+            self.bytes_written += written
 
     def alive(self) -> bool:
         return self._running and self.encoder.poll() is None
 
     def stop(self) -> None:
         self._running = False
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
         self.encoder.stop()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+
+
+# 兼容旧名字（内部/脚本可能还在 import）。
+EncoderPipeline = EncoderSink
 
 
 def _num(value: float) -> str:
@@ -461,6 +488,7 @@ class UvcSource:
         self.session: Optional[usb.DeviceSession] = None
         self.stream: Optional[uvc.UvcStream] = None
         self.probe = None
+        self.gate = usb.UsbGate(verbose=config.verbose)
 
     def open(self):
         self.dev = usb.find_normal()
@@ -496,12 +524,15 @@ class UvcSource:
         self.dev = None
 
     # 眼镜低帧率预览 -----------------------------------------------------
-    def create_mirror(self, config: StreamConfig) -> Optional["GlassesMirror"]:
+    def create_lcd_sink(self, config: StreamConfig,
+                        hub: "pipeline.LatestFrame") -> Optional["pipeline.LcdSink"]:
+        """claim LCD 接口 + 建 LCD 线程（共享同一份帧，不再单独读 UVC）。"""
         if config.mirror_fps <= 0:
             return None
         if self.dev is None or self.session is None:
             raise GlxssError("设备未打开，无法投眼镜")
-        return GlassesMirror(self.dev, self.session, config)
+        return pipeline.open_lcd_sink(self.dev, self.session, config, hub,
+                                      gate=self.gate)
 
 
 class TestPatternSource:
@@ -553,85 +584,12 @@ class TestPatternSource:
     def close(self) -> None:
         pass
 
-    def create_mirror(self, config: StreamConfig) -> None:
+    def create_lcd_sink(self, config: StreamConfig, hub) -> None:
         return None
 
 
 def open_source(config: StreamConfig):
     return TestPatternSource(config) if config.test_source else UvcSource(config)
-
-
-# ---------------------------------------------------------------------------
-# 眼镜预览（可选）
-# ---------------------------------------------------------------------------
-def _fit_rgba(image, width: int = LCD_W, height: int = LCD_H, mode: str = "fit"):
-    """RGB → width×height RGBA（最近邻，够用且省 CPU；不依赖 capture.py）。"""
-    import numpy as np  # type: ignore
-
-    if mode == "crop":
-        mode = "cover"
-    src_h, src_w = image.shape[:2]
-    canvas = np.zeros((height, width, 4), dtype=np.uint8)
-    canvas[:, :, 3] = 255
-    if mode == "stretch":
-        ys = ((np.arange(height) + 0.5) * src_h / height).astype(np.intp)
-        xs = ((np.arange(width) + 0.5) * src_w / width).astype(np.intp)
-        canvas[:, :, :3] = image[np.clip(ys, 0, src_h - 1)[:, None],
-                                 np.clip(xs, 0, src_w - 1)[None, :]]
-        return canvas
-    if mode == "cover":
-        scale = max(width / src_w, height / src_h)
-        crop_w = max(1, min(src_w, int(round(width / scale))))
-        crop_h = max(1, min(src_h, int(round(height / scale))))
-        left = max(0, (src_w - crop_w) // 2)
-        top = max(0, (src_h - crop_h) // 2)
-        part = image[top:top + crop_h, left:left + crop_w]
-        ys = ((np.arange(height) + 0.5) * part.shape[0] / height).astype(np.intp)
-        xs = ((np.arange(width) + 0.5) * part.shape[1] / width).astype(np.intp)
-        canvas[:, :, :3] = part[np.clip(ys, 0, part.shape[0] - 1)[:, None],
-                                np.clip(xs, 0, part.shape[1] - 1)[None, :]]
-        return canvas
-    scale = min(width / src_w, height / src_h)
-    new_w = max(1, min(width, int(round(src_w * scale))))
-    new_h = max(1, min(height, int(round(src_h * scale))))
-    ys = ((np.arange(new_h) + 0.5) * src_h / new_h).astype(np.intp)
-    xs = ((np.arange(new_w) + 0.5) * src_w / new_w).astype(np.intp)
-    resized = image[np.clip(ys, 0, src_h - 1)[:, None],
-                    np.clip(xs, 0, src_w - 1)[None, :]]
-    left = (width - new_w) // 2
-    top = (height - new_h) // 2
-    canvas[top:top + new_h, left:left + new_w, :3] = resized
-    return canvas
-
-
-class GlassesMirror:
-    """把直播画面低帧率投到眼镜屏（claim LCD 接口 + bulk OUT）。"""
-
-    def __init__(self, dev, session: usb.DeviceSession, config: StreamConfig):
-        self.config = config
-        self.fps = max(0.2, config.mirror_fps)
-        self.fit = config.mirror_fit
-        intf, ep = usb.pick_bulk_out(dev)
-        session.claim_interface(intf, label="LCD(预览)")
-        self.link = lcd.LcdLink(dev, ep.bEndpointAddress, timeout=config.timeout_ms)
-        self._next = 0.0
-        self.frames = 0
-        try:
-            self.link.initialize(config.timeout_ms)
-        except GlxssError as exc:
-            print("[stream] 眼镜初始化失败（继续预览）：%s" % exc)
-
-    def maybe_send(self, frame: StreamFrame) -> bool:
-        now = time.monotonic()
-        if now < self._next:
-            return False
-        self._next = now + 1.0 / self.fps
-        rgb = uvc.yv12_to_rgb(frame.data, frame.width, frame.height, order="yv12")
-        rgba = _fit_rgba(rgb, LCD_W, LCD_H, self.fit)
-        packet = lcd.build_frame(rgba.tobytes())
-        self.link.send_packet(packet)
-        self.frames += 1
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +871,12 @@ class StreamStats:
     bitrate_kbps: float = 0.0
     viewers: int = 0
     mjpeg_fps: float = 0.0
+    # 眼镜预览（LCD 线程）
+    lcd: bool = False
+    lcd_fps: float = 0.0
+    lcd_ms: float = 0.0
+    lcd_frames: int = 0
+    lcd_dropped: int = 0
     last_error: str = ""
 
     @property
@@ -921,13 +885,15 @@ class StreamStats:
 
     def line(self) -> str:
         mjpeg = (" MJPEG=%.1ffps" % self.mjpeg_fps) if self.mjpeg_fps else ""
+        lcd = (" 眼镜=%.1ffps/%.1fms" % (self.lcd_fps, self.lcd_ms)
+               if self.lcd else "")
         return (
-            "帧=%d 发送=%d 丢弃=%d 采集=%.1ffps 发送=%.1ffps YUV=%.2fMB/s "
-            "实测=%dkbps 观众=%d 重启=%d/%d%s 运行=%s" % (
+            "帧=%d 编码=%d 丢弃=%d 采集=%.1ffps 编码=%.1ffps YUV=%.2fMB/s "
+            "实测=%dkbps 观众=%d 重启=%d/%d%s%s 运行=%s" % (
                 self.captured, self.sent, self.dropped, self.capture_fps,
                 self.send_fps, self.bytes_in / self.elapsed / 1e6,
                 int(self.bitrate_kbps), self.viewers,
-                self.encoder_restarts, self.source_restarts, mjpeg,
+                self.encoder_restarts, self.source_restarts, mjpeg, lcd,
                 _hms(self.elapsed)))
 
 
@@ -943,7 +909,11 @@ StatsCallback = Optional[Callable[[StreamStats], None]]
 
 
 class Streamer:
-    """把 UVC 源、编码器、MJPEG/眼镜输出和统计串起来。"""
+    """把 UVC 源、编码线程、LCD 线程、MJPEG 输出和统计串起来。
+
+    主线程就是**读线程**：``source.read()`` → ``hub.publish()``，然后立刻回去
+    读下一帧。解码/编码/USB 发送全在各自的消费者线程里，谁慢谁丢自己的旧帧。
+    """
 
     def __init__(self, config: StreamConfig, on_stats: StatsCallback = None):
         self.config = config
@@ -951,10 +921,14 @@ class Streamer:
         self.stats = StreamStats(started=time.monotonic())
         self._stop = threading.Event()
         self._source = None
-        self._pipe: Optional[EncoderPipeline] = None
+        self.hub = pipeline.LatestFrame()
+        self._pipe: Optional[EncoderSink] = None
         self._mjpeg: Optional[MjpegOutput] = None
-        self._mirror: Optional[GlassesMirror] = None
+        self._lcd: Optional[pipeline.LcdSink] = None
         self._api: Optional[MediamtxStats] = None
+        # 编码器线程的累计计数（pipe 重启后归零，靠这里换算成总量）
+        self._pipe_frames = 0
+        self._pipe_dropped = 0
 
     def stop(self) -> None:
         self._stop.set()
@@ -992,8 +966,6 @@ class Streamer:
         source_backoff = 1.0
         encoder_backoff = 1.0
         encoder_retry_at = 0.0
-        tokens = 1.0
-        last_tick = time.monotonic()
         try:
             if cfg.mjpeg_port:
                 self._mjpeg = MjpegOutput(cfg)
@@ -1024,11 +996,15 @@ class Streamer:
                         if probe is not None:
                             self._print("UVC 已打开：%s" % probe.format().replace(
                                 "\n", " "))
-                        if cfg.mirror_fps and hasattr(source, "create_mirror"):
+                        if cfg.mirror_fps and hasattr(source, "create_lcd_sink"):
                             try:
-                                self._mirror = source.create_mirror(cfg)
+                                self._lcd = source.create_lcd_sink(cfg, self.hub)
+                                if self._lcd is not None:
+                                    self._lcd.start()
+                                    self.stats.lcd = True
                             except Exception as exc:
-                                self._mirror = None
+                                self._lcd = None
+                                self.stats.lcd = False
                                 self._print("眼镜预览启动失败（跳过）：%s" % exc)
                     except GlxssError as exc:
                         self.stats.source_restarts += 1
@@ -1043,8 +1019,10 @@ class Streamer:
                 #    等待期间继续读 UVC（帧直接丢），避免 USB 端缓冲溢出。
                 if cfg.rtsp_url and self._pipe is None and now >= encoder_retry_at:
                     try:
-                        self._pipe = EncoderPipeline(cfg)
+                        self._pipe = EncoderSink(cfg, self.hub)
                         self._pipe.start()
+                        self._pipe_frames = 0
+                        self._pipe_dropped = 0
                         encoder_backoff = 1.0
                         encoder_retry_at = 0.0
                         self._print("ffmpeg 已启动（pid=%d）" % (
@@ -1063,7 +1041,7 @@ class Streamer:
                     encoder_backoff = min(encoder_backoff * 2, 15.0)
                     continue
 
-                # 3) 读一帧
+                # 3) 读一帧 —— 读线程唯一的活，读完立刻发布最新帧。
                 try:
                     frame = self._source.read()
                 except GlxssError as exc:
@@ -1078,44 +1056,37 @@ class Streamer:
                 self.stats.captured += 1
                 self.stats.bytes_in += len(frame.data)
 
-                # 4) 节流（令牌桶）：相机比目标快就丢帧，平均帧率严格等于 --fps。
-                #    允许最多攒 2 帧的抖动余量，避免调度抖动导致成对丢帧。
-                now = time.monotonic()
-                emit = True
-                if cfg.period:
-                    tokens = min(2.0, tokens + max(0.0, now - last_tick) * cfg.fps)
-                    last_tick = now
-                    if tokens < 1.0:
-                        self.stats.dropped += 1
-                        emit = False
-                    else:
-                        tokens -= 1.0
-                if emit:
-                    if self._mirror is not None:
-                        try:
-                            self._mirror.maybe_send(frame)
-                        except Exception as exc:
-                            self._print("眼镜预览失败（停用）：%s" % exc)
-                            self._mirror = None
-                    if self._mjpeg is not None:
-                        self._mjpeg.submit(frame)
-                    if self._pipe is not None:
-                        if self._pipe.push(yv12_to_i420(frame.data, frame.width, frame.height)):
-                            self.stats.sent += 1
-                        else:
-                            self.stats.dropped += 1
+                # 4) 发布：不做任何转换/IO，编码线程和 LCD 线程各取最新帧。
+                self.hub.publish(frame)
+                if self._mjpeg is not None:
+                    self._mjpeg.submit(frame)
 
                 # 5) 统计
                 now = time.monotonic()
                 if now - last_report >= cfg.stats_interval:
                     dt = max(1e-6, now - last_report)
                     self.stats.capture_fps = (self.stats.captured - last_captured) / dt
+                    # 编码线程的计数在 pipe 重启后归零，这里按增量累加。
+                    if self._pipe is not None:
+                        self.stats.sent += self._pipe.frames - self._pipe_frames
+                        self.stats.dropped += self._pipe.dropped - self._pipe_dropped
+                        self._pipe_frames = self._pipe.frames
+                        self._pipe_dropped = self._pipe.dropped
                     self.stats.send_fps = (self.stats.sent - last_sent) / dt
                     if self._api is not None:
                         self.stats.bitrate_kbps = self._api.kbps
                         self.stats.viewers = self._api.viewers
                     if self._mjpeg is not None:
                         self.stats.mjpeg_fps = self._mjpeg.frames_sent / self.stats.elapsed
+                    if self._lcd is not None:
+                        lcd_stats = self._lcd.stats_dict()
+                        self.stats.lcd = True
+                        self.stats.lcd_fps = lcd_stats["fps"]
+                        self.stats.lcd_ms = lcd_stats["render_ms"] + lcd_stats["send_ms"]
+                        self.stats.lcd_frames = lcd_stats["frames"]
+                        self.stats.lcd_dropped = lcd_stats["dropped"]
+                        if lcd_stats["last_error"]:
+                            self.stats.last_error = lcd_stats["last_error"]
                     line = self.stats.line()
                     if cfg.rtsp_url and not (self._api and self._api.online):
                         line += "（目标 %s）" % cfg.bitrate
@@ -1144,15 +1115,19 @@ class Streamer:
 
     # -- 清理 -----------------------------------------------------------
     def _close_source(self) -> None:
+        if self._lcd is not None:
+            self._lcd.stop()
+            self._lcd = None
+            self.stats.lcd = False
         if self._source is not None:
             try:
                 self._source.close()
             except Exception:
                 pass
         self._source = None
-        self._mirror = None
 
     def _close_all(self) -> None:
+        self.hub.close()
         if self._pipe is not None:
             self._pipe.stop()
             self._pipe = None

@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="投到眼镜屏的帧率（0=关；开启会占用 LCD 接口，和 HUD 冲突）")
     p.add_argument("--mirror-fit", default="fit",
                    choices=["fit", "cover", "crop", "stretch"], help="眼镜预览的映射方式")
+    p.add_argument("--mirror-level", dest="mirror_level", action="store_true",
+                   default=True, help="眼镜预览叠水平仪（读 HID 加速度计，默认开）")
+    p.add_argument("--no-mirror-level", dest="mirror_level", action="store_false",
+                   help="不读 HID，只画三分线 + 中心准星")
     p.add_argument("--api-url", default="auto",
                    help="mediamtx API（用于实测码率）；auto=本机推流时用 :9997，否则关闭")
     p.add_argument("--stats-interval", type=float, default=2.0, help="统计打印间隔（秒）")
