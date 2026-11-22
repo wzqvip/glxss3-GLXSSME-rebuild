@@ -63,18 +63,30 @@ object LcdControl {
     }
 
     /**
-     * 屏幕开关（原厂 `LCD.setSwitch()` → `liblcd.so` 0xA1/0x03 wIndex=3）。
+     * 屏幕开关（原厂 `LCD.setSwitch()` → `nativeLCDSetSwitch` → `lcd_power_switch`）：
+     * `0xA1 / bRequest=0x02 / wValue=0|1 / wIndex=3 / wLength=1`。
      *
      * **重要**：原厂 LCDService 在停止投屏/浮层后会主动 `setSwitch(false)`，
      * 30 秒的 "Switch-LCD" 线程也会在「没有在投屏」时把屏关掉。
      * 屏 switch 关掉以后，只发帧/只切 displayMode **不会**重新点亮 —— 必须显式 setSwitch(true)。
+     *
+     * 注意：旧文档/旧代码把 0x02 当 roll、0x03 当开关，正好写反了；见 [setRoll]。
      */
     fun setScreenOn(conn: UsbDeviceConnection, on: Boolean): Boolean =
-        xfer(conn, 0x03, if (on) 1 else 0, IFACE_LCD, ByteArray(1), 1) > 0
+        xfer(conn, 0x02, if (on) 1 else 0, IFACE_LCD, ByteArray(1), 1) > 0
 
-    /** 屏幕旋转（原厂 `LCD.setRoll()` → 0xA1/0x02，参数放 wValue） */
+    /**
+     * 屏幕旋转（原厂 `LCD.setRoll()` → `nativeLCDSetRoll` → `lcd_set_roll`）：
+     * `0xA1 / bRequest=0x03 / wValue=roll&0xFF / wIndex=3 / wLength=1`，`ret==1` 才算 ACK。
+     *
+     * 这是对 `liblcd.so` 的 JNI 注册表逐项回溯得到的（armeabi-v7a/arm64-v8a 一致），
+     * 不是按函数顺序猜的：`nativeLCDSetRoll` 的 wrapper 明确 `bl lcd_set_roll`，
+     * 而 `lcd_set_roll` 里 `libusb_control_transfer` 的 bRequest 是 3。
+     *
+     * 只保留给诊断（DebugReceiver/ExpHarness）；普通 UI 的「画面翻转」走软件 180°。
+     */
     fun setRoll(conn: UsbDeviceConnection, roll: Int): Boolean =
-        xfer(conn, 0x02, roll, IFACE_LCD, ByteArray(1), 1) > 0
+        xfer(conn, 0x03, roll and 0xFF, IFACE_LCD, ByteArray(1), 1) > 0
 
     /**
      * `0xA1/0x04` 的 8 B 状态。

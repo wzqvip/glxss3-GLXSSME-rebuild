@@ -8,6 +8,8 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -67,6 +69,8 @@ import com.wzqvip.glxsscast.usb.HidSensor
 import com.wzqvip.glxsscast.usb.Peripherals
 import com.wzqvip.glxsscast.usb.UsbLink
 import com.wzqvip.glxsscast.uvc.UvcCamera
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -76,6 +80,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 单页控制台。功能分区：
@@ -102,8 +107,12 @@ class MainActivity : ComponentActivity() {
     private var fillMode by mutableStateOf(com.wzqvip.glxsscast.cast.CastService.MODE_CROP)
     private var showUvc by mutableStateOf(false)
     private var busy by mutableStateOf(false)
-    private var rollIdx by mutableStateOf(0)
-    private val ROTATE_VALUES = intArrayOf(0, 2, 4, 6, 8, 10, 12, 14)
+
+    // ---- 画面方向（软件实现，不走设备 roll） ----
+    /** 投屏 + 测试图 180° 翻转；状态唯一来源是 CastService.flip180 / LcdProtocol.flip180 */
+    private var flip180 by mutableStateOf(false)
+    /** UVC 预览独立翻转（默认关，不影响投屏/测试图） */
+    private var uvcFlip180 by mutableStateOf(false)
 
     // ---- 画面调整 ----
     private var zoom by mutableStateOf(1f)
@@ -201,11 +210,68 @@ class MainActivity : ComponentActivity() {
     private val usbMutex = Mutex()
     private var lastPermissionRequestAt = 0L
 
+    // ---- 固件灌写 / 华为 ROM 主动轮询（0.1.6） ----
+    /**
+     * 正在灌固件（含「传输完成后等 03E7→2E09 重枚举」的窗口）。
+     * 灌写期间忽略 ATTACH 广播，避免 attach(2E09) → connect 与 flash 线程抢设备、
+     * 或对同一个引导设备重复灌写（重复灌写 = 用户看到的「加载固件后闪退」）。
+     */
+    private val flashing = AtomicBoolean(false)
+    /** detach 清理线程只跑一次，避免自动重连循环每秒都 spawn 一个清理线程 */
+    private val detachCleanupRunning = AtomicBoolean(false)
+    /** 最近一次刷写结束（成功/失败）时间 + 设备 id：轮询时不要对同一台设备立刻重灌 */
+    private var lastFlashFinishedAt = 0L
+    private var lastFlashDeviceId = -1
+    /** 已经为该引导设备弹过一次权限请求（设备 id），避免每 2 秒循环弹框 */
+    private var bootPermissionRequestedFor = -1
+    /** 前台 2 秒轮询 job（onResume 启动 / onPause 取消） */
+    private var usbPollJob: Job? = null
+    @Volatile private var foreground = false
+
     private data class UvcOpenResult(
         val options: List<UvcCamera.StreamOption>,
         val selected: UvcCamera.StreamOption?,
         val status: String
     )
+
+    // ==================================================================
+    // 崩溃兜底 / 主线程安全（0.1.6）
+    // ==================================================================
+
+    /**
+     * [lifecycleScope.launch] 的兜底版本。
+     *
+     * 协程里未捕获的 Throwable 会走 `AndroidExceptionPreHandler` → 主线程
+     * UncaughtExceptionHandler → **进程被杀**（用户看到的就是「闪退」）。
+     * 设备重枚举/拔出时 `usb.open`、`controlTransfer`、`claimInterface` 都可能抛，
+     * 统一在这里接住：落 oplog + 状态栏提示，不让 App 死。
+     */
+    private fun launchSafe(block: suspend CoroutineScope.() -> Unit): Job = lifecycleScope.launch {
+        try {
+            block()
+        } catch (t: Throwable) {
+            // 协程被取消（onPause/onDestroy）是正常流程，不是错误
+            if (t is CancellationException) throw t
+            reportInternalError("coroutine", t)
+        }
+    }
+
+    private fun reportInternalError(where: String, t: Throwable) {
+        try {
+            Oplog.logf(
+                "CONN", "%s 异常 %s: %s", where, t.javaClass.simpleName,
+                (t.message ?: "").take(200)
+            )
+        } catch (ignored: Throwable) {
+        }
+        try {
+            status = "内部错误（$where）：${t.javaClass.simpleName}: ${(t.message ?: "").take(80)}"
+        } catch (ignored: Throwable) {
+        }
+    }
+
+    private val usbManager: UsbManager
+        get() = getSystemService(Context.USB_SERVICE) as UsbManager
 
     private val projectionManager by lazy {
         getSystemService(android.media.projection.MediaProjectionManager::class.java)
@@ -214,36 +280,54 @@ class MainActivity : ComponentActivity() {
     private val mpLauncher = registerForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        val data = result.data
-        if (result.resultCode == android.app.Activity.RESULT_OK && data != null) {
-            val i = Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java).apply {
-                action = com.wzqvip.glxsscast.cast.CastService.ACTION_START
-                putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_CODE, result.resultCode)
-                putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_DATA, data)
-                putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_MODE, fillMode)
+        try {
+            val data = result.data
+            if (result.resultCode == android.app.Activity.RESULT_OK && data != null) {
+                val i = Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java).apply {
+                    action = com.wzqvip.glxsscast.cast.CastService.ACTION_START
+                    putExtra(
+                        com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_CODE, result.resultCode
+                    )
+                    putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_RESULT_DATA, data)
+                    putExtra(com.wzqvip.glxsscast.cast.CastService.EXTRA_MODE, fillMode)
+                }
+                androidx.core.content.ContextCompat.startForegroundService(this, i)
+                status = "投屏已启动"
+            } else {
+                status = "投屏授权被取消"
             }
-            androidx.core.content.ContextCompat.startForegroundService(this, i)
-            status = "投屏已启动"
-        } else {
-            status = "投屏授权被取消"
+        } catch (t: Throwable) {
+            // Android 12+ 后台/超时启动前台服务会抛 ForegroundServiceStartNotAllowedException
+            reportInternalError("mpLauncher", t)
         }
     }
 
+    /**
+     * USB 权限回调（主线程）。
+     *
+     * 整个 onReceive 包 try：这是 BroadcastReceiver 的主线程回调，任何未捕获异常
+     * 都会直接杀进程 —— 华为机上「点加载固件后闪退」很可能就发生在权限回调之后的
+     * connect/autoFlashBoot 里。
+     */
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != UsbLink.ACTION_PERMISSION) return
-            val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            Oplog.logf(
-                "CONN", "USB permission result dev=%s granted=%b",
-                dev?.deviceName ?: "null", granted
-            )
-            when {
-                dev == null -> status = "USB 权限被拒绝"
-                !granted -> status = "USB 权限被拒绝"
-                // 引导模式设备：继续灌固件（不能当正常设备连接）
-                dev.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID -> autoFlashBoot(dev)
-                else -> connect(dev)
+            try {
+                if (intent.action != UsbLink.ACTION_PERMISSION) return
+                val dev = extraDevice(intent)
+                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                Oplog.logf(
+                    "CONN", "USB permission result dev=%s granted=%b",
+                    dev?.deviceName ?: "null", granted
+                )
+                when {
+                    dev == null -> status = "USB 权限被拒绝"
+                    !granted -> status = "USB 权限被拒绝"
+                    // 引导模式设备：继续灌固件（不能当正常设备连接）
+                    dev.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID -> autoFlashBoot(dev)
+                    else -> connect(dev)
+                }
+            } catch (t: Throwable) {
+                reportInternalError("permissionReceiver", t)
             }
         }
     }
@@ -251,35 +335,129 @@ class MainActivity : ComponentActivity() {
     /**
      * 拔插自动重连：
      * - ATTACHED：VID 0x2E09 的 GLXSS3（正常模式 2e09:0030）自动连接；
-     * - DETACHED：清掉状态，后台重连循环会在设备回来后自动恢复。
+     * - DETACHED：停投屏 / 停 UVC+HID / 关 USB，后台清理线程收尾（主线程不阻塞）。
+     *
+     * 0.1.6 加固：
+     * - 灌固件期间（[flashing]）忽略所有 attach —— 重枚举出来的 2E09 由 flash 成功回调
+     *   自己等 1.5 s 后再连，避免 attach 里的 connect 和 flash 线程抢设备；
+     * - detach 不再在主线程 `usb.close()`（releaseInterface 在设备已消失时会抛），
+     *   改到后台线程，并先停 UVC/HID 线程。
      */
     private val attachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                    // 重新插上 = 用户想用设备了：解除「断开」暂停，交给自动重连/自动连接
-                    reconnectPaused = false
-                    val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                    if (dev != null && dev.vendorId == 0x03E7) {
-                        status = "检测到引导模式设备"
-                        // 掉回引导模式 = 固件崩溃复位；先把最后 200 条操作固化下来
-                        Oplog.dumpCrash("boot_mode_03e7(attach)")
-                        autoFlashBoot(dev)
+            try {
+                when (intent.action) {
+                    UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                        // 重新插上 = 用户想用设备了：解除「断开」暂停，交给自动重连/自动连接
+                        reconnectPaused = false
+                        val dev = extraDevice(intent)
+                        if (dev == null) {
+                            Oplog.log("CONN", "attach 广播没有 UsbDevice extra")
+                            return
+                        }
+                        if (flashing.get()) {
+                            Oplog.logf(
+                                "CONN", "忽略 attach（正在灌固件）dev=%s %04x:%04x",
+                                dev.deviceName, dev.vendorId, dev.productId
+                            )
+                            status = "固件写入中，等待设备重新枚举…"
+                            return
+                        }
+                        if (dev.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID) {
+                            status = "检测到引导模式设备"
+                            // 掉回引导模式 = 固件崩溃复位；先把最后 200 条操作固化下来
+                            Oplog.dumpCrash("boot_mode_03e7(attach)")
+                            autoFlashBoot(dev)
+                        } else if (dev.vendorId == UsbLink.VID) {
+                            status = "检测到眼镜（2e09:%04x），自动连接…".format(dev.productId)
+                            connect(dev)
+                        }
                     }
-                    if (dev != null && dev.vendorId == UsbLink.VID) {
-                        status = "检测到眼镜（2e09:%04x），自动连接…".format(dev.productId)
-                        connect(dev)
+                    UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                        val dev = extraDevice(intent)
+                        // 灌固件后引导设备消失 = 正常的重枚举，不当作「设备断开」清理
+                        if (flashing.get() &&
+                            dev != null &&
+                            dev.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID
+                        ) {
+                            Oplog.log("CONN", "引导设备 detach（刷写后的重枚举，预期内）")
+                            return
+                        }
+                        // 引导设备 detach（灌固件后的重枚举）也要清理，否则会残留半开状态
+                        val relevant = dev == null ||
+                            dev.vendorId == UsbLink.VID ||
+                            dev.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID
+                        if (relevant) handleUsbDetach(dev)
                     }
                 }
-                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                    if (dev == null || dev.vendorId == UsbLink.VID) {
-                        Oplog.dumpCrash("usb_detached(productId=${dev?.productId})")
-                        usb.close()
-                        status = "设备已断开（等待自动重连…）"
-                    }
-                }
+            } catch (t: Throwable) {
+                reportInternalError("attachReceiver", t)
             }
+        }
+    }
+
+    /**
+     * USB DETACHED 收尾（主线程只做「非阻塞」的部分）：
+     * 1. 立刻停投屏（CastService 自己也监听 detach，这里是第二道保险）；
+     * 2. 状态栏提示 + 留 crash 现场；
+     * 3. UVC/HID 线程 stop（join 最多 2s）+ usb.close() 全丢到后台线程，
+     *    主线程绝不阻塞（否则华为 ROM 上会 ANR / 被系统判死）。
+     */
+    private fun handleUsbDetach(dev: UsbDevice?) {
+        try {
+            Oplog.logf(
+                "CONN", "detach dev=%s %04x:%04x",
+                dev?.deviceName ?: "null", dev?.vendorId ?: -1, dev?.productId ?: -1
+            )
+            try {
+                Oplog.dumpCrash("usb_detached(productId=${dev?.productId})")
+            } catch (ignored: Throwable) {
+            }
+            reconnectPaused = false
+            status = "设备已断开（等待自动重连…）"
+            castInfo = "未投屏"
+            uvcErr = "USB 已断开"
+            // 停止投屏（避免继续往已消失的设备写帧）；失败只记日志
+            try {
+                if (com.wzqvip.glxsscast.cast.CastService.running) stopCastService()
+            } catch (t: Throwable) {
+                Oplog.logf("CAST", "detach: stop cast 异常 %s", t.javaClass.simpleName)
+            }
+            if (!detachCleanupRunning.compareAndSet(false, true)) return
+            Thread({
+                try {
+                    try {
+                        activeUvc?.stop()
+                        activeUvc?.close()
+                    } catch (t: Throwable) {
+                        Oplog.logf(
+                            "UVC", "detach: uvc stop/close 异常 %s: %s",
+                            t.javaClass.simpleName, t.message
+                        )
+                    }
+                    try {
+                        hidSensor?.stop()
+                    } catch (t: Throwable) {
+                        Oplog.logf(
+                            "HID", "detach: hid stop 异常 %s: %s",
+                            t.javaClass.simpleName, t.message
+                        )
+                    }
+                    try {
+                        usb.close()
+                    } catch (t: Throwable) {
+                        Oplog.logf(
+                            "CONN", "detach: usb.close 异常 %s: %s",
+                            t.javaClass.simpleName, t.message
+                        )
+                    }
+                    Oplog.log("CONN", "detach cleanup done")
+                } finally {
+                    detachCleanupRunning.set(false)
+                }
+            }, "UsbDetach").apply { isDaemon = true }.start()
+        } catch (t: Throwable) {
+            reportInternalError("handleUsbDetach", t)
         }
     }
 
@@ -296,6 +474,9 @@ class MainActivity : ComponentActivity() {
         offsetX = prefs.offsetX
         offsetY = prefs.offsetY
         applyAdjust(zoom, offsetX, offsetY, persist = false)
+        flip180 = prefs.flip180
+        com.wzqvip.glxsscast.cast.CastService.flip180 = flip180
+        uvcFlip180 = prefs.uvcFlip180
         autoBrightness = prefs.autoBrightness
         autoReconnect = prefs.autoReconnect
         hidClickAction = HidAction.from(prefs.hidClickAction)
@@ -332,29 +513,47 @@ class MainActivity : ComponentActivity() {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 3)
         }
 
-        androidx.core.content.ContextCompat.registerReceiver(
-            this, permissionReceiver, IntentFilter(UsbLink.ACTION_PERMISSION),
-            androidx.core.content.ContextCompat.RECEIVER_EXPORTED
-        )
+        try {
+            androidx.core.content.ContextCompat.registerReceiver(
+                this, permissionReceiver, IntentFilter(UsbLink.ACTION_PERMISSION),
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED
+            )
+        } catch (t: Throwable) {
+            reportInternalError("registerReceiver(permission)", t)
+        }
         val filter = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
-        androidx.core.content.ContextCompat.registerReceiver(
-            this, attachReceiver, filter,
-            androidx.core.content.ContextCompat.RECEIVER_EXPORTED
-        )
+        try {
+            androidx.core.content.ContextCompat.registerReceiver(
+                this, attachReceiver, filter,
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED
+            )
+        } catch (t: Throwable) {
+            reportInternalError("registerReceiver(attach)", t)
+        }
 
         startAutoReconnectLoop()
         setContent { App() }
         // 实验/自动化脚本用：`am start ... --es cmd cast` 这类命令在 onCreate 后延迟执行
-        window.decorView.postDelayed({ handleDebugIntent(intent) }, 800)
+        window.decorView.postDelayed({
+            try {
+                handleDebugIntent(intent)
+            } catch (t: Throwable) {
+                reportInternalError("handleDebugIntent", t)
+            }
+        }, 800)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleDebugIntent(intent)
+        try {
+            handleDebugIntent(intent)
+        } catch (t: Throwable) {
+            reportInternalError("onNewIntent", t)
+        }
     }
 
     /**
@@ -362,36 +561,42 @@ class MainActivity : ComponentActivity() {
      *
      * 只服务长跑实验与取证：投屏需要系统授权对话框，所以这里只负责把
      * `createScreenCaptureIntent()` 弹出来，授权仍需点一下。
+     *
+     * 主线程入口：整体兜 Throwable，坏命令不能杀 App。
      */
     private fun handleDebugIntent(intent: Intent?) {
-        val cmd = intent?.getStringExtra("cmd") ?: return
-        Oplog.logf("DEBUG", "intent cmd=%s", cmd)
-        when (cmd) {
-            "cast" -> {
-                if (com.wzqvip.glxsscast.cast.CastService.running) {
-                    status = "投屏已在运行"
-                } else if (!usb.isOpen) {
-                    status = "投屏前先连接眼镜"
-                } else {
-                    status = "请求投屏授权…"
-                    runCatching { mpLauncher.launch(projectionManager.createScreenCaptureIntent()) }
-                        .onFailure { status = "投屏授权启动失败: ${it.message}" }
+        try {
+            val cmd = intent?.getStringExtra("cmd") ?: return
+            Oplog.logf("DEBUG", "intent cmd=%s", cmd)
+            when (cmd) {
+                "cast" -> {
+                    if (com.wzqvip.glxsscast.cast.CastService.running) {
+                        status = "投屏已在运行"
+                    } else if (!usb.isOpen) {
+                        status = "投屏前先连接眼镜"
+                    } else {
+                        status = "请求投屏授权…"
+                        runCatching { mpLauncher.launch(projectionManager.createScreenCaptureIntent()) }
+                            .onFailure { status = "投屏授权启动失败: ${it.message}" }
+                    }
                 }
+                "record_start" -> startRecording()
+                "record_stop" -> stopRecording()
+                "hid_start" -> startHidSensor()
+                "hid_stop" -> stopHidSensor()
+                "fsr_estimate" -> estimateAccRange()
+                "level_calib" -> calibrateLevel()
+                "sensor_attr" -> readImuAttributes()
+                "oplog_dump" -> {
+                    Oplog.dumpCrash("manual")
+                    updateCrashInfo()
+                    status = "已写 crash_last.txt"
+                }
+                "status" -> readStatusFields()
+                else -> status = "未知调试命令: $cmd"
             }
-            "record_start" -> startRecording()
-            "record_stop" -> stopRecording()
-            "hid_start" -> startHidSensor()
-            "hid_stop" -> stopHidSensor()
-            "fsr_estimate" -> estimateAccRange()
-            "level_calib" -> calibrateLevel()
-            "sensor_attr" -> readImuAttributes()
-            "oplog_dump" -> {
-                Oplog.dumpCrash("manual")
-                updateCrashInfo()
-                status = "已写 crash_last.txt"
-            }
-            "status" -> readStatusFields()
-            else -> status = "未知调试命令: $cmd"
+        } catch (t: Throwable) {
+            reportInternalError("handleDebugIntent(${intent?.getStringExtra("cmd")})", t)
         }
     }
 
@@ -420,8 +625,20 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        unregisterReceiver(permissionReceiver)
-        unregisterReceiver(attachReceiver)
+        // unregisterReceiver 在「注册失败/进程被复用」时会抛 IllegalArgumentException，
+        // 以前这行会让 onDestroy 本身崩掉（退出 App 时闪退）
+        try {
+            unregisterReceiver(permissionReceiver)
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "unregister permissionReceiver failed", t)
+        }
+        try {
+            unregisterReceiver(attachReceiver)
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "unregister attachReceiver failed", t)
+        }
+        usbPollJob?.cancel()
+        usbPollJob = null
         // 录像要在进程里收尾，否则 muxer 的 mp4 索引写不完
         try {
             if (com.wzqvip.glxsscast.cast.CastService.frameTap === recorder) {
@@ -438,31 +655,130 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 每次打开/回到页面都按当前姿态重新取水平零点（符合「每次打开都按照水平」）
-        zeroPending = true
-        zeroSamples.clear()
-        // 回到前台时如果还没连上，立刻试一次（不等 1s 轮询）
-        if (!usb.isOpen && prefs.autoReconnect && !reconnectPaused) {
-            lifecycleScope.launch {
-                delay(300)
-                if (!usb.isOpen) tryOpenFound()
+        try {
+            foreground = true
+            // 每次打开/回到页面都按当前姿态重新取水平零点（符合「每次打开都按照水平」）
+            zeroPending = true
+            zeroSamples.clear()
+            // 华为 ROM 可能不投递 USB_DEVICE_ATTACHED（或只在拿到权限后才投递）：
+            // 前台每 2 秒主动扫一次 deviceList，进前台立刻扫一次。
+            startUsbPoll()
+            // 回到前台时如果还没连上，立刻试一次（不等 1s 轮询）
+            if (!usb.isOpen && prefs.autoReconnect && !reconnectPaused) {
+                launchSafe {
+                    delay(300)
+                    if (!usb.isOpen) tryOpenFound()
+                }
             }
+        } catch (t: Throwable) {
+            reportInternalError("onResume", t)
         }
+    }
+
+    override fun onPause() {
+        foreground = false
+        usbPollJob?.cancel()
+        usbPollJob = null
+        super.onPause()
     }
 
     // ==================================================================
     // 连接 / 重连
     // ==================================================================
 
-    private fun autoFlashBoot(dev: UsbDevice) {
-        Oplog.logf("CONN", "autoFlashBoot dev=%s hasPerm=%b", dev.deviceName, usb.hasPermission(dev))
-        if (!usb.hasPermission(dev)) {
-            status = "引导模式设备，请求 USB 权限…"
-            requestPermissionSafe(dev)
-            return
+    /**
+     * 前台 USB 轮询（2 s 一次）。
+     *
+     * 解决的正是「打开 App 不会自动加载固件」：华为 ROM 在眼镜处于 03E7:2150 引导模式时
+     * 不一定把 `USB_DEVICE_ATTACHED` 投递给 App（也可能要等拿到权限后才投递）。
+     * 轮询不依赖广播：扫 `UsbManager.deviceList` 发现引导设备 →
+     * 有权限就自动灌固件，没权限只请求一次（同一个设备 id 不重复弹框）。
+     */
+    private fun startUsbPoll() {
+        usbPollJob?.cancel()
+        usbPollJob = launchSafe {
+            while (isActive) {
+                if (foreground) {
+                    try {
+                        pollUsbOnce()
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        Oplog.logf(
+                            "CONN", "usb poll 异常 %s: %s",
+                            t.javaClass.simpleName, (t.message ?: "").take(120)
+                        )
+                    }
+                }
+                delay(2000)
+            }
         }
-        status = "检测到引导模式，准备固件…"
-        flashBootDevice(dev)
+    }
+
+    private suspend fun pollUsbOnce() {
+        val list = withContext(Dispatchers.IO) {
+            try {
+                usbManager.deviceList.values.toList()
+            } catch (t: Throwable) {
+                Oplog.logf(
+                    "CONN", "deviceList 读取失败 %s: %s",
+                    t.javaClass.simpleName, t.message
+                )
+                null
+            }
+        } ?: return
+        if (!foreground) return
+
+        val boot = list.firstOrNull {
+            it.vendorId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_VID &&
+                it.productId == com.wzqvip.glxsscast.usb.MyriadBootLoader.BOOT_PID
+        }
+        if (boot != null) {
+            if (flashing.get()) return
+            // 刚刷完（还没重枚举）的同一台引导设备不要立刻再刷一遍：给 10 s 窗口
+            val recentlyFlashed = boot.deviceId == lastFlashDeviceId &&
+                System.currentTimeMillis() - lastFlashFinishedAt < 10_000
+            if (recentlyFlashed) return
+            val hasPerm = try {
+                usb.hasPermission(boot)
+            } catch (t: Throwable) {
+                false
+            }
+            if (hasPerm) {
+                Oplog.logf(
+                    "CONN", "poll: 发现引导模式设备 %s（广播可能没来），自动灌固件",
+                    boot.deviceName
+                )
+                autoFlashBoot(boot)
+            } else if (boot.deviceId != bootPermissionRequestedFor) {
+                // 同一设备只请求一次权限，避免每 2 秒弹一次系统框
+                bootPermissionRequestedFor = boot.deviceId
+                Oplog.logf("CONN", "poll: 引导设备无权限，请求一次 USB 权限")
+                status = "发现引导模式设备（03E7:2150），请求 USB 权限…"
+                requestPermissionSafe(boot)
+            }
+        }
+    }
+
+    private fun autoFlashBoot(dev: UsbDevice) {
+        try {
+            Oplog.logf(
+                "CONN", "autoFlashBoot dev=%s hasPerm=%b flashing=%b",
+                dev.deviceName, usb.hasPermission(dev), flashing.get()
+            )
+            if (flashing.get()) {
+                status = "固件正在写入，请稍候…"
+                return
+            }
+            if (!usb.hasPermission(dev)) {
+                status = "引导模式设备，请求 USB 权限…"
+                requestPermissionSafe(dev)
+                return
+            }
+            status = "检测到引导模式，准备固件…"
+            flashBootDevice(dev)
+        } catch (t: Throwable) {
+            reportInternalError("autoFlashBoot", t)
+        }
     }
 
     /**
@@ -495,7 +811,7 @@ class MainActivity : ComponentActivity() {
 
     /** 启动时预热：新装用户第一次进来就把固件解包好，插上眼镜时不用等 */
     private fun prewarmFirmware() {
-        lifecycleScope.launch {
+        launchSafe {
             val r = ensureFirmware()
             firmwareInfo = if (r.ok) Firmware.describe(this@MainActivity) else "固件：不可用 —— ${r.message}"
             Oplog.logf("BOOT", "firmware prewarm ok=%b: %s", r.ok, r.message)
@@ -507,7 +823,7 @@ class MainActivity : ComponentActivity() {
         if (firmwareBusy) return
         firmwareBusy = true
         status = "重新解包内置固件…"
-        lifecycleScope.launch {
+        launchSafe {
             try {
                 withContext(Dispatchers.IO) { Firmware.reset(applicationContext) }
                 val r = ensureFirmware()
@@ -525,45 +841,240 @@ class MainActivity : ComponentActivity() {
      * 旧实现只认 `getExternalFilesDir(null)/G25_MainFW_1.9.1.img`：普通用户装完 APK
      * 根本没有这个文件 → 无法恢复；而且文件缺失/设备被拔时的异常路径没兜底。
      * 现在统一走 APK 内置 + 私有目录，任何一步失败都给状态栏提示而不是崩。
+     *
+     * 0.1.6：用 [flashing] 做闸门（attach 广播 / 2s 轮询 / 权限回调都可能同时触发），
+     * 传输完成后由 [onFlashFinished] 等重枚举再连接。
      */
     private fun flashBootDevice(dev: UsbDevice) {
-        lifecycleScope.launch {
-            val r = ensureFirmware()
-            val img = r.file
-            if (!r.ok || img == null) {
-                firmwareInfo = "固件：不可用 —— ${r.message}"
-                status = "缺少固件：${r.message}"
-                return@launch
+        if (!flashing.compareAndSet(false, true)) {
+            status = "固件正在写入，请稍候…"
+            return
+        }
+        // 先记下设备 id：即使后面在「解包/校验」阶段就失败，轮询也不会对同一台
+        // 引导设备每 2 秒重复触发一次
+        lastFlashDeviceId = dev.deviceId
+        launchSafe {
+            try {
+                val r = ensureFirmware()
+                val img = r.file
+                if (!r.ok || img == null) {
+                    firmwareInfo = "固件：不可用 —— ${r.message}"
+                    status = "缺少固件：${r.message}"
+                    flashing.set(false)
+                    lastFlashFinishedAt = System.currentTimeMillis()
+                    return@launchSafe
+                }
+                firmwareInfo = Firmware.describe(this@MainActivity)
+                // 再就地校验一次（目录可能刚被系统清理/写坏）
+                val invalid = com.wzqvip.glxsscast.usb.MyriadBootLoader.validate(img)
+                if (invalid != null) {
+                    status = "固件不可用：$invalid"
+                    flashing.set(false)
+                    lastFlashFinishedAt = System.currentTimeMillis()
+                    return@launchSafe
+                }
+                status = "正在灌固件…"
+                Oplog.logf("CONN", "flash start dev=%s img=%s", dev.deviceName, img.name)
+                com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(
+                    this@MainActivity, dev, img,
+                    { p, m ->
+                        runOnUiThread {
+                            try {
+                                status = "$p% $m"
+                            } catch (ignored: Throwable) {
+                            }
+                        }
+                    },
+                    { ok, msg ->
+                        runOnUiThread {
+                            try {
+                                onFlashFinished(dev, ok, msg)
+                            } catch (t: Throwable) {
+                                reportInternalError("onFlashFinished", t)
+                            }
+                        }
+                    }
+                )
+            } catch (t: Throwable) {
+                flashing.set(false)
+                lastFlashFinishedAt = System.currentTimeMillis()
+                reportInternalError("flashBootDevice", t)
             }
-            firmwareInfo = Firmware.describe(this@MainActivity)
-            // 再就地校验一次（目录可能刚被系统清理/写坏）
-            com.wzqvip.glxsscast.usb.MyriadBootLoader.validate(img)?.let {
-                status = "固件不可用：$it"
-                return@launch
+        }
+    }
+
+    /**
+     * 灌固件结束（主线程回调）。
+     *
+     * - 失败：复位 [flashing] + 状态栏提示（不自动重试，避免把同一台设备刷写死循环）；
+     * - 成功：设备会 03E7 → 2E09 重枚举，**先等 1.5 s**，再在后台线程反复尝试连接；
+     *   连接失败只提示，绝不再走「attach → connect → 协程异常 → 闪退」这条老路。
+     */
+    private fun onFlashFinished(dev: UsbDevice, ok: Boolean, msg: String) {
+        lastFlashDeviceId = dev.deviceId
+        lastFlashFinishedAt = System.currentTimeMillis()
+        if (!ok) {
+            flashing.set(false)
+            status = "固件加载失败：$msg"
+            Oplog.logf("CONN", "flash failed: %s", msg)
+            return
+        }
+        status = msg
+        Oplog.log("CONN", "flash sent OK, waiting re-enum (1.5s)")
+        launchSafe {
+            // 等设备从引导模式重枚举成 2E09:0030（这期间 attach 广播会被 flashing 忽略）
+            withContext(Dispatchers.IO) {
+                try {
+                    Thread.sleep(1500)
+                } catch (ignored: InterruptedException) {
+                }
             }
-            status = "正在灌固件…"
-            com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(
-                this@MainActivity, dev, img,
-                { p, m -> runOnUiThread { status = "$p% $m" } },
-                { ok, msg -> runOnUiThread { status = if (ok) msg else "固件加载失败：$msg" } }
-            )
+            flashing.set(false)
+            status = "固件已灌入，等待设备重枚举…"
+            Oplog.log("CONN", "flash wait done, trying connect")
+            var connected = false
+            for (attempt in 1..12) {
+                val d = withContext(Dispatchers.IO) {
+                    try {
+                        usb.findDevice()
+                    } catch (t: Throwable) {
+                        null
+                    }
+                }
+                if (d != null) {
+                    if (!usb.hasPermission(d)) {
+                        status = "固件已灌入，等待 USB 授权…"
+                        requestPermissionThrottled(d)
+                    } else {
+                        val opened = try {
+                            withContext(Dispatchers.IO) {
+                                usbMutex.withLock { usb.open(d) }
+                            }
+                        } catch (t: Throwable) {
+                            Oplog.logf(
+                                "CONN", "flash 后连接异常 %s: %s",
+                                t.javaClass.simpleName, t.message
+                            )
+                            false
+                        }
+                        if (opened) {
+                            connected = true
+                            status = "固件已灌入，已连接: ${safeProductName(d)}"
+                            Oplog.log("CONN", "flash → connect OK")
+                            applyPersistedDeviceSettings()
+                            break
+                        }
+                    }
+                }
+                delay(700)
+            }
+            if (!connected) {
+                status = "固件已灌入（$msg）。等设备以 2E09:0030 出现后点「连接眼镜」"
+                Oplog.log("CONN", "flash done but not connected yet")
+            }
+        }
+    }
+
+    /** `productName` 在 USB 服务异常时会抛（部分 ROM），取名字一律走这里 */
+    private fun safeProductName(dev: UsbDevice): String = try {
+        dev.productName ?: dev.deviceName
+    } catch (t: Throwable) {
+        dev.deviceName
+    }
+
+    /**
+     * 「加载固件（引导模式 03E7:2150）」按钮（主线程 Compose 回调）。
+     *
+     * 用户手动灌固件是**闪退报告集中的路径**：以前直接在主线程做
+     * findBootDevice / hasPermission / flashBootDevice，任何一步抛异常就是闪退。
+     * 现在：全部兜底 + 走 [flashing] 闸门 + 成功后等重枚举再连接。
+     */
+    private fun loadFirmwareManually() {
+        try {
+            if (flashing.get()) {
+                status = "固件正在写入，请稍候…"
+                return
+            }
+            val bootDev = try {
+                com.wzqvip.glxsscast.usb.BootLoader.findBootDevice(usbManager)
+            } catch (t: Throwable) {
+                Oplog.logf(
+                    "CONN", "findBootDevice 失败 %s: %s", t.javaClass.simpleName, t.message
+                )
+                null
+            }
+            if (bootDev == null) {
+                status = if (usb.findDevice() != null) {
+                    "未检测到引导模式设备（眼镜已在正常模式 2E09:0030，点「连接眼镜」）"
+                } else {
+                    "未检测到引导模式设备(03E7:2150)"
+                }
+                return
+            }
+            if (!usb.hasPermission(bootDev)) {
+                status = "请求引导设备权限…"
+                requestPermissionSafe(bootDev)
+                return
+            }
+            Oplog.logf("CONN", "manual flash dev=%s", bootDev.deviceName)
+            autoFlashBoot(bootDev)
+        } catch (t: Throwable) {
+            reportInternalError("loadFirmwareManually", t)
         }
     }
 
     /** 手动连接：先看权限，再在 IO 线程打开 */
-    private fun connect(dev: UsbDevice) {
-        reconnectPaused = false
-        if (!usb.hasPermission(dev)) {
-            status = "请求 USB 权限…"
-            requestPermissionThrottled(dev)
-            return
+    /** API 33 才有 getParcelableExtra(name, Class)，Android 12 及以下必须走旧重载 */
+    @Suppress("DEPRECATION")
+    private fun extraDevice(intent: android.content.Intent): UsbDevice? =
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        } else {
+            intent.getParcelableExtra(android.hardware.usb.UsbManager.EXTRA_DEVICE)
         }
-        lifecycleScope.launch {
-            val ok = usbMutex.withLock {
-                withContext(Dispatchers.IO) { usb.open(dev) }
+
+    /**
+     * 手动连接（主线程入口）：先看权限，再在 IO 线程打开。
+     *
+     * 0.1.6：设备可能刚被拔出/正在重枚举 —— 先确认它还在 deviceList，
+     * 打开失败只写状态栏；`open` 本身已经不会抛（UsbLink.open 内部兜底）。
+     */
+    private fun connect(dev: UsbDevice) {
+        try {
+            reconnectPaused = false
+            if (!usb.hasPermission(dev)) {
+                status = "请求 USB 权限…"
+                requestPermissionThrottled(dev)
+                return
             }
-            status = if (ok) "已连接: ${dev.productName ?: dev.deviceName}" else "打开失败（设备可能被占用）"
-            if (ok) applyPersistedDeviceSettings()
+            launchSafe {
+                val present = withContext(Dispatchers.IO) {
+                    try {
+                        usb.isDevicePresent(dev)
+                    } catch (t: Throwable) {
+                        false
+                    }
+                }
+                if (!present) {
+                    status = "设备已断开（未连接）"
+                    Oplog.logf("CONN", "connect: 设备已不在 deviceList %s", dev.deviceName)
+                    return@launchSafe
+                }
+                val ok = try {
+                    withContext(Dispatchers.IO) {
+                        usbMutex.withLock { usb.open(dev) }
+                    }
+                } catch (t: Throwable) {
+                    Oplog.logf(
+                        "CONN", "connect/open 异常 %s: %s", t.javaClass.simpleName, t.message
+                    )
+                    false
+                }
+                status = if (ok) "已连接: ${safeProductName(dev)}" else "打开失败（设备可能被占用）"
+                if (ok) applyPersistedDeviceSettings()
+            }
+        } catch (t: Throwable) {
+            reportInternalError("connect", t)
         }
     }
 
@@ -574,63 +1085,93 @@ class MainActivity : ComponentActivity() {
         requestPermissionSafe(dev)
     }
 
-    /** 设过了自动亮度 / HID 的话，连接成功后恢复 */
+    /** 设过了自动亮度 / HID 的话，连接成功后恢复（失败只提示，不影响已建立的连接） */
     private fun applyPersistedDeviceSettings() {
-        lifecycleScope.launch {
-            withContext(Dispatchers.IO) {
-                val c = usb.connection ?: return@withContext
-                usb.ensureHid()
-                val ab = autoBrightness
-                LcdControl.setAutoBrightness(c, ab)
+        val ab = autoBrightness
+        launchSafe {
+            try {
+                withContext(Dispatchers.IO) {
+                    val c = usb.connection ?: return@withContext
+                    usb.ensureHid()
+                    LcdControl.setAutoBrightness(c, ab)
+                }
+            } catch (t: Throwable) {
+                // 设备重枚举/拔线后 controlTransfer 会抛：旧代码会变成主线程协程崩溃（闪退）
+                Oplog.logf(
+                    "CONN", "恢复自动亮度失败 %s: %s", t.javaClass.simpleName, t.message
+                )
             }
-            if (prefs.hidEnabled && hidSensor?.running != true) startHidSensor()
+            if (prefs.hidEnabled && hidSensor?.running != true) {
+                try {
+                    startHidSensor()
+                } catch (t: Throwable) {
+                    Oplog.logf("HID", "自动启动 HID 失败 %s: %s", t.javaClass.simpleName, t.message)
+                }
+            }
         }
     }
 
     /** 后台重连：设备在但没打开时按指数退避重试（500ms → 15s 上限） */
     private fun startAutoReconnectLoop() {
-        lifecycleScope.launch {
+        launchSafe {
             var attempt = 0
             while (isActive) {
                 delay(1000)
-                if (!autoReconnect || !prefs.autoReconnect || reconnectPaused) {
-                    attempt = 0
-                    continue
-                }
-                if (usb.isOpen) {
-                    // 系统没发 DETACH 广播（进程被冻/服务抢占）时，用 deviceList 自行校验
-                    val d = usb.device
-                    if (d != null && usb.findDevice() == null) {
-                        usb.close()
-                        status = "设备已断开（等待自动重连…）"
+                // 每轮整体兜一层：deviceList/open/close 在拔插竞态里都可能抛，
+                // 以前这会变成「后台重连循环把主线程弄崩」的闪退。
+                try {
+                    if (!autoReconnect || !prefs.autoReconnect || reconnectPaused) {
+                        attempt = 0
+                        continue
                     }
+                    if (usb.isOpen) {
+                        // 系统没发 DETACH 广播（进程被冻/服务抢占）时，用 deviceList 自行校验
+                        val d = usb.device
+                        if (d != null && !usb.isDevicePresent(d)) {
+                            Oplog.log("CONN", "重连循环: 已打开的设备已不在 deviceList → 按 detach 处理")
+                            handleUsbDetach(d)
+                        }
+                        attempt = 0
+                        continue
+                    }
+                    val dev = usb.findDevice()
+                    if (dev == null) {
+                        attempt = 0
+                        continue
+                    }
+                    if (!usb.hasPermission(dev)) {
+                        status = "重连: 请求 USB 权限…"
+                        requestPermissionThrottled(dev)
+                        attempt++
+                        delay(backoffMs(attempt))
+                        continue
+                    }
+                    val ok = try {
+                        withContext(Dispatchers.IO) {
+                            usbMutex.withLock { usb.open(dev) }
+                        }
+                    } catch (t: Throwable) {
+                        Oplog.logf(
+                            "CONN", "重连 open 异常 %s: %s", t.javaClass.simpleName, t.message
+                        )
+                        false
+                    }
+                    if (ok) {
+                        attempt = 0
+                        status = "已自动重连: %s".format(safeProductName(dev))
+                        applyPersistedDeviceSettings()
+                    } else {
+                        attempt++
+                        val wait = backoffMs(attempt)
+                        status = "重连失败（第 $attempt 次），%.1fs 后重试".format(wait / 1000f)
+                        delay(wait)
+                    }
+                } catch (t: Throwable) {
                     attempt = 0
-                    continue
-                }
-                val dev = usb.findDevice()
-                if (dev == null) {
-                    attempt = 0
-                    continue
-                }
-                if (!usb.hasPermission(dev)) {
-                    status = "重连: 请求 USB 权限…"
-                    requestPermissionThrottled(dev)
-                    attempt++
-                    delay(backoffMs(attempt))
-                    continue
-                }
-                val ok = usbMutex.withLock {
-                    withContext(Dispatchers.IO) { usb.open(dev) }
-                }
-                if (ok) {
-                    attempt = 0
-                    status = "已自动重连: %s".format(dev.productName ?: dev.deviceName)
-                    applyPersistedDeviceSettings()
-                } else {
-                    attempt++
-                    val wait = backoffMs(attempt)
-                    status = "重连失败（第 $attempt 次），%.1fs 后重试".format(wait / 1000f)
-                    delay(wait)
+                    Oplog.logf(
+                        "CONN", "重连循环异常 %s: %s", t.javaClass.simpleName, (t.message ?: "").take(120)
+                    )
+                    delay(1000)
                 }
             }
         }
@@ -643,12 +1184,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun tryOpenFound() {
-        val dev = usb.findDevice() ?: return
-        if (!usb.hasPermission(dev)) return
-        val ok = usbMutex.withLock { withContext(Dispatchers.IO) { usb.open(dev) } }
-        if (ok) {
-            status = "已连接: ${dev.productName ?: dev.deviceName}"
-            applyPersistedDeviceSettings()
+        try {
+            val dev = usb.findDevice() ?: return
+            if (!usb.hasPermission(dev)) return
+            val ok = try {
+                withContext(Dispatchers.IO) { usbMutex.withLock { usb.open(dev) } }
+            } catch (t: Throwable) {
+                Oplog.logf(
+                    "CONN", "tryOpenFound 异常 %s: %s", t.javaClass.simpleName, t.message
+                )
+                false
+            }
+            if (ok) {
+                status = "已连接: ${safeProductName(dev)}"
+                applyPersistedDeviceSettings()
+            }
+        } catch (t: Throwable) {
+            Oplog.logf("CONN", "tryOpenFound 失败 %s: %s", t.javaClass.simpleName, t.message)
         }
     }
 
@@ -659,18 +1211,22 @@ class MainActivity : ComponentActivity() {
     private fun readStatusFields() {
         if (busy) return
         busy = true
-        lifecycleScope.launch {
-            val st = withContext(Dispatchers.IO) {
-                val c = usb.connection ?: return@withContext null
-                LcdControl.readStatus(c)
-            }
-            busy = false
-            if (st != null) {
-                statusFields = st.describe()
-                status = "读状态成功"
-                brightness = st.luminance.coerceIn(100, 254)
-            } else {
-                status = "读状态失败（未连接？）"
+        launchSafe {
+            try {
+                val st = withContext(Dispatchers.IO) {
+                    val c = usb.connection ?: return@withContext null
+                    LcdControl.readStatus(c)
+                }
+                if (st != null) {
+                    statusFields = st.describe()
+                    status = "读状态成功"
+                    brightness = st.luminance.coerceIn(100, 254)
+                } else {
+                    status = "读状态失败（未连接？）"
+                }
+            } finally {
+                // USB 在拔插竞态里会抛：busy 必须复位，否则所有按钮永久变灰
+                busy = false
             }
         }
     }
@@ -678,18 +1234,21 @@ class MainActivity : ComponentActivity() {
     private fun readProductInfo() {
         if (busy) return
         busy = true
-        lifecycleScope.launch {
-            val pi = withContext(Dispatchers.IO) {
-                val c = usb.connection ?: return@withContext null
-                LcdControl.readProductInfo(c)
-            }
-            busy = false
-            if (pi == null) {
-                status = "读产品信息失败（0xA1/0x07 无响应）"
-            } else {
-                productInfo = pi
-                productDialog = true
-                status = "产品信息: " + pi.summary()
+        launchSafe {
+            try {
+                val pi = withContext(Dispatchers.IO) {
+                    val c = usb.connection ?: return@withContext null
+                    LcdControl.readProductInfo(c)
+                }
+                if (pi == null) {
+                    status = "读产品信息失败（0xA1/0x07 无响应）"
+                } else {
+                    productInfo = pi
+                    productDialog = true
+                    status = "产品信息: " + pi.summary()
+                }
+            } finally {
+                busy = false
             }
         }
     }
@@ -697,20 +1256,23 @@ class MainActivity : ComponentActivity() {
     private fun readFirmwareVersion() {
         if (busy) return
         busy = true
-        lifecycleScope.launch {
-            val v = withContext(Dispatchers.IO) {
-                val c = usb.connection ?: return@withContext null
-                // HID 接口的 claim 是"按 fd"的：UVC 抢走后要重新 ensureHid()
-                usb.ensureHid()
-                LcdControl.getFirmwareVersion(c)
+        launchSafe {
+            try {
+                val v = withContext(Dispatchers.IO) {
+                    val c = usb.connection ?: return@withContext null
+                    // HID 接口的 claim 是"按 fd"的：UVC 抢走后要重新 ensureHid()
+                    usb.ensureHid()
+                    LcdControl.getFirmwareVersion(c)
+                }
+                status = if (v.isNullOrBlank()) "读固件版本失败（HID 接口被占用？）" else "真实固件版本: $v"
+            } finally {
+                busy = false
             }
-            busy = false
-            status = if (v.isNullOrBlank()) "读固件版本失败（HID 接口被占用？）" else "真实固件版本: $v"
         }
     }
 
     private fun openScreen() {
-        lifecycleScope.launch {
+        launchSafe {
             val (sw, md) = withContext(Dispatchers.IO) {
                 val c = usb.connection ?: return@withContext false to false
                 // 原厂 LCDService.c()：屏没开就先 setSwitch(true)，再切 displayMode
@@ -726,7 +1288,7 @@ class MainActivity : ComponentActivity() {
     private fun changeBrightness(v: Int) {
         brightness = v.coerceIn(100, 254)
         val b = brightness
-        lifecycleScope.launch {
+        launchSafe {
             val ok = withContext(Dispatchers.IO) {
                 val c = usb.connection ?: return@withContext false
                 LcdControl.setBrightness(c, b)
@@ -738,7 +1300,7 @@ class MainActivity : ComponentActivity() {
     private fun setAutoBrightnessByUser(on: Boolean) {
         autoBrightness = on
         prefs.autoBrightness = on
-        lifecycleScope.launch {
+        launchSafe {
             val ok = withContext(Dispatchers.IO) {
                 val c = usb.connection ?: return@withContext false
                 LcdControl.setAutoBrightness(c, on)
@@ -751,11 +1313,16 @@ class MainActivity : ComponentActivity() {
     // 投屏 / 画面调整
     // ==================================================================
 
+    /** 停投屏：Android 12+ 后台 startService 可能抛 ForegroundServiceStartNotAllowed */
     private fun stopCastService() {
-        startService(
-            Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java)
-                .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_STOP)
-        )
+        try {
+            startService(
+                Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java)
+                    .setAction(com.wzqvip.glxsscast.cast.CastService.ACTION_STOP)
+            )
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "stopCastService 失败 %s: %s", t.javaClass.simpleName, t.message)
+        }
     }
 
     /**
@@ -780,6 +1347,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 画面 180° 软件翻转（实时生效）：
+     * 写 CastService.flip180（内部就是 LcdProtocol.flip180），下一帧投屏立即翻转；
+     * 测试图 bars/solid 生成时读同一开关，所以色条也会一起翻。持久化到 Prefs.flip180。
+     */
+    private fun applyFlip180(on: Boolean) {
+        flip180 = on
+        com.wzqvip.glxsscast.cast.CastService.flip180 = on
+        prefs.flip180 = on
+        status = if (on) {
+            "画面已翻转 180°（软件，投屏/测试图实时生效）"
+        } else {
+            "画面恢复正常方向（0°）"
+        }
+    }
+
     private fun resyncOrientation() {
         startService(
             Intent(this, com.wzqvip.glxsscast.cast.CastService::class.java)
@@ -798,41 +1381,44 @@ class MainActivity : ComponentActivity() {
     private fun sendAsync(payload: ByteArray) {
         if (busy) return
         busy = true
-        lifecycleScope.launch {
-            val r = withContext(Dispatchers.IO) {
-                // 发测试图前先停止投屏，避免画面被投屏覆盖
-                if (com.wzqvip.glxsscast.cast.CastService.running) {
-                    stopCastService()
-                    Thread.sleep(400)
+        launchSafe {
+            try {
+                val r = withContext(Dispatchers.IO) {
+                    // 发测试图前先停止投屏，避免画面被投屏覆盖
+                    if (com.wzqvip.glxsscast.cast.CastService.running) {
+                        stopCastService()
+                        Thread.sleep(400)
+                    }
+                    val c = usb.connection
+                    var screenOn = false
+                    var modeOk = false
+                    if (c != null) {
+                        // 停止投屏会把显示模式切回 1（关屏）——先切回 2（投屏）
+                        modeOk = LcdControl.setDisplayMode(c, 2)
+                        // 原厂 App 停止投屏后会 0xA1/0x03 关屏；关屏状态下只发帧是看不到的，必须显式开屏
+                        screenOn = LcdControl.setScreenOn(c, true)
+                    }
+                    val sent = usb.sendFrame(LcdProtocol.frame(payload))
+                    Triple(sent, screenOn, modeOk)
                 }
-                val c = usb.connection
-                var screenOn = false
-                var modeOk = false
-                if (c != null) {
-                    // 停止投屏会把显示模式切回 1（关屏）——先切回 2（投屏）
-                    modeOk = LcdControl.setDisplayMode(c, 2)
-                    // 原厂 App 停止投屏后会 0xA1/0x03 关屏；关屏状态下只发帧是看不到的，必须显式开屏
-                    screenOn = LcdControl.setScreenOn(c, true)
+                val sent = r.first
+                val screenOn = r.second
+                val modeOk = r.third
+                if (sent) {
+                    frames++
+                    val warn = when {
+                        !modeOk && !screenOn -> "（警告：开屏/显示模式都没 ACK）"
+                        !screenOn -> "（警告：开屏命令没 ACK）"
+                        !modeOk -> "（警告：显示模式没 ACK）"
+                        else -> ""
+                    }
+                    status = "已发送 $frames 帧（已停止投屏）$warn"
+                } else {
+                    status = if (usb.isOpen) "发送失败（bulk OUT 没有写完）"
+                    else "发送失败（未连接眼镜）"
                 }
-                val sent = usb.sendFrame(LcdProtocol.frame(payload))
-                Triple(sent, screenOn, modeOk)
-            }
-            val sent = r.first
-            val screenOn = r.second
-            val modeOk = r.third
-            busy = false
-            if (sent) {
-                frames++
-                val warn = when {
-                    !modeOk && !screenOn -> "（警告：开屏/显示模式都没 ACK）"
-                    !screenOn -> "（警告：开屏命令没 ACK）"
-                    !modeOk -> "（警告：显示模式没 ACK）"
-                    else -> ""
-                }
-                status = "已发送 $frames 帧（已停止投屏）$warn"
-            } else {
-                status = if (usb.isOpen) "发送失败（bulk OUT 没有写完）"
-                else "发送失败（未连接眼镜）"
+            } finally {
+                busy = false
             }
         }
     }
@@ -843,45 +1429,61 @@ class MainActivity : ComponentActivity() {
 
     /** 枚举设备描述符里的档位 → 按保存的偏好选档 → 开始取流 */
     private fun startUvc(cam: UvcCamera) {
-        val dev = cam.findDevice()
-        if (dev == null) {
-            status = "未找到眼镜"
-            return
-        }
-        if (!cam.hasPermission(dev)) {
-            status = "请求设备权限…"
-            requestPermissionThrottled(dev)
-            return
-        }
-        status = "枚举 UVC 档位…"
-        lifecycleScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                // 单 owner：UVC 复用 UsbLink 的连接（不再 open(dev, null) 拿第二个 fd）
-                if (!usb.isOpen) {
-                    val opened = usbMutex.withLock { usb.open(dev) }
-                    if (!opened) {
-                        return@withContext UvcOpenResult(
-                            emptyList(), null, "USB 打开失败（${cam.lastError() ?: "设备被占用"}）"
-                        )
-                    }
-                }
-                if (!cam.prepare(dev, usb.connection)) {
-                    return@withContext UvcOpenResult(emptyList(), null, "打开失败: ${cam.lastError()}")
-                }
-                val opts = cam.options()
-                val want = opts.firstOrNull {
-                    prefs.hasUvcSelection && it.matches(prefs.uvcFormat, prefs.uvcWidth, prefs.uvcHeight)
-                }
-                if (!cam.select(want)) {
-                    return@withContext UvcOpenResult(opts, null, "协商失败: ${cam.lastError()}")
-                }
-                cam.start()
-                UvcOpenResult(opts, cam.currentOption(), "摄像头: ${cam.negotiatedInfo()}")
+        try {
+            val dev = try {
+                cam.findDevice()
+            } catch (t: Throwable) {
+                Oplog.logf("UVC", "findDevice 异常 %s: %s", t.javaClass.simpleName, t.message)
+                null
             }
-            uvcOptions = res.options
-            uvcSelected = res.selected
-            res.selected?.let { prefs.saveUvc(it.formatName, it.width, it.height) }
-            status = res.status
+            if (dev == null) {
+                status = "未找到眼镜"
+                return
+            }
+            if (!cam.hasPermission(dev)) {
+                status = "请求设备权限…"
+                requestPermissionThrottled(dev)
+                return
+            }
+            status = "枚举 UVC 档位…"
+            launchSafe {
+                val res = withContext(Dispatchers.IO) {
+                    // 单 owner：UVC 复用 UsbLink 的连接（不再 open(dev, null) 拿第二个 fd）
+                    if (!usb.isOpen) {
+                        val opened = try {
+                            usbMutex.withLock { usb.open(dev) }
+                        } catch (t: Throwable) {
+                            Oplog.logf(
+                                "UVC", "open 异常 %s: %s", t.javaClass.simpleName, t.message
+                            )
+                            false
+                        }
+                        if (!opened) {
+                            return@withContext UvcOpenResult(
+                                emptyList(), null, "USB 打开失败（${cam.lastError() ?: "设备被占用"}）"
+                            )
+                        }
+                    }
+                    if (!cam.prepare(dev, usb.connection)) {
+                        return@withContext UvcOpenResult(emptyList(), null, "打开失败: ${cam.lastError()}")
+                    }
+                    val opts = cam.options()
+                    val want = opts.firstOrNull {
+                        prefs.hasUvcSelection && it.matches(prefs.uvcFormat, prefs.uvcWidth, prefs.uvcHeight)
+                    }
+                    if (!cam.select(want)) {
+                        return@withContext UvcOpenResult(opts, null, "协商失败: ${cam.lastError()}")
+                    }
+                    cam.start()
+                    UvcOpenResult(opts, cam.currentOption(), "摄像头: ${cam.negotiatedInfo()}")
+                }
+                uvcOptions = res.options
+                uvcSelected = res.selected
+                res.selected?.let { prefs.saveUvc(it.formatName, it.width, it.height) }
+                status = res.status
+            }
+        } catch (t: Throwable) {
+            reportInternalError("startUvc", t)
         }
     }
 
@@ -889,7 +1491,7 @@ class MainActivity : ComponentActivity() {
     private fun selectUvc(cam: UvcCamera, opt: UvcCamera.StreamOption) {
         uvcMenuOpen = false
         status = "切换档位: ${opt.label} …"
-        lifecycleScope.launch {
+        launchSafe {
             val res: Pair<UvcCamera.StreamOption?, String> = withContext(Dispatchers.IO) {
                 if (cam.restartStream(opt)) {
                     cam.currentOption() to "摄像头: ${cam.negotiatedInfo()}"
@@ -918,19 +1520,36 @@ class MainActivity : ComponentActivity() {
         val s = hidSensor ?: HidSensor(usb).also { sensor ->
             hidSensor = sensor
             sensor.onReport = { r ->
+                // HID 线程 → 主线程：主线程回调里任何异常都会闪退，这里兜住
                 runOnUiThread {
-                    applySensorReport(r)
-                    hidInfo = r.sensorLine(accFsr, gyroFsr)
-                    hidHex = r.hex()
+                    try {
+                        applySensorReport(r)
+                        hidInfo = r.sensorLine(accFsr, gyroFsr)
+                        hidHex = r.hex()
+                    } catch (t: Throwable) {
+                        reportInternalError("hid.onReport", t)
+                    }
                 }
             }
             sensor.onEvent = { e ->
-                runOnUiThread { handleHidEvent(e) }
+                runOnUiThread {
+                    try {
+                        handleHidEvent(e)
+                    } catch (t: Throwable) {
+                        reportInternalError("hid.onEvent", t)
+                    }
+                }
             }
         }
         s.accFsr = accFsr
         s.gyroFsr = gyroFsr
-        if (s.start(hidMode)) {
+        if (try {
+                s.start(hidMode)
+            } catch (t: Throwable) {
+                Oplog.logf("HID", "start 异常 %s: %s", t.javaClass.simpleName, t.message)
+                false
+            }
+        ) {
             prefs.hidEnabled = true
             prefs.hidMode = if (s.mode == HidSensor.Mode.POLL) "poll" else "interrupt"
             hidOn = true
@@ -945,7 +1564,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopHidSensor() {
-        hidSensor?.stop()
+        try {
+            hidSensor?.stop()
+        } catch (t: Throwable) {
+            Oplog.logf("HID", "stop 异常 %s: %s", t.javaClass.simpleName, t.message)
+        }
         prefs.hidEnabled = false
         hidOn = false
         status = "HID 已停止"
@@ -953,33 +1576,37 @@ class MainActivity : ComponentActivity() {
 
     /** 按键事件（已在主线程）：按配置执行动作 */
     private fun handleHidEvent(e: HidSensor.Event) {
-        val action = when (e) {
-            is HidSensor.Event.Click -> hidClickAction
-            is HidSensor.Event.LongPress -> hidLongAction
-        }
-        Oplog.logf("HID", "button %s → %s", e.javaClass.simpleName, action.id)
-        when (action) {
-            HidAction.NONE -> status = "Fn 按键（未绑定动作）"
-            HidAction.SNAPSHOT -> lifecycleScope.launch {
-                val f = withContext(Dispatchers.IO) { activeUvc?.saveSnapshot() }
-                status = if (f != null) "Fn 单击：已拍照 ${f.absolutePath}"
-                else "Fn 单击：拍照失败（UVC 没有帧 / 未打开摄像头）"
+        try {
+            val action = when (e) {
+                is HidSensor.Event.Click -> hidClickAction
+                is HidSensor.Event.LongPress -> hidLongAction
             }
-            HidAction.CAST_TOGGLE -> {
-                if (com.wzqvip.glxsscast.cast.CastService.running) {
-                    stopCastService()
-                    status = "Fn 长按：停止投屏"
-                } else if (!usb.isOpen) {
-                    status = "Fn 长按：未连接眼镜，无法投屏"
-                } else {
-                    status = "Fn 长按：请求投屏授权…"
-                    runCatching { mpLauncher.launch(projectionManager.createScreenCaptureIntent()) }
-                        .onFailure { status = "投屏授权启动失败: ${it.message}" }
+            Oplog.logf("HID", "button %s → %s", e.javaClass.simpleName, action.id)
+            when (action) {
+                HidAction.NONE -> status = "Fn 按键（未绑定动作）"
+                HidAction.SNAPSHOT -> launchSafe {
+                    val f = withContext(Dispatchers.IO) { activeUvc?.saveSnapshot() }
+                    status = if (f != null) "Fn 单击：已拍照 ${f.absolutePath}"
+                    else "Fn 单击：拍照失败（UVC 没有帧 / 未打开摄像头）"
+                }
+                HidAction.CAST_TOGGLE -> {
+                    if (com.wzqvip.glxsscast.cast.CastService.running) {
+                        stopCastService()
+                        status = "Fn 长按：停止投屏"
+                    } else if (!usb.isOpen) {
+                        status = "Fn 长按：未连接眼镜，无法投屏"
+                    } else {
+                        status = "Fn 长按：请求投屏授权…"
+                        runCatching { mpLauncher.launch(projectionManager.createScreenCaptureIntent()) }
+                            .onFailure { status = "投屏授权启动失败: ${it.message}" }
+                    }
+                }
+                HidAction.RECORD_TOGGLE -> {
+                    if (recorder.isRecording) stopRecording() else startRecording()
                 }
             }
-            HidAction.RECORD_TOGGLE -> {
-                if (recorder.isRecording) stopRecording() else startRecording()
-            }
+        } catch (t: Throwable) {
+            reportInternalError("handleHidEvent", t)
         }
     }
 
@@ -1099,7 +1726,7 @@ class MainActivity : ComponentActivity() {
         if (fsrEstimating) return
         fsrEstimating = true
         fsrEstimate = "量程估计：采样 2 秒…（请把眼镜平放静止）"
-        lifecycleScope.launch {
+        launchSafe {
             val mags = ArrayList<Double>()
             var lastPoll = -1L
             val t0 = SystemClock.elapsedRealtime()
@@ -1122,7 +1749,7 @@ class MainActivity : ComponentActivity() {
             if (est == null) {
                 fsrEstimate = "量程估计失败：样本不足或 acc 全 0（先点「使能传感器」）"
                 status = "量程估计失败（acc 全 0？先使能传感器）"
-                return@launch
+                return@launchSafe
             }
             selectAccFsr(est.nearestIndex, manual = false)
             fsrEstimate = String.format(
@@ -1164,14 +1791,14 @@ class MainActivity : ComponentActivity() {
 
     /** 读 `0x06` 的 IMU 属性：拿硬件真实 acc_fsr / gyro_fsr；首次连接用它初始化量程 */
     private fun readImuAttributes() {
-        lifecycleScope.launch {
+        launchSafe {
             val attr = withContext(Dispatchers.IO) {
                 val c = usb.connection ?: return@withContext null
                 LcdControl.readImuAttributes(c)
             }
             if (attr == null) {
                 hwFsrLine = "硬件 FSR：读取失败（0x06；可手动选量程）"
-                return@launch
+                return@launchSafe
             }
             hwFsrLine = if (attr.fsrValid) {
                 "硬件 FSR：acc_fsr=${attr.accFsr}（±${HidSensor.ACC_FSR_G[attr.accFsr]}g）· " +
@@ -1277,7 +1904,7 @@ class MainActivity : ComponentActivity() {
     // ==================================================================
 
     private fun refreshAudioDevices() {
-        lifecycleScope.launch {
+        launchSafe {
             val list = withContext(Dispatchers.IO) {
                 AudioEnh.inputDevices(this@MainActivity).map { it.line() }
             }
@@ -1287,7 +1914,7 @@ class MainActivity : ComponentActivity() {
 
     private fun runAudioProbe() {
         status = "音频实测中（1 秒，强制 USB 麦克风）…"
-        lifecycleScope.launch {
+        launchSafe {
             val p = withContext(Dispatchers.IO) { AudioEnh.probe(this@MainActivity, 1.0) }
             audioInfo = p.line() + if (p.usbFound) "" else " · 没有 USB 输入设备"
             status = if (p.ok) "音频实测完成" else "音频实测失败"
@@ -1297,7 +1924,7 @@ class MainActivity : ComponentActivity() {
 
     private fun runDuplexTest() {
         status = "双向通话测试中（2 秒：播放 440Hz + 录音）…"
-        lifecycleScope.launch {
+        launchSafe {
             val p = withContext(Dispatchers.IO) { AudioEnh.duplex(this@MainActivity, 2.0) }
             audioInfo = if (!p.ok) {
                 "双向测试失败: ${p.error}"
@@ -1343,7 +1970,7 @@ class MainActivity : ComponentActivity() {
         val uvc0 = cam?.frameCount() ?: 0L
         val cores = CpuSampler.cores()
         val cpu0 = CpuSampler.cpuMs()
-        stressJob = lifecycleScope.launch {
+        stressJob = launchSafe {
             val t0 = System.currentTimeMillis()
             var castSum = 0.0
             var castN = 0
@@ -1480,14 +2107,19 @@ class MainActivity : ComponentActivity() {
         androidx.compose.runtime.LaunchedEffect(Unit) {
             var keepOn = false
             while (true) {
-                val on = com.wzqvip.glxsscast.cast.CastService.running
-                if (on != keepOn) {
-                    keepOn = on
-                    if (on) {
-                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    } else {
-                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                // Compose 协程跑在主线程：window 操作/状态读取抛异常会直接闪退
+                try {
+                    val on = com.wzqvip.glxsscast.cast.CastService.running
+                    if (on != keepOn) {
+                        keepOn = on
+                        if (on) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        } else {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
                     }
+                } catch (t: Throwable) {
+                    Oplog.logf("BOOT", "keepScreenOn 异常 %s: %s", t.javaClass.simpleName, t.message)
                 }
                 delay(500)
             }
@@ -1542,7 +2174,7 @@ class MainActivity : ComponentActivity() {
             }
 
             Scaffold(
-                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.5 Dev") }) }
+                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.6 Dev") }) }
             ) { pad ->
                 Column(
                     Modifier
@@ -1625,8 +2257,27 @@ class MainActivity : ComponentActivity() {
                             com.wzqvip.glxsscast.uvc.UvcPreview(
                                 cam,
                                 Modifier.fillMaxWidth().height(300.dp),
+                                flip180 = uvcFlip180,
                                 onError = { msg: String -> uvcErr = msg }
                             )
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "预览翻转 180°（仅 UVC 预览，独立开关）",
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Switch(
+                                    checked = uvcFlip180,
+                                    onCheckedChange = {
+                                        uvcFlip180 = it
+                                        prefs.uvcFlip180 = it
+                                        status = if (it) "UVC 预览已翻转 180°" else "UVC 预览恢复正常方向"
+                                    }
+                                )
+                            }
                             if (uvcErr.isNotEmpty()) {
                                 Text(
                                     "⚠ " + uvcErr,
@@ -1713,28 +2364,42 @@ class MainActivity : ComponentActivity() {
 
                     androidx.compose.runtime.LaunchedEffect(Unit) {
                         while (true) {
-                            castInfo = if (com.wzqvip.glxsscast.cast.CastService.running) {
-                                "投屏中: %.1f fps · 抓取 %s · 累计 %d 帧".format(
-                                    com.wzqvip.glxsscast.cast.CastService.fps,
-                                    com.wzqvip.glxsscast.cast.CastService.captureDesc.ifEmpty { "?" },
-                                    com.wzqvip.glxsscast.cast.CastService.frames
+                            try {
+                                castInfo = if (com.wzqvip.glxsscast.cast.CastService.running) {
+                                    "投屏中: %.1f fps · 抓取 %s · 累计 %d 帧".format(
+                                        com.wzqvip.glxsscast.cast.CastService.fps,
+                                        com.wzqvip.glxsscast.cast.CastService.captureDesc.ifEmpty { "?" },
+                                        com.wzqvip.glxsscast.cast.CastService.frames
+                                    )
+                                } else {
+                                    "未投屏"
+                                }
+                                hidOn = hidSensor?.running == true
+                                updateCrashInfo()
+                                // 通知栏「画面模式」改了服务侧模式后，回 App 时同步显示
+                                val svcMode = com.wzqvip.glxsscast.cast.CastService.fillMode
+                                if (svcMode != fillMode) fillMode = svcMode
+                            } catch (t: Throwable) {
+                                Oplog.logf(
+                                    "CAST", "UI 状态轮询异常 %s: %s",
+                                    t.javaClass.simpleName, t.message
                                 )
-                            } else {
-                                "未投屏"
                             }
-                            hidOn = hidSensor?.running == true
-                            updateCrashInfo()
-                            // 通知栏「画面模式」改了服务侧模式后，回 App 时同步显示
-                            val svcMode = com.wzqvip.glxsscast.cast.CastService.fillMode
-                            if (svcMode != fillMode) fillMode = svcMode
                             delay(500)
                         }
                     }
 
                     androidx.compose.runtime.LaunchedEffect(Unit) {
                         while (true) {
-                            recInfo = recordStatusLine()
-                            volume = AudioEnh.volume(this@MainActivity)
+                            try {
+                                recInfo = recordStatusLine()
+                                volume = AudioEnh.volume(this@MainActivity)
+                            } catch (t: Throwable) {
+                                Oplog.logf(
+                                    "CAST", "录像/音量轮询异常 %s: %s",
+                                    t.javaClass.simpleName, t.message
+                                )
+                            }
                             delay(300)
                         }
                     }
@@ -1753,7 +2418,16 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = {
-                            mpLauncher.launch(projectionManager.createScreenCaptureIntent())
+                            // createScreenCaptureIntent / launch 在部分 ROM 上会抛（闪退）
+                            runCatching {
+                                mpLauncher.launch(projectionManager.createScreenCaptureIntent())
+                            }.onFailure {
+                                status = "投屏授权启动失败: ${it.javaClass.simpleName}: ${it.message}"
+                                Oplog.logf(
+                                    "CAST", "launch projection 失败 %s: %s",
+                                    it.javaClass.simpleName, it.message
+                                )
+                            }
                         },
                         enabled = usb.isOpen,
                         modifier = Modifier.fillMaxWidth()
@@ -1939,7 +2613,7 @@ class MainActivity : ComponentActivity() {
                     ) { Text("长按: ${hidLongAction.label}") }
                     OutlinedButton(
                         onClick = {
-                            lifecycleScope.launch {
+                            launchSafe {
                                 val ok = withContext(Dispatchers.IO) {
                                     val c = usb.connection ?: return@withContext false
                                     // 0x10 光感 / 0x11 罗盘 / 0x12 加速度 / 0x14 陀螺
@@ -2085,7 +2759,7 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = {
-                            lifecycleScope.launch {
+                            launchSafe {
                                 val r = withContext(Dispatchers.IO) { Peripherals.micRms() }
                                 status = if (r < 0) "麦克风不可用" else "麦克风 RMS = " + r
                             }
@@ -2095,7 +2769,7 @@ class MainActivity : ComponentActivity() {
 
                     Button(
                         onClick = {
-                            lifecycleScope.launch {
+                            launchSafe {
                                 val ok = withContext(Dispatchers.IO) {
                                     Peripherals.playTone(440.0, 1.0)
                                 }
@@ -2262,18 +2936,7 @@ class MainActivity : ComponentActivity() {
                         fontFamily = FontFamily.Monospace
                     )
                     Button(
-                        onClick = {
-                            val usbMgr = getSystemService(android.content.Context.USB_SERVICE) as UsbManager
-                            val bootDev = com.wzqvip.glxsscast.usb.BootLoader.findBootDevice(usbMgr)
-                            if (bootDev == null) {
-                                status = "未检测到引导模式设备(03E7:2150)"
-                            } else if (!usb.hasPermission(bootDev)) {
-                                status = "请求引导设备权限…"
-                                requestPermissionSafe(bootDev)
-                            } else {
-                                flashBootDevice(bootDev)
-                            }
-                        },
+                        onClick = { loadFirmwareManually() },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("加载固件（引导模式 03E7:2150）") }
                     OutlinedButton(
@@ -2298,28 +2961,35 @@ class MainActivity : ComponentActivity() {
                         style = MaterialTheme.typography.bodySmall
                     )
 
-                    // 实验项：改 roll 会让画面翻转，只有拔插眼镜能恢复 —— 所以放在最底下
+                    HorizontalDivider()
+                    Text("显示方向（软件）", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("画面翻转 180°（软件）")
+                            Text(
+                                if (flip180) "当前：已翻转（投屏 + 测试图）" else "当前：正常（0°）",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (flip180) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(checked = flip180, onCheckedChange = { applyFlip180(it) })
+                    }
                     Text(
-                        "实验项：改了 roll 会导致画面上下翻转，需拔插眼镜恢复",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
+                        "实时生效，不需要重启投屏；测试色条同步翻转。\n" +
+                            "设备 roll（0x04 byte6..7）只作诊断，不再用它翻转画面。",
+                        style = MaterialTheme.typography.bodySmall
                     )
-                    Button(
-                        onClick = {
-                            usb.connection?.let { c ->
-                                rollIdx = (rollIdx + 1) % ROTATE_VALUES.size
-                                val r = ROTATE_VALUES[rollIdx]
-                                status = if (LcdControl.setRoll(c, r)) "roll=$r 已发送（$rollIdx/${ROTATE_VALUES.size-1}）" else "roll 发送失败"
-                            } ?: run { status = "未连接" }
-                        },
-                        enabled = usb.isOpen,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("显示翻转（roll=" + ROTATE_VALUES[rollIdx] + "）") }
                 }
             }
         }
     }
 }
+
+
 
 
 

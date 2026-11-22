@@ -65,6 +65,8 @@ fun UvcPreview(
     camera: UvcCamera,
     modifier: Modifier = Modifier.fillMaxWidth(),
     scaleType: ImageView.ScaleType = ImageView.ScaleType.FIT_CENTER,
+    /** 仅该预览的 180° 翻转（独立于投屏/测试图，默认关）。 */
+    flip180: Boolean = false,
     onError: (String) -> Unit = {}
 ) {
     val holder = remember { mutableStateOf<ImageView?>(null) }
@@ -95,11 +97,15 @@ fun UvcPreview(
         factory = { c ->
             ImageView(c).apply {
                 this.scaleType = scaleType
+                rotation = if (flip180) 180f else 0f
                 holder.value = this
             }
         },
         modifier = modifier,
-        update = { holder.value = it }
+        update = {
+            holder.value = it
+            it.rotation = if (flip180) 180f else 0f
+        }
     )
 }
 

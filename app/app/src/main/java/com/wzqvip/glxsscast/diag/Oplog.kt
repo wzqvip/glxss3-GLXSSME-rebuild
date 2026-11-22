@@ -149,9 +149,13 @@ object Oplog {
      *
      * @param reason 短原因，例如 `usb_detached` / `boot_mode_03e7` / `uvc_invalid_stream` /
      *               `lcd_send_fail` / `app_crash:IOException`
+     * @param throwable 进程崩溃时把堆栈一起落盘（否则只有一行 message，定位不到崩在哪一行）
      */
-    fun dumpCrash(reason: String): File? {
-        flush()
+    fun dumpCrash(reason: String, throwable: Throwable? = null): File? {
+        try {
+            flush()
+        } catch (ignored: Throwable) {
+        }
         val dir = filesDir ?: return null
         val lines = tail(CRASH_TAIL)
         val f = File(dir, "crash_last.txt")
@@ -162,12 +166,30 @@ object Oplog {
             appendLine("reason : $reason")
             appendLine("version: $version (versionCode ${BuildConfig.VERSION_CODE})")
             appendLine("pid    : ${android.os.Process.myPid()}")
+            appendLine("thread : ${Thread.currentThread().name}")
             appendLine("entries: ${lines.size}")
             appendLine("----------------------------------")
         }
+        val stack = throwable?.let { t ->
+            try {
+                java.io.StringWriter().use { sw ->
+                    java.io.PrintWriter(sw).use { pw -> t.printStackTrace(pw) }
+                    sw.toString().take(16 * 1024)
+                }
+            } catch (ignored: Throwable) {
+                null
+            }
+        }
         return try {
             dir.mkdirs()
-            f.writeText(header + lines.joinToString("\n") + "\n")
+            val body = StringBuilder(header)
+            if (stack != null) {
+                body.appendLine("=== stacktrace ===")
+                body.appendLine(stack)
+                body.appendLine("=== last $CRASH_TAIL oplog entries ===")
+            }
+            body.append(lines.joinToString("\n")).append('\n')
+            f.writeText(body.toString())
             lastCrashPath = f.absolutePath
             lastCrashReason = reason
             crashCount++
@@ -179,11 +201,22 @@ object Oplog {
         }
     }
 
+    /**
+     * 进程级未捕获异常兜底。
+     *
+     * 关键顺序：**先 dump 再交给原 handler（rethrow）**。
+     * - 主线程崩溃：dump 完必须把异常抛回系统，否则 App 会卡在坏状态（系统 UI 会认为
+     *   我们"吞"了崩溃）；crash_last.txt 已经落盘，用户下次打开能在首页看到。
+     * - 工作线程崩溃：Android 默认会杀掉整个进程（用户看到闪退）。这里 dump 后吞掉，
+     *   并把 `thread/异常` 记进 [lastWorkerCrash] 供 UI 显示；真正的逻辑错误由各线程
+     *   自己的 try/catch 兜住（UvcReader/HidSensor/MyriadFlash/recorder…）。
+     */
     private fun installCrashHandler() {
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         val mainThread = android.os.Looper.getMainLooper()?.thread
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             val isMain = mainThread == null || t === mainThread
+            Log.e(TAG, "uncaught exception thread=${t?.name} main=$isMain", e)
             try {
                 if (!isMain) {
                     lastWorkerCrash = "thread=${t?.name} ${e.javaClass.simpleName}: ${e.message?.take(160)}"
@@ -193,16 +226,26 @@ object Oplog {
                         "app_crash:${e.javaClass.simpleName}:${e.message?.take(80)}"
                     } else {
                         "worker_crash(thread=${t?.name}):${e.javaClass.simpleName}:${e.message?.take(80)}"
-                    }
+                    },
+                    e
                 )
             } catch (ignored: Throwable) {
             }
             if (isMain) {
-                prev?.uncaughtException(t, e)
+                // 先落盘再 rethrow（Android 默认 handler 会杀掉进程并写 logcat）
+                try {
+                    prev?.uncaughtException(t, e)
+                } catch (ignored: Throwable) {
+                }
+                if (prev == null) {
+                    // 没有可委托的 handler：显式结束进程，别留下半死状态
+                    try {
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                    } catch (ignored: Throwable) {
+                    }
+                }
             } else {
-                // Android 默认：任意线程未捕获异常 = 整个进程被 kill（用户看到「闪退」）。
-                // 工作线程（UvcReader / HidSensor / MyriadFlash / CastService…）上的异常
-                // 已经 dump 过现场，这里吞掉，让 App 继续跑 —— 主线程崩溃仍然交给系统。
+                // 工作线程：dump 已落盘，吞掉以免「一个后台线程异常 = 整个 App 闪退」
                 Log.e(TAG, "worker thread crash swallowed: thread=${t?.name}", e)
             }
         }
