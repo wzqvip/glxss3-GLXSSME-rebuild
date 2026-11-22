@@ -24,8 +24,8 @@
   └─ bulk OUT EP 0x01 ──────────────► LEON 核收数据 → 校验头 → 写帧缓冲 → 面板刷新
                                           ▲
      0xA1/0x01 亮度  ────────────────────┤
-     0xA1/0x03 开关屏 ───────────────────┤ 控制面（class 请求，wIndex=3）
-     0xA1/0x02 roll   ───────────────────┤
+     0xA1/0x02 开关屏 ───────────────────┤ 控制面（class 请求，wIndex=3）
+     0xA1/0x03 roll   ───────────────────┤
      0xA1/0x05 显示模式 ─────────────────┘
 ```
 
@@ -38,7 +38,7 @@
 3. **控制与数据分离**。亮度/开关/模式走 USB **class control transfer**（不是 bulk），
    参数放在 `wValue`，`wIndex` 固定为 LCD 接口号 3。
 
-> 这也解释了为什么"发色条能看见、但原厂 App 退出后屏幕黑"：原厂退出时会 `0xA1/0x03` 把屏
+> 这也解释了为什么"发色条能看见、但原厂 App 退出后屏幕黑"：原厂退出时会 `0xA1/0x02` 把屏
 > **switch 关掉**，而 `0xA1/0x05` 切显示模式并不会重新点亮面板。必须显式 `setScreenOn(true)`。
 
 ---
@@ -77,7 +77,7 @@
 | 像素格式 | RGBA8888，每像素 4 B：`R, G, B, A` |
 | 行宽（payload） | `640 × 4 = 2,560 B` |
 | **行填充（padding）** | **无**。payload 是紧密排列的 `400 × 2560 = 1,024,000 B` |
-| 原点 | 左上角；不做垂直翻转 |
+| 原点 | 左上角；默认不翻转，需要时用软件 180°（见 §3.4） |
 | Alpha | 实测原厂黑帧是 `00 00 00 FF`、近黑帧 `01 01 01 FF`；A 通常写 `0xFF` |
 
 设备端把 payload 直接当帧缓冲用，所以**不存在 rowStride ≠ width×4 的情况**；
@@ -106,8 +106,8 @@ frame     = 16 + payload           = 1,024,016 B
 | 功能 | bmReq | bRequest | wValue | wIndex | wLength | 返回/说明 |
 |---|---|---|---|---|---|---|
 | 设亮度 | `0xA1` | `0x01` | 100–254 | 3 | 1 | 实测 `0x64`–`0xFE`；App 侧夹到 100–254，越界值的固件行为未测 |
-| 设 roll（旋转） | `0xA1` | `0x02` | roll 值 | 3 | 1 | 与状态里的 `roll` 字段对应 |
-| 屏开关 | `0xA1` | `0x03` | 0/1 | 3 | 1 | **0=关，1=开**；只发帧不会点亮 |
+| 设 roll（旋转） | `0xA1` | `0x03` | roll 值（低 8 位） | 3 | 1 | 与状态里的 `rollover` 字段对应；**不是 0x02**，见 §3.4 |
+| 屏开关 | `0xA1` | `0x02` | 0/1 | 3 | 1 | **0=关，1=开**；只发帧不会点亮 |
 | 读状态 | `0xA1` | `0x04` | 0 | 3 | **8** | 8 B，见 §3.2 |
 | 显示模式 | `0xA1` | `0x05` | 1/2 | 3 | 1 | **1=关/logo/待机，2=投屏开**；0 未实测 |
 | 读 EEPROM 产品信息 | `0xA1` | `0x07` | `0x0100` | 3 | **264** | 8 B 头 + 256 B 产品信息（见 §6） |
@@ -138,12 +138,36 @@ frame     = 16 + payload           = 1,024,016 B
 原厂 `LCDService` 的行为是：**屏没开就先开，再切显示模式**。我们照抄：
 
 ```
-1) 0xA1/0x03 wValue=1   （setScreenOn true）
+1) 0xA1/0x02 wValue=1   （setScreenOn true）
 2) 0xA1/0x05 wValue=2   （displayMode = 投屏）
 3) 每帧 bulk OUT 0x01
 ```
 
-停止投屏时反过来：`0xA1/0x05 wValue=1`（或 `0xA1/0x03=0`）。
+停止投屏时反过来：`0xA1/0x05 wValue=1`（或 `0xA1/0x02=0`）。
+
+### 3.4 roll 的真实编码与"自己翻转"（0.1.6 静态复核）
+
+对原厂 `liblcd.so`（armeabi-v7a、arm64-v8a 两份）从 `JNI_OnLoad` 的
+`RegisterNatives` 表逐项回溯，结论与本文旧版相反：
+
+| Kotlin/SDK | JNI | 实际 control 请求 |
+|---|---|---|
+| `LCD.setRoll(int)` | `nativeLCDSetRoll` → `lcd_set_roll` | `0xA1 / 0x03 / wValue=roll&0xFF / wIndex=3 / len=1` |
+| `LCD.setSwitch(boolean)` | `nativeLCDSetSwitch` → `lcd_power_switch` | `0xA1 / 0x02 / wValue=0 或 1 / wIndex=3 / len=1` |
+
+- 两个架构里 `lcd_set_roll` 的 `libusb_control_transfer` 都传 `bRequest=3`，
+  `lcd_power_switch` 都传 `bRequest=2`；旧文档的 0x1a4e/0x1b9a 两个"调用点"
+  实际分别落在 setSwitch/setRoll 内部，是标签写反了。
+- 因此底部旧的「显示翻转（roll=N）」发 0x02 等于发**屏开关**：N=2/4/… 都被
+  固件当"非 0=开"，屏本来就是开的，所以看不出任何变化（一直点到 0 才会关屏）。
+- 反过来，旧 `setScreenOn(true)` 发 0x03/1，等于每次"开屏"都在写 roll。这是
+  "画面自己就翻"的最直接代码级嫌疑；已改为 0x02，roll 只留在诊断入口。
+- `0xA1/0x04` byte6（LE u16 的低字节）是固件维护的 rollover 状态：正常 0x0A，
+  翻转后 0x06。它由固件/面板初始化决定，不由投屏帧决定；重灌固件或重启会让
+  固件按 IMU/面板默认值重新初始化，拔插 USB 一般不会重置。所以"重灌后方向变了"
+  （默认值变了）和"我们误写 roll"（残留状态）可以同时成立。
+- roll 的 wValue 语义（0/1、90° 步进还是寄存器位域）仍未验证：需要真机逐值试验
+  `0x03`，并每次回读 0x04 byte6。当前 app 用软件 180°，不依赖它。
 
 ---
 
@@ -154,12 +178,12 @@ frame     = 16 + payload           = 1,024,016 B
 ```
 1) 打开 2E09:0030，claim 厂商接口（if3，class 0xFF），找到 bulk OUT 0x01
 2) （可选）0xA1/0x04 读 8 B 状态，记下 bopen / luminance
-3) 0xA1/0x03 wValue=1      开屏（屏被关时只发帧不会亮）
+3) 0xA1/0x02 wValue=1      开屏（屏被关时只发帧不会亮）
 4) 0xA1/0x05 wValue=2      切到投屏显示模式
 5) 组帧：16 B 头（format=1, totalLen=1,024,016）+ 640×400 RGBA
 6) bulkTransfer(EP 0x01, 1,024,016 B, timeout=5000)；短写/失败则 16 KB 分块重试
-7) 循环 5–6；停止时发 0xA1/0x05 wValue=1（或 0xA1/0x03 wValue=0）
-8) 亮度/roll 可随时发：0xA1/0x01 / 0xA1/0x02
+7) 循环 5–6；停止时发 0xA1/0x05 wValue=1（或 0xA1/0x02 wValue=0）
+8) 亮度/roll 可随时发：0xA1/0x01 / 0xA1/0x03（roll 仅诊断，翻转用软件）
 ```
 
 ### 4.2 数据流
@@ -171,8 +195,9 @@ MediaProjection (系统录屏授权)
              └─ acquireLatestImage()
                   └─ planes[0].buffer / rowStride / pixelStride
                        └─ 映射到 640×400（适应 / 裁剪 / 拉伸）
-                            └─ 16 B 头 + 1,024,000 B
-                                 └─ bulkTransfer(EP 0x01, 1,024,016 B)
+                            └─ flip180? 原地 180°（扫描序反转）
+                                 └─ 16 B 头 + 1,024,000 B
+                                      └─ bulkTransfer(EP 0x01, 1,024,016 B)
 ```
 
 两个反直觉的点：
@@ -184,6 +209,9 @@ MediaProjection (系统录屏授权)
 * **Android 14+ 不能为同一个 MediaProjection 建第二个 VirtualDisplay**。屏幕旋转时不能重建管线，
   只能 `VirtualDisplay.setSurface(newReader.surface)` + `resize()`，见
   [`applyScreenSize()`](../app/app/src/main/java/com/wzqvip/glxsscast/cast/CastService.kt#L295-L345)。
+
+0.1.6 起「画面翻转 180°（软件）」在映射后做一次原地 180°（目标行/列都反），
+同一开关也作用于 `LcdProtocol.bars/solid` 测试图；下一帧立即生效，不需要重启投屏，也不写设备 roll。
 
 ### 4.3 三种映射模式
 
@@ -341,7 +369,8 @@ EEPROM 256 B 产品信息（只读，安全）：
 1. **头里的长度字段**：必须是 `16 + 像素长度`，小端 u32。写错会导致整帧被丢弃或错位。
 2. **格式字节**：必须是 `1`。其它值（如 JPEG）在原厂 LCD 路径里**从未使用**，不要假设。
 3. **屏 switch 状态是持久的**：原厂停止投屏会关屏，30 秒线程也会在"没在投屏"时关屏。
-   发帧前先 `0xA1/0x03=1`，否则帧写进去了但面板不亮——这是"发了色条没反应"的头号原因。
+   发帧前先 `0xA1/0x02=1`，否则帧写进去了但面板不亮——这是"发了色条没反应"的头号原因。
+   注意 0x02 是屏开关、0x03 是 roll，别写反（见 §3.4）。
 4. **显示模式 ≠ 开关屏**：`0x05=2` 只是切显示模式，不负责点亮。
 5. **抓图行宽有 padding**：`ImageReader` 的 `rowStride` 可能 > `width×4`。
    直接按 `w*4` 拷会得到斜纹/错位；本实现用 `plane.rowStride` + `pixelStride` 消掉。
