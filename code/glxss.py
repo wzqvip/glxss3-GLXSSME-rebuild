@@ -1611,8 +1611,10 @@ def analyze_firmware(path: str, args):
     print("  SHA256    : %s" % raw_sha)
     magic = raw[:4]
     print("  magic     : %s (%s)" % (magic.decode("latin1", "replace"), hexs(magic)))
-    if magic != b"MA2x" and not args.force:
-        die("镜像不以 MA2x 开头，可能不是 Myriad2/G25 固件。确认文件无误后可用 --force 强制发送。")
+    if magic != b"MA2x":
+        if args.yes and not args.force:
+            die("镜像不以 MA2x 开头，可能不是 Myriad2/G25 固件。确认文件无误后可用 --force 强制发送。")
+        warn("镜像不以 MA2x 开头；dry-run 继续分析（真写会被拒绝，除非加 --force）。")
     raw_ver, raw_off = find_fw_version(raw)
     print("  版本串    : %s" % (("%r @0x%x" % (raw_ver, raw_off)) if raw_ver else "（明文区未找到）"))
 
@@ -1628,23 +1630,32 @@ def analyze_firmware(path: str, args):
         start = len(raw) - tail
         print("  尾部      : 0x%x..0x%x（%d B）" % (start, len(raw), tail))
         if tail % 16:
-            die("尾部长度 %d B 不是 16 的整数倍，无法按 AES-ECB 解密；"
-                "若这是已解密镜像请加 --no-decrypt。" % tail)
-        print("  AES-128-ECB: 解密尾部（key=%r）..." % FW_AES_KEY.decode("ascii"))
-        t0 = time.perf_counter()
-        plain = aes128_ecb_decrypt(raw[start:], FW_AES_KEY)
-        print("              完成，耗时 %.2f s" % (time.perf_counter() - t0))
-        payload = raw[:start] + plain
-        ver, off = find_fw_version(payload)
-        if ver is None:
-            die("AES 解密后仍未找到 G25_MainFW_ 版本串；镜像可能不是 G25 固件/已损坏。\n"
-                "  若确认镜像是明文，可加 --no-decrypt 强制发送。")
-        print("  版本串    : %r @0x%x（解密后）" % (ver, off))
-        pad = plain[-1]
-        pad_ok = 1 <= pad <= 16 and plain[-pad:] == bytes([pad]) * pad
-        print("  PKCS#7    : 末字节=%d，填充%s（本工具保留完整长度发送，与 App 一致）" % (
-            pad, "有效" if pad_ok else "无效/可疑"))
-        decrypted = True
+            if args.yes:
+                die("尾部长度 %d B 不是 16 的整数倍，无法按 AES-ECB 解密；"
+                    "若这是已解密镜像请加 --no-decrypt。" % tail)
+            warn("尾部长度 %d B 不是 16 的整数倍；dry-run 用原文件算哈希，不尝试解密。" % tail)
+            payload = raw
+        else:
+            print("  AES-128-ECB: 解密尾部（key=%r）..." % FW_AES_KEY.decode("ascii"))
+            t0 = time.perf_counter()
+            plain = aes128_ecb_decrypt(raw[start:], FW_AES_KEY)
+            print("              完成，耗时 %.2f s" % (time.perf_counter() - t0))
+            candidate = raw[:start] + plain
+            ver, off = find_fw_version(candidate)
+            if ver is None:
+                if args.yes:
+                    die("AES 解密后仍未找到 G25_MainFW_ 版本串；镜像可能不是 G25 固件/已损坏。\n"
+                        "  若确认镜像是明文，可加 --no-decrypt 强制发送。")
+                warn("AES 解密后未找到 G25_MainFW_ 版本串；dry-run 改用原文件算哈希（真写会被拒绝）。")
+                payload = raw
+            else:
+                payload = candidate
+                print("  版本串    : %r @0x%x（解密后）" % (ver, off))
+                pad = plain[-1]
+                pad_ok = 1 <= pad <= 16 and plain[-pad:] == bytes([pad]) * pad
+                print("  PKCS#7    : 末字节=%d，填充%s（本工具保留完整长度发送，与 App 一致）" % (
+                    pad, "有效" if pad_ok else "无效/可疑"))
+                decrypted = True
 
     payload_sha = hashlib.sha256(payload).hexdigest()
     print("  将发送    : %d B (0x%x)" % (len(payload), len(payload)))
