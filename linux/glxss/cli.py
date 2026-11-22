@@ -15,7 +15,6 @@ import argparse
 import hashlib
 import json
 import sys
-import threading
 import time
 from typing import Optional, Tuple
 
