@@ -353,13 +353,15 @@ Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
 | YV12→RGBA，stretch/fit（需要重采样） | ~79 ms |
 | 旋转 180°（uint32 像素整体反转） | ~1 ms |
 | RGBA 打包 + 16 B 帧头 | ~2 ms |
-| LCD 整帧 bulk OUT + 打包 | 实测 15 fps 时约 54–60 ms/帧（15.3 MB/s） |
+| LCD 整帧 bulk OUT（10 fps 发送） | 实测 30–32 ms/帧（10.2 MB/s） |
 
 > 目标 ≥10 fps：默认 cover 的解码与发送在不同线程，互不阻塞；若设备
 > 实测低于 10 fps，优先用 `--uvc-half`（~17 ms/帧），再看 USB 供电/线材。
 > 合成 YV12 帧 + 真实 LCD 发送的 Pi Zero 2 W 实测：稳定 10.0 fps，后台解码
-> ~20 fps。真机 UVC 若 probe/commit 成功但读不到帧，是固件媒体流水线停摆，
-> 见 `docs/device-recovery.md`（需重灌固件，不在本工具范围内）。
+> ~20 fps。真机 `glxss cast --source uvc --fps 10 --duration 10 --detach` 的
+> LCD 发送侧同样稳定 **10.0 fps（10.2 MB/s）**；如果 UVC probe/commit 成功但
+> 读不到帧，是固件媒体流水线停摆，见 `docs/device-recovery.md`（需重灌固件，
+> 不在本工具范围内）。
 
 ---
 

@@ -228,6 +228,10 @@ journalctl -u glxss-cast.service -f
   进程占用眼镜摄像头（HUD 主进程切监看，或独立 `cast --source uvc`）。
 * 相机监看的发送帧率受 LCD bulk OUT 吞吐限制；默认 cover 解码约 44 ms/帧
   （Pi Zero 2 W @1 GHz），帧率不够时用 `--uvc-half`（约 17 ms/帧）。
+  本机实测 `cast --source uvc --fps 10 --duration 10 --detach --rotate 180`
+  的 LCD 发送稳定 10.0 fps（10.2 MB/s、30–32 ms/帧）。
+* 若 probe/commit 成功但 UVC 0 帧（读错误 `Errno 110`），是固件媒体流水线
+  停摆，先按 `docs/device-recovery.md` 拔插+重灌；不是 monitor 代码问题。
 * Pi Zero 2 W USB 供电有限；眼镜 + HAT 建议带供电 Hub 或独立供电。
 * 本项目不修改眼镜固件；首次使用仍需主机向 `03e7:2150` 灌合法固件
   （`glxss flash IMAGE --yes`），详见 SETUP.md §12。
