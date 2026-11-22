@@ -371,6 +371,15 @@ Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
 > 读不到帧，是固件媒体流水线停摆，见 `docs/device-recovery.md`（需重灌固件，
 > 不在本工具范围内）。
 
+真机 UVC（2026-11-22，`2e09:0030` + 16 KiB 分块组帧）：
+
+| 项 | 实测 |
+|---|---|
+| `pi/stream.py --check --fps 30` | **29.9 fps / 13.80 MB/s**（预热 2 帧后） |
+| 稳态读帧 | **30.0 fps**，33.3 ms/帧，0 丢弃字节 |
+| `glxss cast --source uvc --fps 10 --rotate 180` | 发送 10.0 fps / 10.21 MB/s，100 帧 0 失败，UVC 读 15 fps |
+| RTSP `--fps 20` | 采集 30.0 fps、发送 20.0 fps、0 重启；ffprobe `h264 640x480 20/1` |
+
 ---
 
 ## 6. 代码里复用

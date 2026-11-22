@@ -380,7 +380,7 @@ Linux [`UvcStream.read_frame()`](../linux/glxss/uvc.py)）：
 | 缓冲 | `frameSize=460800 chunk=16384 rxBuf≈477 KB urbSize=460822（仅日志）` |
 | 单次 bulk | `n = 16384`（分块上限），一帧由 ~29 块组成（`460812 = 12 + 460800`） |
 | 帧率（Pixel） | **29.7–30.4 fps**，首秒 17.8（组帧/同步）；4900 帧 0 无效 URB |
-| 帧率（Pi） | 见 §7.2（16 KiB 分块后待真机复测） |
+| 帧率（Pi） | **30.0 fps**（Pi Zero 2 W，16 KiB 分块 + 字节流组帧后实测，见 §7.2） |
 | 解码 | YV12→ARGB 纯 Kotlin 约 8–15 ms/帧；Bitmap A/B 双缓冲，每帧零分配 |
 | 并发 | 投屏 25 fps 同时 UVC 24.6 fps（实测不互斥） |
 | 原始抓包 | 30 个 URB × (460812 + 4 B 长度前缀) = 13,824,480 B，与设备文件大小一致 |
@@ -405,7 +405,8 @@ Pi 上已验证可用的并发面（同一个 handle，控制面走 `usb.UsbGate
   实测约 22–24 MB/s；
 - 两者可与 UVC bulk IN 同时跑（对应 Android 的「投屏 + HID 轮询 + 取流」）。
 
-**实测结论（2026-11-22）：主机侧已对齐，但设备侧仍 0 帧。**
+**当时的实测结论（2026-11-22 早些时候）：主机侧已对齐，但设备侧仍 0 帧。**
+（后来确认是设备固件媒体流水线状态 B；设备恢复后同一套主机代码直接 30 fps，见 §7.2。）
 
 重新插拔（眼镜冷启动 → `03E7:2150` → udev 自动灌 `G25_MainFW_1.9.1.img`，
 md5 `9cea02e4…` 与 APK 内置一致 → `2E09:0030`）之后，新的打开流程实测为：
@@ -498,18 +499,29 @@ cd linux && python -m unittest discover -s tests -v
 Pi Zero 2 W 上的离线组帧基准（假设备按 16 KiB 返回 6 帧连续数据，跑 3 帧）：
 **5.1 ms/帧、~196 fps 组帧吞吐、0 丢弃字节**，远高于 30 fps 目标——组帧不是瓶颈。
 
-Pi 真机验证（眼镜插回 Pi 后；当前设备不在 Pi 上，尚未复测）：
+Pi 真机验证（2026-11-22，Raspberry Pi Zero 2 W + pyusb 1.2.1，眼镜 `2e09:0030`）：
 
 ```bash
 sudo python3 pi/stream.py --check --fps 30 --detach
 python3 -m glxss cast --source uvc --fps 10 --duration 10 --detach --rotate 180
-sudo python3 pi/stream.py --rtsp rtsp://127.0.0.1:8554/glxss --fps 20   # 另开 ffprobe 验证
+sudo python3 pi/stream.py --rtsp rtsp://127.0.0.1:8554/glxss --fps 20   # 另开 ffprobe
 ```
+
+| 测试 | 结果 |
+|---|---|
+| `--check --fps 30` | probe `format=1 frame=4 interval=333333 maxFrame=460800 maxPayload=16384`；预热后 **29.9 fps / 13.80 MB/s** |
+| 稳态读帧 | **30.0 fps**，33.3 ms/帧（中位 33.3，max 38.2），0 丢弃字节；40 帧回放 0 丢帧 |
+| 自检启动 | commit 后第 2 帧 **466 ms**（设备重启数据面）；`--check` 现在预热 2 帧再计时，否则 10 帧均值只有 ~13 fps |
+| 监看 `--fps 10` | 发送 **10.0 fps / 10.21 MB/s**，100 帧 0 失败；后台 UVC 读 15 fps（解码 ~40 ms），0 错误/0 超时 |
+| RTSP `--fps 20` | 采集 **30.0 fps**、发送 **19.7–20.2 fps**、0 重启（33 s / 882 帧）；`ffprobe` → `h264 640x480 avg_frame_rate=20/1` |
+| 连续推流（`--fps 25`） | 采集 30.0 fps、发送 25.1 fps，42 s / 1263 帧，0 重启 |
 
 > Linux 的 libusb 本来就会把 460822 拆成 16 KiB URB（usbmon 可见 `S Bi:… 16384`），
 > 所以这一步在 Pi 上**不会改变 USB 线上看到的 URB 大小**；它的价值是：不再依赖
 > libusb 后端的拆分行为、与 Android 共用同一套组帧/重同步逻辑、并且在任何
 > 只支持单 URB ≤16 KiB 的 usbfs 上都成立（Android 就是被这个上限挡住）。
+> Pi 修复前“0 帧”是设备固件媒体流水线卡死（状态 B）；设备恢复后同一套代码
+> 直接 30 fps，说明主机侧（分块读 + 组帧 + 原厂序列）已经齐了。
 
 ---
 

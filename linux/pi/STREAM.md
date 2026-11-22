@@ -110,7 +110,7 @@ OBS: 媒体源 rtsp://127.0.0.1:8554/glxss
 
 | 阶段 | 实测/估算 | 说明 |
 |---|---|---|
-| UVC 采集 | 20–50 ms | 640×480 YV12 @20fps，帧间隔 50 ms |
+| UVC 采集 | 30–40 ms | 640×480 YV12 @30fps（2026-11-22 起 16 KiB 分块组帧，实测 30.0fps） |
 | YV12→I420 | <1 ms | 交换 U/V 平面（Debian ffmpeg 5.1 没有 `yv12` 像素格式） |
 | H.264 硬编 | 20–40 ms | `h264_v4l2m2m`，`-g 40 -bf 0` |
 | mediamtx 转发 | <10 ms | 本机回环 + 局域网 |
@@ -121,7 +121,8 @@ OBS: 媒体源 rtsp://127.0.0.1:8554/glxss
 
 1. OBS 媒体源「网络缓冲」调到 **1 MB**（默认 2 MB），有线局域网可试 0.5 MB；
 2. 保持 `--transport tcp`（UDP 在 Wi-Fi 上丢包会触发重传/花屏，反而更慢）；
-3. `--fps 20` 而不是 30：Pi 上更稳，OBS 不会因为补帧而增加缓冲；
+3. `--fps 20` 而不是 30：相机本身能到 30fps，但 Pi Zero 2 W 的编码/发送侧
+   留 10fps 余量更稳，OBS 不会因为补帧而增加缓冲；
 4. 不要用 OBS「VLC 视频源」拉 RTSP（libVLC 默认缓存更大），用「媒体源」。
 
 ---
@@ -194,8 +195,11 @@ cd /home/taco/glxss3-linux
 python3 pi/stream.py --check
 ```
 
-它会：打开 USB → probe/commit → 打印协商结果 → 读 10 帧并给出实测 fps/MB/s。
+它会：打开 USB → probe/commit → 打印协商结果 → **预热 2 帧** → 读 10 帧并给出实测 fps/MB/s。
 **不会启动 ffmpeg**，适合确认「眼镜在不在、UVC 能不能读」。
+
+> commit 后设备会重启数据面，第 2 帧实测约 **466 ms**；预热正是为了不让这一下把
+> 10 帧均值拖到 ~13 fps。预热后 Pi 实测 **29.9 fps / 13.80 MB/s**（2026-11-22）。
 
 无眼镜时可先验证整条编码链路：
 
@@ -232,7 +236,7 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 |---|---|---|
 | `--rtsp` | `rtsp://127.0.0.1:8554/glxss` | 推流地址；`--no-rtsp` 关闭 |
 | `--size` | `640x480` | 必须是偶数；相机还支持 1280×720 / 1920×1080 |
-| `--fps` | `20` | 相机实际 20–25；设 20 最稳，30 时帧率会被节流丢掉 |
+| `--fps` | `20` | 相机实际 30.0（16 KiB 分块后）；设 20 给编码侧留余量，30 也能抓但发送会被节流 |
 | `--bitrate` | `1500k` | 640×480 运动画面 1–2 Mbps 足够 |
 | `--codec` | `h264_v4l2m2m` | 备选 `libx264`（CPU 高，但兼容性最好） |
 | `--transport` | `tcp` | 局域网稳定优先 |
@@ -361,8 +365,8 @@ sudo systemctl start glxss-stream.service
 
 | 链路 | 带宽 | 说明 |
 |---|---|---|
-| USB（Pi ← 眼镜） | **9.2 MB/s** | 640×480 YV12 ×20fps；USB2 480 Mbps 够用 |
-| Pi 内 ffmpeg stdin | 9.2 MB/s | 同一进程管道，不占网络 |
+| USB（Pi ← 眼镜） | **13.8 MB/s** | 640×480 YV12 ×30fps（实测 30.0fps，13.80 MB/s）；USB2 480 Mbps 够用 |
+| Pi 内 ffmpeg stdin | 9.2 MB/s | 采集 30fps 后按 `--fps 20` 节流，只把 20fps 送编码器 |
 | Pi → PC（RTSP H.264） | **~1.5 Mbps ≈ 0.19 MB/s** | 目标码率；实测静态测试图仅 ~0.1 Mbps |
 | MJPEG（备选） | 0.7–2 Mbps | 640×480@10、quality 70，动态画面更高 |
 | 每多一个 OBS/观众 | +1.5 Mbps | mediamtx 按需转发，不重新编码 |
@@ -381,8 +385,9 @@ YV12 更累；H.264 是必须的。
 | `mediamtx`（最小配置） | <1% | 19–28 MB |
 | 合计 | ~0.2–0.3 核 | ~150 MB |
 
-真实 UVC 时 Python 端会把「生成图案」换成「libusb 读 460 KB 帧」，CPU 预计
-相近或略高（USB 拷贝 + 帧重组约 10–20%）；ffmpeg/mediamtx 不变。
+真实 UVC（640×480@30fps，16 KiB 分块组帧）实测：Python 读帧线程单帧 33.3 ms、
+组帧 0 丢弃；`--fps 20` 推流时采集 30.0fps、发送 20.0fps、0 重启。CPU/内存与
+测试图案模式同量级（多一次 USB 拷贝 + 组帧），ffmpeg/mediamtx 不变。
 
 MJPEG 模式（测试图案、单观众、10 fps）：Python ~20–27%，带宽约 0.7 Mbps；
 无观众时编码线程跳过，CPU 回落到 ~10%（只剩采集/图案生成）。
@@ -417,13 +422,16 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 |---|---|
 | 枚举 | `2e09:0030`，UVC 1.10，VS `if=1 alt=0 ep=0x81` bulk IN |
 | 支持的格式 | `YV12`：1920×1080、1280×960、1280×720、**640×480**、4128×3104 等 |
-| probe/commit | 可读写 34 B probe；`--fps 20` 回读 `interval=500000`、`maxFrame=460800` |
-| 帧读取 | **复测时 `bulk IN 0x81` 超时（5–10 s 无数据），随后设备从 USB 掉线** |
+| probe/commit | 可读写 34 B probe；`--fps 20` 回读 `interval=500000`，`--fps 30` 回读 `333333`；`maxFrame=460800 maxPayload=16384` |
+| 帧读取 | **30.0 fps**（33.3 ms/帧，max 38.2 ms，0 丢弃）；`--check` 预热后 29.9 fps / 13.80 MB/s |
+| 自检耗时 | commit 后第 2 帧约 466 ms（设备重启数据面），预热 2 帧后稳定 |
+| 推流实测 | `--fps 20`：采集 30.0fps、发送 20.0fps、0 重启（33 s / 882 帧）；`ffprobe` → `h264 640x480 avg_frame_rate=20/1` |
+| 监看实测 | `cast --source uvc --fps 10 --rotate 180`：发送 10.0fps / 10.21 MB/s，100 帧 0 失败，UVC 读 15 fps、0 错误/0 超时 |
 
-> 说明：本次复测期间相机在 probe/commit 后没有吐帧，最后一次尝试后系统日志出现
-> `usb 1-1: USB disconnect`。怀疑是热插拔/复位后相机固件状态异常，或与该时段
-> 另一个进程并发 detach/claim 有关。**真实帧率/码率/CPU 数据待设备稳定后复测**。
-> 复测步骤见 §9.1；请勿在 uvcvideo 被占用时反复 `dev.reset()`。
+> 2026-11-21 复测时曾出现 `bulk IN 0x81` 超时并掉线，那是设备固件媒体流水线卡死
+> （状态 B，需重灌/拔插），不是主机侧问题。2026-11-22 起读路径改为 **16 KiB
+> 分块 + 字节流组帧**（`uvc.py`），本次真机恢复后连续 42 s、1263 帧采集 30.0fps，
+> 0 重启、0 读错误。
 >
 > 另外，反复 `kill -9` ffmpeg 后 `dmesg` 可能出现 `bcm2835-codec: Mutex fail`
 > （Pi 的 MMAL 硬编状态卡住）；重启 Pi 可清掉，编码器恢复。日常用 systemd

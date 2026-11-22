@@ -109,6 +109,11 @@ def run_check(config: StreamConfig) -> int:
         probe = source.open()
         if probe is not None:
             print("[check] probe:\n" + probe.format())
+        # commit 后第一帧可能是上一会话残留/设备重启数据面，实测会慢 ~0.4-0.5 s；
+        # 预热 2 帧再计时，否则 10 帧均值会被这一下拖到 ~13 fps（见 docs/ch-uvc.md §7.2）。
+        print("[check] 预热 2 帧 ...")
+        for _ in range(2):
+            source.read()
         count = 10
         print("[check] 读 %d 帧测速 ..." % count)
         started = time.monotonic()
