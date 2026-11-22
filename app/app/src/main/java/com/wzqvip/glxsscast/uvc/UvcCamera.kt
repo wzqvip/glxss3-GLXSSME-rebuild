@@ -21,7 +21,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.max
-import kotlin.math.min
 
 /**
  * 录像等旁路消费者：每帧解码完成后额外回调一次。
@@ -48,16 +47,18 @@ fun interface UvcFrameTap {
  * - 设备自称 UVC 1.10，VS 接口用 **bulk** 端点（不是 isochronous），
  *   INTF1 只有 alt=0 就带 0x81（mps=512），所以 `setInterface(alt=0)` 即可；
  * - 原厂 libuvc 每次 `libusb_submit_transfer` 就是 `frameBufferSize=460822`
- *   = `dwMaxVideoFrameSize(460800) + 22`，实测**一次 transfer 正好一帧**：
- *   `actual_length = 460812 = 460800 + 12B UVC payload header`；
+ *   = `dwMaxVideoFrameSize(460800) + 22`，设备侧一帧 = `460812 = 460800 + 12B header`；
  * - payload header 是标准 UVC 1.1 的 12 字节头（PTS + SCR 都在）：
  *   `0C 0F|0E <PTS:4> <SCR:6>`  → `bHeaderLength=12`、`bmHeaderInfo` bit1(EOF)=1、
  *   bit0(FID) 逐帧翻转、bit2/bit3(PTS/SCR)=1；后 460800 字节是 YV12
- *   （Y | V | U，实测与原厂画面一致）；
- * - 因此本实现的 URB 尺寸对齐原厂（`frameSize + 22`），并且**只认合法 header**：
- *   固件异常时设备会"整块灌满缓冲区"（`n == urbSize`、首字节是亮度值），
+ *   （Y | V | U，实测与原厂画面一致）；**整帧只有帧首这一个 header**；
+ * - **主机侧单次 bulk URB 上限 16384 B**（Android usbfs，与 libusb 的
+ *   `MAX_BULK_BUFFER_LENGTH` 一致）：拿 460822 去 `bulkTransfer` 会立刻返回 -1
+ *   （不是超时！）。原厂 libusb 是内部拆成 ~29 个 16 KiB URB。因此本实现按
+ *   [BULK_CHUNK] 分块读，再在 [readLoop] 里按 `hdrLen + frameSize` 重组帧；
+ * - **只认合法 header**：固件异常时设备会"整块灌满、首字节是亮度值"，
  *   以前那种 `rawPayloadMode` 兜底会把垃圾当图像画出来 → 彩色噪点；
- *   现在直接判定为无效数据并报错，不再刷噪点。
+ *   现在未同步超过 4 MB 会判定为无效流并报错。
  *
  * 与 [com.wzqvip.glxsscast.usb.UsbLink] 的关系（0.1.3 起**默认共用同一个连接**）：
  * - 原厂只 open 一个 fd，LCD/UVC/HID 都在上面 claim/控制；我们以前是 UVC 自己
@@ -101,14 +102,19 @@ class UvcCamera(private val ctx: Context) {
         private const val MAX_HDR = 12
 
         /**
-         * 原厂 libuvc 的 URB 尺寸 = dwMaxVideoFrameSize + 22（日志 frameBufferSize=460822）。
-         * 实测设备一帧 = 460800 + 12B header = 460812，用 22 留 10 字节余量，
-         * 既不会截断、也不会让一个 URB 横跨两帧。
+         * 原厂 libuvc 的 transfer 尺寸 = dwMaxVideoFrameSize + 22（日志 frameBufferSize=460822）。
+         * 设备一帧 = 460800 + 12B header = 460812，用 22 留 10 字节余量。
+         *
+         * **注意**：Android usbfs 单次 URB 上限 16384 B，不能拿这个尺寸去 `bulkTransfer`
+         * （实测立刻返回 -1）；实际读取用 [BULK_CHUNK]，本值只用于日志/统计。
          */
         private const val URB_SLACK = 22
 
-        /** 连续多少个无效 URB 就认定"设备在发无效数据"并上报一次 */
-        private const val INVALID_LIMIT = 10
+        /**
+         * 单次 `bulkTransfer` 的读取块大小 = Android usbfs 单 URB 上限（16 KiB）。
+         * libusb（原厂）内部也是把 460822 拆成 16 KiB URB，只是它对 App 隐藏了拆分/重组。
+         */
+        private const val BULK_CHUNK = 16 * 1024
 
         /** 探测设备的视频格式/帧描述符（不 claim 接口，只读描述符），用于诊断 */
         fun describe(usb: UsbManager, device: UsbDevice): String {
@@ -238,6 +244,8 @@ class UvcCamera(private val ctx: Context) {
     @Volatile private var inSync = false
     @Volatile private var unalignedDrop = 0
     private var transferBuf = ByteArray(0)
+    /** 字节流组帧缓冲：1 帧 + 1 个 chunk（header 可能跨 chunk） */
+    private var rxBuf = ByteArray(0)
     /** 单帧净荷（不含 UVC header），640x480 YV12 = 460800 */
     private var frameSize = 0
     /** URB 尺寸 = frameSize + URB_SLACK（对齐原厂 460822） */
@@ -303,6 +311,51 @@ class UvcCamera(private val ctx: Context) {
     }
 
     fun hasPermission(dev: UsbDevice): Boolean = usb.hasPermission(dev)
+
+    /**
+     * 诊断（debug 广播 `uvc_bulk` 用）：对当前 VS bulk IN 端点按不同长度做同步
+     * `bulkTransfer`，记录返回值和耗时。
+     *
+     * 判据：
+     * - `n = -1` 且 `dt ≈ timeout` → 设备在线但**不送数据**（NAK，没出流）；
+     * - `n = -1` 且 `dt ≈ 0`   → 端点错误（EPIPE/STALL/ENODEV，claim/alt 被抢或端点 halt）；
+     * - `n > 0` → 真有数据（打印前 12 字节，`0c 0f ...` 就是 UVC header）。
+     *
+     * 在 [prepare] 之后、[select] 之前调用不会出流（预期全部超时），
+     * 在 [select] 之后调用才可能拿到帧。
+     */
+    fun bulkProbe(
+        lengths: IntArray = intArrayOf(512, 16384, 460822),
+        timeoutMs: Int = 800
+    ): String {
+        val c = conn ?: return "bulkProbe: no connection"
+        val ep = vsEpIn ?: return "bulkProbe: no endpoint"
+        val sb = StringBuilder()
+        sb.append("ep=0x%02x mps=%d claimed=%b alt=%b\n".format(ep.address, ep.maxPacketSize, vsClaimed, altSelected))
+        for (len in lengths) {
+            val buf = ByteArray(len)
+            val t0 = SystemClock.elapsedRealtime()
+            val n = try {
+                c.bulkTransfer(ep, buf, len, timeoutMs)
+            } catch (t: Throwable) {
+                -2
+            }
+            val dt = SystemClock.elapsedRealtime() - t0
+            val head = if (n > 0) (0 until minOf(12, n)).joinToString("") { "%02x".format(buf[it]) } else ""
+            val line = "len=$len n=$n dt=${dt}ms $head"
+            Log.i(TAG, "bulkProbe $line")
+            Oplog.logf("UVC", "bulkProbe %s", line)
+            sb.append(line).append('\n')
+        }
+        return sb.toString()
+    }
+
+    /** 诊断：清一次 EP 0x81 的 HALT（CLEAR_FEATURE(ENDPOINT_HALT)） */
+    fun clearHaltForTest(): Boolean {
+        val c = conn ?: return false
+        val ep = vsEpIn ?: return false
+        return LcdControl.clearEndpointHalt(c, ep.address)
+    }
 
     // ==================================================================
     // 打开 + 协商
@@ -520,14 +573,26 @@ class UvcCamera(private val ctx: Context) {
         frameHeight = fr.height
         Log.i(TAG, "selected: ${f.name} ${fr.width}x${fr.height} frameIdx=${fr.index}")
 
-        // 5) probe / commit
+        // 5) 原厂 vendor 前置序列（显示模式 / LCD 状态读 + XU 0x0d0d 相机开关）
+        //    必须在 probe 之前（Frida 抓包 re/liangliang/uvc40.txt 94–101 行）
+        vendorPreProbe(c)
+
+        // 6) probe / commit
         if (!probeAndCommit(c, alt.id, f, fr)) return false
 
-        // 6) 准备缓冲：URB 对齐原厂 = 单帧净荷 + 22
+        // 7) 原厂 commit 之后再写两次 XU 0x0606（抓包 130–131 行）
+        vendorPostCommit(c)
+
+        // 7.5) 清一次 EP 0x81 的 HALT。上一次被取消的 URB / 固件 STALL 会让端点停在
+        //      halt 状态，表现是 bulkTransfer **立刻** 返回 -1（dt≈0），而不是 1000ms 超时。
+        vsEpIn?.let { LcdControl.clearEndpointHalt(c, it.address) }
+
+        // 8) 准备缓冲：一次 bulk 只能读 16 KiB（usbfs 上限），组帧缓冲按 1 帧 + 1 chunk
         frameSize = max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height))
         urbSize = frameSize + URB_SLACK
         frameBuf = ByteArray(frameSize + 64)
-        transferBuf = ByteArray(urbSize)
+        transferBuf = ByteArray(BULK_CHUNK)
+        rxBuf = ByteArray(frameSize + MAX_HDR + BULK_CHUNK + 64)
         frameLen = 0
         invalidStreak = 0
         invalidTotal = 0
@@ -640,7 +705,25 @@ class UvcCamera(private val ctx: Context) {
     }
 
     /**
-     * UVC probe/commit。
+     * UVC probe/commit —— 逐字节对齐原厂 Frida 抓包
+     * （`re/liangliang/uvc40.txt` 105–131 行 / `vendor_uvc_full.log` 104–130 行）：
+     *
+     * ```
+     * GET_CUR / GET_MIN / GET_MAX                      ×2 轮
+     * SET_CUR(probe, frame=3) → GET_CUR ×2 GET_MIN GET_MAX ×2 轮
+     * SET_CUR(probe, frame=4) → GET_CUR ×2 GET_MIN GET_MAX ×2 轮
+     * SET_CUR(probe, frame=4) → GET_CUR
+     * SET_CUR(commit, frame=4)   ← 34 B，内容 = 最后一次 GET_CUR 的回读
+     * ```
+     *
+     * 与旧实现的关键差异：
+     * - 原厂 SET_CUR 里的 `dwMaxVideoFrameSize=0x012c7f80 /
+     *   dwMaxPayloadTransferSize=0x012c7f8c` 就是 **GET_MAX 的全局上限**（19,693,440 /
+     *   19,693,452 B），旧实现自己填 460800/16384，字节对不上原厂；
+     * - 先 probe frame=3（热身档）再落到 frame=4，并在 commit 前把目标档 SET 两次。
+     *
+     * 注意：URB 尺寸仍按**当前档位净荷**算（640×480 = 460822），
+     * 不能拿这个全局上限当 URB（见 docs/ch-uvc.md §2.3）。
      *
      * probe 结构（UVC 1.1，34 字节；UVC 1.0 为 26 字节）：
      * ```
@@ -691,22 +774,6 @@ class UvcCamera(private val ctx: Context) {
             return n
         }
 
-        // 用 GET_CUR 得到的当前值做基底最稳（有些设备校验未用字段必须为 0）
-        var probe = ByteArray(34)
-        var len = ioIn("GET_CUR(probe)", UVC_GET_CUR, VS_PROBE, probe.size, probe)
-        if (len <= 0) {
-            len = ioIn("GET_DEF(probe)", UVC_GET_DEF, VS_PROBE, probe.size, probe)
-        }
-        if (len <= 0) {
-            Log.w(TAG, "GET_CUR/GET_DEF(probe) failed, building probe from scratch")
-            probe = ByteArray(34)
-            len = 34
-        }
-        if (len < 26) {
-            Log.w(TAG, "probe length $len < 26, padding")
-            len = 34
-        }
-
         fun putU32(buf: ByteArray, off: Int, v: Int) {
             buf[off] = (v and 0xff).toByte()
             buf[off + 1] = ((v shr 8) and 0xff).toByte()
@@ -714,54 +781,113 @@ class UvcCamera(private val ctx: Context) {
             buf[off + 3] = ((v shr 24) and 0xff).toByte()
         }
 
-        // bmHint = 1 → 用 dwFrameInterval
-        probe[0] = 1
-        probe[1] = 0
-        probe[2] = f.index.toByte()
-        probe[3] = fr.index.toByte()
-        putU32(probe, 4, fr.defaultInterval)
-        val frameBytes = max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height))
-        putU32(probe, 18, frameBytes)
-        // 640×480 保持原厂验证过的 16 KB（不改已知可用路径）；
-        // 720p/1080p 的单帧远超 16 KB，probe 里把 maxPayload 提到整帧大小，
-        // 否则部分固件会按小的 payload 切帧。
-        val payload = if (frameBytes > 1024 * 1024) {
-            min(frameBytes, 8 * 1024 * 1024)
-        } else if (vsEpIn != null) {
-            max(16384, vsEpIn!!.maxPacketSize * 32)
-        } else {
-            16384
+        // 基底：设备当前的 probe 值（有些设备校验未用字段必须为 0）
+        val base = ByteArray(34)
+        var len = ioIn("GET_CUR(probe)", UVC_GET_CUR, VS_PROBE, base.size, base)
+        if (len <= 0) {
+            len = ioIn("GET_DEF(probe)", UVC_GET_DEF, VS_PROBE, base.size, base)
         }
-        putU32(probe, 22, payload)
+        if (len <= 0) {
+            Log.w(TAG, "GET_CUR/GET_DEF(probe) failed, building probe from scratch")
+            base.fill(0)
+            len = 34
+        }
+        if (len < 26) {
+            Log.w(TAG, "probe length $len < 26, padding")
+            len = 34
+        }
+        var baseMaxFrame = u32(base, 18).toInt()
+        var baseMaxPayload = u32(base, 22).toInt()
 
-        var ret = ioOut("SET_CUR(probe)", VS_PROBE, probe, len)
-        Log.i(TAG, "SET_CUR(probe) -> $ret (len=$len fmt=${f.index} frame=${fr.index} interval=${fr.defaultInterval})")
-        if (ret < 0) {
-            // 有些设备只接受 26 字节
-            if (len > 26) {
-                ret = ioOut("SET_CUR(probe,26)", VS_PROBE, probe, 26)
-                Log.i(TAG, "SET_CUR(probe, 26) -> $ret")
-                if (ret >= 0) len = 26
+        // 原厂在 probe 前把 GET_CUR/GET_MIN/GET_MAX 来回读两轮；
+        // 18..25 以 GET_MAX 的全局上限为准（= 原厂 SET_CUR 里的字节）。
+        val minb = ByteArray(34)
+        val maxb = ByteArray(34)
+        val tmp = ByteArray(34)
+        repeat(2) { round ->
+            ioIn("GET_CUR(probe#${round + 2})", UVC_GET_CUR, VS_PROBE, 34, tmp)
+            val nMin = ioIn("GET_MIN(probe#${round + 1})", UVC_GET_MIN, VS_PROBE, 34, minb)
+            val nMax = ioIn("GET_MAX(probe#${round + 1})", UVC_GET_MAX, VS_PROBE, 34, maxb)
+            if (round == 0) {
+                Log.i(TAG, "probe MIN n=$nMin frame=${minb[3]} " +
+                    "maxFrame=${u32(minb, 18)} maxPayload=${u32(minb, 22)}")
+                Log.i(TAG, "probe MAX n=$nMax frame=${maxb[3]} " +
+                    "maxFrame=${u32(maxb, 18)} maxPayload=${u32(maxb, 22)}")
+            }
+            if (nMax >= 26) {
+                val mf = u32(maxb, 18).toInt()
+                val mp = u32(maxb, 22).toInt()
+                if (mf > 0 && mp > 0) {
+                    baseMaxFrame = mf
+                    baseMaxPayload = mp
+                }
             }
         }
-        if (ret < 0) {
-            lastError = "SET_CUR(probe) failed: $ret"
-            Log.e(TAG, lastError!!)
-            return false
+        putU32(base, 18, baseMaxFrame)
+        putU32(base, 22, baseMaxPayload)
+
+        fun buildProbe(frameIndex: Int): ByteArray {
+            val b = base.copyOf()
+            b[0] = 1                        // bmHint: 用 dwFrameInterval
+            b[1] = 0
+            b[2] = f.index.toByte()
+            b[3] = frameIndex.toByte()
+            putU32(b, 4, fr.defaultInterval)
+            return b
         }
 
-        // 读回 probe 看设备给了什么（失败不致命）
+        /** 原厂每组 SET_CUR 之后：GET_CUR ×2 + GET_MIN + GET_MAX */
+        fun readRound(tag: String) {
+            ioIn("GET_CUR($tag)", UVC_GET_CUR, VS_PROBE, 34, tmp)
+            ioIn("GET_CUR($tag,+1)", UVC_GET_CUR, VS_PROBE, 34, tmp)
+            ioIn("GET_MIN($tag)", UVC_GET_MIN, VS_PROBE, 34, tmp)
+            ioIn("GET_MAX($tag)", UVC_GET_MAX, VS_PROBE, 34, tmp)
+        }
+
+        fun setProbe(tag: String, frameIndex: Int): Boolean {
+            val b = buildProbe(frameIndex)
+            var ret = ioOut("SET_CUR($tag)", VS_PROBE, b, 34)
+            if (ret < 0) {
+                ret = ioOut("SET_CUR($tag,26)", VS_PROBE, b, 26)
+            }
+            Log.i(
+                TAG,
+                "SET_CUR(probe $tag) frame=$frameIndex fmt=${f.index} " +
+                    "interval=${fr.defaultInterval} -> $ret"
+            )
+            if (ret < 0) {
+                lastError = "SET_CUR(probe) failed: $ret"
+                Log.e(TAG, lastError!!)
+                return false
+            }
+            return true
+        }
+
+        // 原厂顺序：先 probe 热身帧档（抓包里是 frame=3），再落到目标档（frame=4）；
+        // 目标档在 commit 前再 SET 一次。
+        val indexes = f.frames.map { it.index }
+        val warm = indexes.firstOrNull { it == 3 && it != fr.index }
+            ?: indexes.firstOrNull { it != fr.index }
+        if (warm != null) {
+            if (!setProbe("warm#$warm", warm)) return false
+            readRound("warm")
+            readRound("warm+")
+        }
+        if (!setProbe("target#${fr.index}", fr.index)) return false
+        readRound("target")
+        readRound("target+")
+        if (!setProbe("target#${fr.index}#final", fr.index)) return false
+
+        // 读回 probe 看设备给了什么，并原样作为 commit 内容（与原厂一致）
         val back = ByteArray(34)
         val n = ioIn("GET_CUR(probe,back)", UVC_GET_CUR, VS_PROBE, back.size, back)
         if (n >= 4) {
             Log.i(TAG, "probe result: bFormatIndex=${back[2]} bFrameIndex=${back[3]} " +
                 "maxVideoFrame=${u32(back, 18)} maxPayload=${u32(back, 22)}")
         }
-
-        // commit：把 probe 内容原样提交
-        val commitSrc = if (n > 0) back else probe
-        ret = ioOut("SET_CUR(commit)", VS_COMMIT, commitSrc, len)
-        Log.i(TAG, "SET_CUR(commit) -> $ret")
+        val commitSrc = if (n >= 26) back else buildProbe(fr.index)
+        var ret = ioOut("SET_CUR(commit)", VS_COMMIT, commitSrc, len)
+        Log.i(TAG, "SET_CUR(commit) frame=${commitSrc[3]} len=$len -> $ret")
         if (ret < 0 && len > 26) {
             ret = ioOut("SET_CUR(commit,26)", VS_COMMIT, commitSrc, 26)
             Log.i(TAG, "SET_CUR(commit, 26) -> $ret")
@@ -772,6 +898,44 @@ class UvcCamera(private val ctx: Context) {
             return false
         }
         return true
+    }
+
+    /**
+     * 原厂打开相机**之前**的 vendor 序列（Frida 抓包 `re/liangliang/uvc40.txt` 94–101 行）：
+     *
+     * ```
+     * 0xA1/0x05  wValue=1  wIndex=3  wLen=1   读显示模式（wValue=1 即"显示模式 1"）
+     * 0xA1/0x04  wValue=0  wIndex=3  wLen=8   读 LCD 状态
+     * 0xA1/0x05  wValue=1  wIndex=3  wLen=1   再读一次
+     * 0x21/0x01  wValue=0x0d0d wIndex=0x0400 wLen=1 data=01   XU：相机开关（entity 4）
+     * ```
+     *
+     * 最后这条 XU 写是原厂「相机开关」：旧实现不发也能出帧，但在「probe/commit 都成功、
+     * bulk IN 却一个字节都不来」的场景里，这条是先试项（设备相机侧可能停在待机）。
+     */
+    private fun vendorPreProbe(c: UsbDeviceConnection) {
+        val t0 = SystemClock.elapsedRealtime()
+        // 0xA1/0x05 wValue=1 wIndex=3：与 LcdControl.setDisplayMode 是同一条控制传输
+        // （bmRequestType=0xA1 是 IN，缓冲区就是读回值；原厂也是这么发的）
+        val mode1 = LcdControl.setDisplayMode(c, 1)
+        val status = LcdControl.readStatus(c)
+        val mode1b = LcdControl.setDisplayMode(c, 1)
+        val xu = LcdControl.vendorXuSwitch(c, true)
+        Oplog.logf(
+            "UVC", "pre-probe vendor: mode1=%b status=%s mode1#2=%b xu0x0d0d=%b ms=%d",
+            mode1, status?.hex() ?: "-", mode1b, xu, SystemClock.elapsedRealtime() - t0
+        )
+        Log.i(
+            TAG, "vendor pre-probe: displayMode=$mode1 status=${status?.hex()} " +
+                "displayMode#2=$mode1b xu(0x0d0d)=$xu"
+        )
+    }
+
+    /** 原厂 `SET_CUR(commit)` 之后连发两次 XU `0x0606`（抓包 130–131 行） */
+    private fun vendorPostCommit(c: UsbDeviceConnection) {
+        val ok = LcdControl.vendorXuStreamStart(c)
+        Oplog.logf("UVC", "post-commit vendor: xu0x0606 x2 -> %b", ok)
+        Log.i(TAG, "vendor post-commit: xu(0x0606) x2 -> $ok")
     }
 
     private fun u32(b: ByteArray, off: Int): Long {
@@ -911,7 +1075,10 @@ class UvcCamera(private val ctx: Context) {
         unalignedDrop = 0
         framesInWindow = 0
         windowStart = System.currentTimeMillis()
-        Oplog.logf("UVC", "start reader ep=0x%02x urb=%d", ep.address, transferBuf.size)
+        Oplog.logf(
+            "UVC", "start reader ep=0x%02x chunk=%d frame=%d urb=%d",
+            ep.address, transferBuf.size, frameSize, urbSize
+        )
         thread = Thread({ readLoop(c, ep) }, "UvcReader").also {
             it.priority = Thread.NORM_PRIORITY + 1
             it.start()
@@ -919,23 +1086,31 @@ class UvcCamera(private val ctx: Context) {
     }
 
     /**
-     * 读帧循环。
+     * 读帧循环（分块 URB + 字节流组帧）。
      *
-     * 真机行为（Frida 抓原厂 libusb，见 docs §8）：URB = frameSize+22，
-     * **一次 bulk 传输就返回一整帧 payload**：`n = 460812`、
-     * `buf[0]=0x0C`（12B header）、`buf[1]` 的 bit1(EOF)=1。
+     * **为什么不能一次 bulk 读一整帧**：Android usbfs 单次 `bulkTransfer` 的 URB
+     * 上限是 16384 B（与 libusb 的 `MAX_BULK_BUFFER_LENGTH` 一致）。实测
+     * `bulkTransfer(ep, buf, 460822, 1000)` 在 Pixel 上**立刻返回 -1**（dt≈0/59ms，
+     * 不是 1000ms 超时），而 512 / 16384 都能拿到数据；原厂 libusb 之所以能用
+     * `transferBufferSize=460822`，是 libusb 内部把它拆成 ~29 个 16 KB URB 再重组。
+     * 所以这里改成每次读 [BULK_CHUNK]=16384，自己在字节流上组帧。
      *
-     * 判定规则因此很简单也很严格：
-     * - `bHeaderLength` 不在 2..12、或 ERR 位置 1 → 这个 URB 是无效数据，
-     *   **不拼入帧、不解码、不刷屏**（以前的 rawPayloadMode 兜底会把垃圾当图像画 → 彩色噪点）；
-     * - header 合法 → 跳过 header 拼 payload，EOF 置位就交一帧。
+     * 设备实际格式（本轮 15:45 实测 + 原厂抓包一致）：
+     * - 每帧 = 12 B UVC header + `frameSize`（640×480 YV12 = 460800）净荷；
+     * - **整帧只有一个 header**，且 `bmHeaderInfo` bit1(EOF)=1（`0c 0f|0e ...`）；
+     * - header 之后是连续净荷，后续 16 KB 块里没有 header（首字节就是亮度值）。
      *
-     * 固件异常时设备的典型症状是"整块灌满 URB"（`n == urbSize`，首字节是亮度值），
-     * 会命中无效分支；连续 [INVALID_LIMIT] 次后回调一次 [Listener.onError]，
-     * 提示眼镜固件状态异常、需要重新上电或重新加载固件。
+     * 组帧规则：
+     * 1. 未同步时在字节流里找 header（`0x0C` + EOF + PTS/SCR 自洽），丢弃之前的半帧；
+     * 2. 同步后每 `hdrLen + frameSize` 字节交一帧；
+     * 3. 交帧后校验下一帧起点仍是合法 header，不合法就重新同步（防止永久错位）。
      */
     private fun readLoop(c: UsbDeviceConnection, ep: UsbEndpoint) {
         val buf = transferBuf
+        val rx = rxBuf
+        var rxLen = 0
+        var synced = false
+        var discarding = 0L
         var timeouts = 0
         var fastFails = 0
         var lastLog = 0L
@@ -969,7 +1144,7 @@ class UvcCamera(private val ctx: Context) {
                 timeouts++
                 if (timeouts == 3) {
                     Log.w(TAG, "no UVC data yet (${BULK_TIMEOUT}ms timeout) — device idle?")
-                    Oplog.logf("UVC", "bulk-in timeout x3 (no data, urb=%d)", urbSize)
+                    Oplog.logf("UVC", "bulk-in timeout x3 (no data, chunk=%d)", buf.size)
                 }
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastLog >= 3000) {
@@ -987,37 +1162,76 @@ class UvcCamera(private val ctx: Context) {
             fastFails = 0
             dumpUrb(buf, n)
 
-            val hdrLen = buf[0].toInt() and 0xff
-            val hdrInfo = if (n >= 2) buf[1].toInt() and 0xff else 0
-            val errBit = (hdrInfo and 0x40) != 0
-            val hdrOk = hdrLen in 2..MAX_HDR && hdrLen <= n
-            if (!hdrOk || errBit) {
-                // 没有合法 header：
-                //  - 已经同步到某帧内（续传）→ 追加
-                //  - 未同步（流从帧中间开始）→ 丢弃，等下一个 0x0C 开头的新帧
-                // 之前无条件追加会让整帧永久错位 → 彩色噪点。
-                if (inSync) {
-                    append(buf, 0, n)
-                    if (frameLen >= frameSize) { deliverSafe(); inSync = false }
-                } else {
-                    unalignedDrop++
-                    onInvalidUrb(n, hdrLen, hdrInfo,
-                        if (!hdrOk) "bHeaderLength=$hdrLen" else "ERR bit set")
-                }
-                continue
+            if (rxLen + n > rx.size) {
+                // 理论不会发生（缓冲按 1 帧 + 1 chunk 分配）；真溢出就丢半帧重新同步
+                Log.w(TAG, "rx buffer overflow (rxLen=$rxLen n=$n) → resync")
+                rxLen = 0
+                synced = false
             }
-            invalidStreak = 0
-            lastHdrLen = hdrLen
-            lastHdrInfo = hdrInfo
-            val eof = (hdrInfo and 0x02) != 0
-            if (!inSync) { frameLen = 0; inSync = true }
-            append(buf, hdrLen, n - hdrLen)
-            if (eof) {
+            System.arraycopy(buf, 0, rx, rxLen, n)
+            rxLen += n
+
+            var pos = 0
+            while (true) {
+                if (!synced) {
+                    var i = pos
+                    var found = -1
+                    while (i + MAX_HDR <= rxLen) {
+                        val l = rx[i].toInt() and 0xff
+                        if (l in 2..MAX_HDR && headerOk(rx, i, l)) { found = i; break }
+                        i++
+                    }
+                    if (found < 0) {
+                        // 保留末尾 <MAX_HDR 字节（header 可能跨 chunk）
+                        pos = max(pos, rxLen - (MAX_HDR - 1))
+                        break
+                    }
+                    discarding += (found - pos)
+                    unalignedDrop += (found - pos)
+                    pos = found
+                    synced = true
+                    inSync = true
+                }
+                if (rxLen - pos < MAX_HDR) break
+                val hdrLen = rx[pos].toInt() and 0xff
+                if (!headerOk(rx, pos, hdrLen)) {
+                    synced = false
+                    discarding++
+                    pos++
+                    continue
+                }
+                val need = hdrLen + frameSize
+                if (rxLen - pos < need) break
+                // 一帧到齐：整块拷进 frameBuf（deliver() 会按 frameSize 解码）
+                if (frameBuf.size < frameSize) frameBuf = ByteArray(frameSize + 64)
+                System.arraycopy(rx, pos + hdrLen, frameBuf, 0, frameSize)
+                frameLen = frameSize
+                lastHdrLen = hdrLen
+                lastHdrInfo = rx[pos + 1].toInt() and 0xff
+                invalidStreak = 0
+                discarding = 0
                 deliverSafe()
-                inSync = false
-            } else if (frameLen >= frameSize) {
-                // 设备没按 UVC 语义打 EOF：按长度兜底交帧（真机不会走到这里）
-                deliverSafe()
+                pos += need
+            }
+            if (pos > 0) {
+                System.arraycopy(rx, pos, rx, 0, rxLen - pos)
+                rxLen -= pos
+            }
+
+            if (discarding > 4L * 1024 * 1024 && !invalidReported) {
+                invalidReported = true
+                invalidTotal++
+                val msg = "眼镜在发没有合法 UVC header 的数据流（已丢弃 ${discarding / 1024} KB）：" +
+                    "固件媒体流水线可能已卡死。请拔插眼镜 USB —— App 会自动重灌固件" +
+                    "（03E7:2150 → 2E09:0030）；若没自动重灌，等设备出现后用「加载固件」。"
+                Log.e(TAG, msg)
+                Oplog.logf("UVC", "unsynced 4MB, synced=false → 报错")
+                Oplog.dumpCrash("uvc_unsynced_4mb")
+                try {
+                    listener?.onError(msg)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "onError callback failed", t)
+                }
             }
         }
         } catch (t: Throwable) {
@@ -1032,45 +1246,24 @@ class UvcCamera(private val ctx: Context) {
         }
     }
 
-    /** 无效 URB：丢弃 + 计数；连续太多次就上报一次（绝不再把垃圾画成噪点） */
-    private fun onInvalidUrb(n: Int, hdrLen: Int, hdrInfo: Int, why: String) {
-        invalidStreak++
-        invalidTotal++
-        frameLen = 0
-        if (invalidStreak <= 2) {
-            Log.w(
-                TAG,
-                "invalid UVC payload ($why): n=$n hdrLen=$hdrLen hdrInfo=0x%02x urbSize=$urbSize"
-                    .format(hdrInfo)
-            )
-            // 前 16 字节进 oplog：区分「整块灌满（首字节是亮度值）」还是「header 错位」
-            Oplog.logf(
-                "UVC", "invalid URB n=%d hdr=0x%02x info=0x%02x first16=%s",
-                n, hdrLen, hdrInfo,
-                (0 until minOf(16, n)).joinToString("") { "%02x".format(transferBuf[it]) }
-            )
-            // 第一个坏 URB 原样落盘，便于离线分析（是「整块灌满」还是「header 错位」）
-            if (invalidStreak == 1 && n in 1..transferBuf.size) {
-                try {
-                    File(ctx.filesDir, "uvc_bad.bin").writeBytes(transferBuf.copyOf(n))
-                } catch (ignored: Throwable) {
-                }
-            }
+    /**
+     * 判定一段字节是否是一个合法 UVC payload header（本设备 12 B，整帧只有这一个）。
+     *
+     * 用 header 自身的冗余位做校验（误判概率 ~1e-10，远低于纯 `0x0C` 扫描）：
+     * - `bHeaderLength` 在 2..12；
+     * - `bmHeaderInfo` bit1(EOF)=1（本设备每帧都置位）、bit6(ERR)=0；
+     * - 带 SCR（bit3）时，SCR 前 2 字节 = PTS 前 2 字节（实测 `0c 0f d9 75 00 00 d9 75…`）。
+     */
+    private fun headerOk(b: ByteArray, off: Int, hdrLen: Int): Boolean {
+        if (hdrLen !in 2..MAX_HDR) return false
+        if (off + hdrLen > b.size) return false
+        val info = b[off + 1].toInt() and 0xff
+        if ((info and 0x40) != 0) return false             // ERR bit
+        if ((info and 0x02) == 0) return false             // EOF
+        if (hdrLen >= 12 && (info and 0x08) != 0) {        // SCR 与 PTS 低 2 字节一致
+            if (b[off + 6] != b[off + 2] || b[off + 7] != b[off + 3]) return false
         }
-        if (invalidStreak == INVALID_LIMIT && !invalidReported) {
-            invalidReported = true
-            val msg = "眼镜在发无效数据流（连续 $invalidStreak 个 URB 没有合法 UVC header，n=$n）：" +
-                "固件媒体流水线已卡死。请拔插眼镜 USB —— App 会自动重灌固件（03E7:2150 → 2E09:0030）；" +
-                "若没自动重灌，等设备出现后用「加载固件（引导模式 03E7:2150）」。"
-            Log.e(TAG, msg)
-            Oplog.logf("UVC", "invalid streak=%d (%s) n=%d hdr=0x%02x", invalidStreak, why, n, hdrInfo)
-            Oplog.dumpCrash("uvc_invalid_stream(streak=$invalidStreak,n=$n)")
-            try {
-                listener?.onError(msg)
-            } catch (t: Throwable) {
-                Log.w(TAG, "onError callback failed", t)
-            }
-        }
+        return true
     }
 
     /**
@@ -1100,12 +1293,12 @@ class UvcCamera(private val ctx: Context) {
     @Volatile private var dumpRemaining = 0
 
     /**
-     * 把接下来 [urbs] 个 bulk 传输的**原始字节**写到 [file]，格式：
-     * 每个 URB 前置 4 字节小端长度，后接原始数据。
+     * 把接下来 [urbs] 个 bulk 读请求的**原始字节**写到 [file]，格式：
+     * 每个请求前置 4 字节小端长度，后接原始数据。
      *
-     * 这是排查"固件状态异常"最快的手段：合法数据里每个 URB 应以
-     * `0C 0F/0E` 开头、长度 460812；异常时会是 `n == urbSize` 且首字节是亮度值。
-     * 拿回 PC 上可以用 `re/liangliang/uvc_frame_decode.py` 直接解析。
+     * 2026-11-22 起读请求是 16 KiB 分块（[BULK_CHUNK]），不再是"一帧一个 460812 B 的
+     * URB"；合法流里**每帧第一块**以 `0C 0F/0E` 开头，其余块首字节是亮度值。
+     * 拿回 PC 后按 `12 + frameSize` 组帧，可用 `re/liangliang/uvc_frame_decode.py` 解析。
      *
      * @return 成功打开文件返回 true（数据在 reader 线程里写）
      */
@@ -1158,18 +1351,6 @@ class UvcCamera(private val ctx: Context) {
             Log.e(TAG, "dumpUrb failed", t)
             stopRawDump()
         }
-    }
-
-    private fun append(src: ByteArray, off: Int, len: Int) {
-        if (len <= 0) return
-        if (frameLen + len > frameBuf.size) {
-            // 帧比预期大：扩容（首帧可能比 dwMaxVideoFrameBufferSize 大）
-            val newSize = max(frameBuf.size * 2, frameLen + len + 1024)
-            Log.w(TAG, "frame buffer grown ${frameBuf.size} -> $newSize")
-            frameBuf = frameBuf.copyOf(newSize)
-        }
-        System.arraycopy(src, off, frameBuf, frameLen, len)
-        frameLen += len
     }
 
     /** 一帧收齐：解码/转换 → 回调 */

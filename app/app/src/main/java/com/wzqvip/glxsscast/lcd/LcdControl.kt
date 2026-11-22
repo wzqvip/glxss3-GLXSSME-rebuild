@@ -270,6 +270,34 @@ object LcdControl {
     }
 
     /**
+     * 原厂 `SET_CUR(commit)` **之后**连发的两条 XU 写（Frida 抓包
+     * `re/liangliang/uvc40.txt` 130–131 / `vendor_uvc_full.log` 129–130 行）：
+     *
+     * ```
+     * 0x21/0x01  wValue=0x0606  wIndex=0x0400  wLength=1  data=00   ×2
+     * ```
+     *
+     * 只出现在 commit 之后、收流之前；抓包里没有对应读，猜测是「让相机侧媒体
+     * 流水线开始送流 / 清掉上一轮残留」。本实现按原厂连发两次，逐字节一致。
+     */
+    fun vendorXuStreamStart(conn: UsbDeviceConnection): Boolean {
+        val data = byteArrayOf(0)
+        var ok = true
+        repeat(2) { i ->
+            val t0 = SystemClock.elapsedRealtime()
+            val n = UsbGate.io("xu:0x0606") {
+                conn.controlTransfer(0x21, 0x01, 0x0606, 0x0400, data, 1, TIMEOUT)
+            }
+            Oplog.logf(
+                "CTRL", "op=0x01(XU) wValue=0x0606 wIndex=0x0400 data=00 rc=%d ms=%d (#%d)",
+                n, SystemClock.elapsedRealtime() - t0, i + 1
+            )
+            if (n < 0) ok = false
+        }
+        return ok
+    }
+
+    /**
      * 清端点 HALT：`bmRequestType=0x02`（Host→Device | Standard | Endpoint）、
      * `bRequest=0x01`（CLEAR_FEATURE）、`wValue=0`（ENDPOINT_HALT）、`wIndex=端点地址`。
      *

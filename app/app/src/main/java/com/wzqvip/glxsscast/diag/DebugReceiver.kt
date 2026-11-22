@@ -79,6 +79,8 @@ class DebugReceiver : BroadcastReceiver() {
                 }
                 "uvc_close" -> bg("ExpUvcClose") { ExpHarness.uvcClose() }
                 "uvc_rawdump" -> Log.i(TAG, ExpHarness.uvcRawDump(app, intent.getIntExtra("n", 3)))
+                "uvc_bulk" -> bg("ExpUvcBulk") { Log.i(TAG, ExpHarness.uvcBulk(app)) }
+                "uvc_snapshot" -> bg("ExpUvcSnap") { Log.i(TAG, ExpHarness.uvcSnapshot()) }
                 "uvc_cycle" -> {
                     val n = intent.getIntExtra("n", 50)
                     val hold = intent.getIntExtra("hold", 400).toLong()

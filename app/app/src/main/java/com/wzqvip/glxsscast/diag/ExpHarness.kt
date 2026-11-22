@@ -2,6 +2,7 @@ package com.wzqvip.glxsscast.diag
 
 import android.content.Context
 import android.hardware.usb.UsbManager
+import android.util.Log
 import com.wzqvip.glxsscast.cast.CastService
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
@@ -84,6 +85,44 @@ object ExpHarness {
         uvc = null
         Oplog.log("EXP", "uvc close")
         "uvc close: done"
+    }
+
+    /** 把当前 UVC 帧存成 PNG（验证解码画面用） */
+    fun uvcSnapshot(): String {
+        val cam = synchronized(lock) { uvc } ?: return "snapshot: no uvc instance"
+        val f = cam.saveSnapshot() ?: return "snapshot: no frame (frames=${cam.frameCount()})"
+        return "snapshot: ${f.absolutePath} (${f.length()} B, frames=${cam.frameCount()}, fps=${cam.currentFps()})"
+    }
+
+    /** 诊断 bulk IN：prepare 后 / clear halt 后 / commit 后 三种状态下的 bulkTransfer 实测 */
+    fun uvcBulk(ctx: Context): String {
+        val link = ensureLink(ctx)
+        val dev = link.device ?: link.findDevice() ?: return "uvc bulk: no device"
+        if (!link.isOpen && !link.open(dev)) return "uvc bulk: usb open failed"
+        val cam = UvcCamera(ctx.applicationContext)
+        val sb = StringBuilder()
+        try {
+            if (!cam.prepare(dev, link.connection)) {
+                return "uvc bulk: prepare failed ${cam.lastError()}"
+            }
+            sb.append("== before probe ==\n").append(cam.bulkProbe())
+            cam.clearHaltForTest()
+            sb.append("== after clear halt ==\n").append(cam.bulkProbe())
+            if (!cam.select(null)) {
+                sb.append("select failed: ${cam.lastError()}")
+            } else {
+                sb.append("== after commit ==\n").append(cam.bulkProbe())
+                cam.start()
+                Thread.sleep(1500)
+                sb.append("running=${cam.isRunning} frames=${cam.frameCount()} fps=${cam.currentFps()}")
+                cam.stop()
+            }
+        } finally {
+            cam.close()
+        }
+        val s = sb.toString()
+        for (line in s.split('\n')) Log.i("ExpHarness", "BULK $line")
+        return s
     }
 
     /** 使能光感/罗盘/加速度/陀螺（0x10/0x11/0x12/0x14），让 28B 报告有非零 IMU */

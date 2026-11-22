@@ -1,7 +1,9 @@
 # 第 2 章 · 摄像头（UVC）
 
 > 本章讲清楚：怎么**不依赖任何 native 库**，用纯 Kotlin 把眼镜摄像头跑起来。
-> 关键结论：它是**标准 UVC 1.10 + bulk 端点 + 未压缩 YV12**，一次 bulk 传输正好是一帧；
+> 关键结论：它是**标准 UVC 1.10 + bulk 端点 + 未压缩 YV12**；设备侧一帧就是一个 UVC
+> payload（12 B header + 460800 B），但**主机侧单次 URB 最多 16 KiB**（见 §5.3），
+> 所以 App 要按 16 KiB 分块读、自己重组帧。
 > 之前所有"彩色噪点/花屏"都不是协议问题，而是**固件卡死时在灌无边界垃圾流**。
 >
 > 对应代码：[`uvc/UvcCamera.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcCamera.kt)、
@@ -33,8 +35,8 @@ claim if0 (VC) + if1 (VS)
    ├─ GET_CUR(probe, 34B) ◄───────────────────────────── 看设备认可了什么
    ├─ SET_CUR(commit, 34B) ────────────────────────────► 正式生效
    │
-   └─ bulkTransfer(0x81, 460822B) ◄───────────────────── 每次一整帧：
-                                                          12B header + 460800B YV12
+   └─ bulkTransfer(0x81, 16384B) × N ◄────────────────── 16 KiB 一块，
+                                                          自己按 12+460800 组帧
 ```
 
 ### 1.1 设备事实（实测，别再猜）
@@ -47,10 +49,11 @@ claim if0 (VC) + if1 (VS)
 | UVC 版本 | `bcdUVC = 0x0110`（1.10）→ probe 结构 34 B（UVC 1.0 是 26 B） |
 | 格式 | `bFormatIndex=1` → **YV12 未压缩**（`idx2` 是 MJPEG） |
 | 帧档位 | 1920×1080、1280×720、640×480；实测选中 `bFrameIndex=4` → 640×480@30 |
-| 实际帧率 | **20–25 fps**（30 只是描述符上限） |
+| 实际帧率 | **29.7–30.4 fps**（2026-11-22 Pixel 10 Pro Fold 实测；描述符上限 30） |
 | 一帧 | `460800 = 640×480×1.5`，**无 stride padding** |
-| 一次 bulk | `460812 = 460800 + 12`（12 B UVC payload header） |
-| URB 尺寸 | `460822 = frameSize + 22`（原厂 `frameBufferSize` 日志） |
+| 一帧总长 | `460812 = 460800 + 12`（12 B UVC payload header，整帧只有这 1 个 header） |
+| 原厂 transfer | `460822 = frameSize + 22`（libusb `frameBufferSize` 日志；libusb 内部拆 16 KiB URB） |
+| Android 单 URB | **16384 B 上限**：`bulkTransfer(…, 460822, …)` 直接返回 -1（见 §5.3） |
 
 > ⚠️ 早期文档按"常见摄像头"假设了 `alt=1`、`2 B header`、`iso 端点`，全部被真机抓包推翻。
 > 本文以抓包为准：[uvc-camera-plan.md §4](uvc-camera-plan.md#4-真机抓包与修复2026-11-21已完成)。
@@ -120,18 +123,62 @@ bmHint fmt  frm   333333              460800        16384
 
 > `GET_MAX` 会回 `dwMaxVideoFrameSize=0x012c7f80 (19,693,440)`、`maxPayload=0x012c7f8c`
 > ——这是设备/格式的**全局上限**，不是当前档位，**不能拿来当 URB 尺寸**。
-> URB 必须按"当前档位的净荷 + 12"算。
+> 但原厂 SET_CUR 里的字节**就是**这个全局上限（见 §2.4），所以 probe 基底必须以
+> `GET_MAX` 回读为准；URB 仍按"当前档位净荷"算。
 
-### 2.4 原厂额外发的一条 XU（不是必需）
+### 2.4 原厂完整启动序列（Frida 逐字节抓包，2026-11-22）
 
-健康设备初始化时原厂还会发：
+来源：`re/liangliang/uvc40.txt` 94–131 行 / `vendor_uvc_full.log` 93–130 行
+（hook 原厂 `:llvision_G25` 的 `libusb_control_transfer` / `libusb_submit_transfer`）。
+`type=0x-5f` 是 0xA1 的有符号打印。
 
 ```
-0x21/0x01  wValue=0x0d0d  wIndex=0x0400  wLength=1  data=01
+t      请求                                                  说明
+────── ──────────────────────────────────────────────────── ─────────────────────────
+ 1  0xA1/0x05 wValue=0x0001 wIndex=3 wLen=1 → 00            读显示模式
+ 2  0xA1/0x04 wValue=0x0000 wIndex=3 wLen=8 → 8002900101d50a00   读 LCD 状态
+ 3  0xA1/0x05 wValue=0x0001 wIndex=3 wLen=1 → 00            再读一次
+ 4  0x21/0x01 wValue=0x0d0d wIndex=0x0400 wLen=1 data=01    XU entity 4：相机开关
+ 5  0xA1/0x81 wValue=0x0100 wIndex=1 wLen=34                 GET_CUR（frame=4）
+ 6  0xA1/0x82 wValue=0x0100 wIndex=1 wLen=34                 GET_MIN（frame=1）
+ 7  0xA1/0x83 wValue=0x0100 wIndex=1 wLen=34                 GET_MAX（全局上限）
+ 8  0xA1/0x81 + 0x82 + 0x83 再一轮                             （原厂来回读两轮）
+ 9  0x21/0x01 wValue=0x0100 wIndex=1 wLen=34 frame=3          SET_CUR probe（热身档）
+10  0xA1/0x81 ×2 + 0x82 + 0x83 ×2 轮                          读回/再看上限
+11  0x21/0x01 wValue=0x0100 wIndex=1 wLen=34 frame=4          SET_CUR probe（目标档）
+12  0xA1/0x81 ×2 + 0x82 + 0x83 ×2 轮
+13  0x21/0x01 wValue=0x0100 wIndex=1 wLen=34 frame=4          SET_CUR probe（再发一次）
+14  0xA1/0x81 wValue=0x0100 wIndex=1 wLen=34                  最后一次读回
+15  0x21/0x01 wValue=0x0200 wIndex=1 wLen=34                  SET_CUR commit（34 B）
+16  0x21/0x01 wValue=0x0606 wIndex=0x0400 wLen=1 data=00      XU：连发两次
+17  0xA1/0x04 wValue=0 wIndex=3 wLen=8                        收流前再读一次状态
 ```
 
-这是相机侧一个 1 字节 vendor 开关（entity 4）。**本实现不发，实测 25 fps 正常**。
-如果某天遇到"probe/commit 都成功但 0 帧"，可以把它列为待试项。
+原厂 SET_CUR / commit 的 34 字节（`0x012c7f80 = 19,693,440`）：
+
+```
+01 00 | 01 | 04 | 15 16 05 00 | 01 00 00 00 00 00 00 00 | 80 7f 2c 01 | 8c 7f 2c 01 | 00 00 00 00 | 00 00 00 00
+bmHint fmt  frm   333333        wKeyFrameRate…wDelay       maxFrameSize   maxPayload      clock          ver
+```
+
+> 第 9 步的 `frame=3` 在抓包里只用来"热身"：设备回读仍是 3，随后才 SET 到 4。
+> 本实现照抄（若 UI 选的就是 frame=3，则跳过热身）。
+
+**我们的实现**（`UvcCamera.select()` / `probeAndCommit()` / `vendorPreProbe()` /
+`vendorPostCommit()`，2026-11-22 起）：
+
+- claim 顺序保持 **VC(if0) → HID(if2) → VS(if1)**（与原厂一致，HID 已由 `UsbLink` claim）；
+- `vendorPreProbe()`：步骤 1–4（显示模式/状态读走 `LcdControl.setDisplayMode/readStatus`，
+  XU 走 `LcdControl.vendorXuSwitch`）；
+- `probeAndCommit()`：步骤 5–15。probe 基底取 `GET_CUR`，`18..25` 用 `GET_MAX` 覆盖，
+  先 SET frame=3 再 SET frame=4（目标档连发两次），commit 内容 = 最后一次 `GET_CUR` 回读；
+- `vendorPostCommit()`：步骤 16（`LcdControl.vendorXuStreamStart()` 连发两次 `0x0606`）；
+- 收流：16 KiB 分块 `bulkTransfer` + 自己组帧（§5.3 / §6）。
+
+> **0x0d0d / 0x0606 是否必需？** 本轮实测：设备在 probe/commit **之前**就已经在
+> 吐 `0c 0f …` 数据（见 §6 的 `bulkProbe` 日志），所以这两条 XU 不是出流的唯一开关。
+> 之所以照做，是为了和原厂逐字节一致、排除"相机侧开关"这个变量。
+> 真正阻塞出流的是 **URB 尺寸**（§5.3）。
 
 ---
 
@@ -220,16 +267,18 @@ Yuv.yuv420ToArgb(argb, src, uOff, vOff, w, h)
 
 ```
 1. 找设备 2E09:0030，拿 USB 权限
-2. openDevice（可复用 UsbLink 的连接）
-3. claim if0 (VC)            ← 与原厂 libuvc 对齐；部分设备要求先有 VC
-4. claim if1 (VS alt=0)
-5. setInterface(VS alt=0)    ← 返回 false 也可能已生效
+2. openDevice（可复用 UsbLink 的连接；单 fd 与原厂一致）
+3. claim if0 (VC)
+4. claim if2 (HID)            ← 共用一个 fd 时 UsbLink 已 claim，UvcCamera 不重复 claim
+5. claim if1 (VS alt=0) + setInterface(alt=0)
 6. 解析 rawDescriptors → VS_FORMAT_* / VS_FRAME_*
-7. GET_CUR(probe) 拿基底 → 填 fmt/frame/interval/maxFrame/maxPayload
-8. SET_CUR(probe) → GET_CUR(probe) 读回 → SET_CUR(commit)
-9. 分配 transferBuf = frameSize + 22
-10. 线程循环 bulkTransfer(0x81)，按 §6 组帧
-11. 停止：setInterface(alt0) → releaseInterface → close（若连接是自己开的）
+7. XU 前置：0xA1/0x05 显示模式、0xA1/0x04 状态、0x21/0x01 0x0d0d=01（§2.4 步骤 1–4）
+8. probe/commit：GET_CUR/MIN/MAX 两轮 → SET frame=3 → SET frame=4 ×2 → commit（§2.4 5–15）
+9. XU 后置：0x21/0x01 0x0606=00 ×2（§2.4 步骤 16）
+10. CLEAR_FEATURE(HALT, 0x81)
+11. 分配 transferBuf=16384、rxBuf=frameSize+12+16384
+12. 线程循环 bulkTransfer(0x81, 16384) → 字节流组帧（§6）
+13. 停止：setInterface(alt0) → CLEAR_FEATURE(HALT) → releaseInterface(VS)，共享连接不 close
 ```
 
 ### 5.1 选接口与端点
@@ -258,94 +307,146 @@ for (i in 0 until dev.interfaceCount) {
 ### 5.2 probe/commit（仓库真实代码，节选）
 
 ```kotlin
-// uvc/UvcCamera.kt
-var probe = ByteArray(34)
-var len = c.controlTransfer(REQ_IN, UVC_GET_CUR, VS_PROBE, ifaceNum, probe, 0, probe.size, CTRL_TIMEOUT)
-if (len <= 0) len = c.controlTransfer(REQ_IN, UVC_GET_DEF, VS_PROBE, ifaceNum, probe, 0, probe.size, CTRL_TIMEOUT)
-if (len <= 0) { probe = ByteArray(34); len = 34 }
-if (len < 26) len = 34
+// uvc/UvcCamera.kt :: probeAndCommit()
+val base = ByteArray(34)
+var len = ioIn("GET_CUR(probe)", UVC_GET_CUR, VS_PROBE, 34, base)   // 基底
+if (len <= 0) len = ioIn("GET_DEF(probe)", UVC_GET_DEF, VS_PROBE, 34, base)
+...
+// 原厂在 probe 前把 GET_CUR/MIN/MAX 来回读两轮；18..25 以 GET_MAX 为准
+repeat(2) {
+    ioIn("GET_CUR", ...); val nMin = ioIn("GET_MIN", ...); val nMax = ioIn("GET_MAX", ...)
+    if (nMax >= 26) { baseMaxFrame = u32(maxb, 18); baseMaxPayload = u32(maxb, 22) }
+}
+putU32(base, 18, baseMaxFrame)      // 19,693,440（原厂 SET_CUR 里的字节）
+putU32(base, 22, baseMaxPayload)    // 19,693,452
 
-probe[0] = 1                       // bmHint = 1
-probe[1] = 0
-probe[2] = f.index.toByte()        // bFormatIndex
-probe[3] = fr.index.toByte()       // bFrameIndex
-putU32(probe, 4, fr.defaultInterval)
-putU32(probe, 18, max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height)))
-val payload = if (vsEpIn != null) max(16384, vsEpIn!!.maxPacketSize * 32) else 16384
-putU32(probe, 22, payload)         // dwMaxPayloadTransferSize
-
-var ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_PROBE, ifaceNum, probe, 0, len, CTRL_TIMEOUT)
-if (ret < 0 && len > 26) {         // 回退 UVC 1.0 的 26 B
-    ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_PROBE, ifaceNum, probe, 0, 26, CTRL_TIMEOUT)
+fun buildProbe(frameIndex: Int) = base.copyOf().apply {
+    this[0] = 1; this[1] = 0
+    this[2] = f.index.toByte()
+    this[3] = frameIndex.toByte()
+    putU32(this, 4, fr.defaultInterval)
 }
 
+setProbe("warm#3", 3)               // 热身档（抓包 105–118 行）
+readRound("warm"); readRound("warm+")
+setProbe("target#${fr.index}", fr.index)   // 目标档（119–125 行）
+readRound("target"); readRound("target+")
+setProbe("target#${fr.index}#final", fr.index)  // 再发一次（126 行）
 val back = ByteArray(34)
-val n = c.controlTransfer(REQ_IN, UVC_GET_CUR, VS_PROBE, ifaceNum, back, 0, back.size, CTRL_TIMEOUT)
-val commitSrc = if (n > 0) back else probe
-ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0, len, CTRL_TIMEOUT)
+val n = ioIn("GET_CUR(probe,back)", UVC_GET_CUR, VS_PROBE, 34, back)
+ioOut("SET_CUR(commit)", VS_COMMIT, if (n >= 26) back else buildProbe(fr.index), 34)
 ```
 
 > 最强诊断行是 **`probe result:`**——它告诉你设备最终认可了哪个 format/frame/maxFrame。
+> 例：`probe result: bFormatIndex=1 bFrameIndex=4 maxVideoFrame=19693440 maxPayload=19693452`
+> 与原厂 SET_CUR 的字节完全一致。
 > 失败时按这个顺序降级：34 B → 26 B → `bmHint=0` → 改 `dwMaxPayloadTransferSize`。
+
+### 5.3 收流：单 URB 上限 16 KiB（本轮真正的坑）
+
+**现象**：probe/commit 全部成功（`rc=34`），但读线程里 `bulkTransfer` 立刻返回 -1：
+
+```
+15:45:02.313 UvcCamera: bulkProbe len=460822 n=-1 dt=130ms
+15:45:02.314 UvcCamera: bulkProbe len=512    n=512 dt=1ms 0c0fd9750000d9750000d975   ← UVC header!
+15:45:02.315 UvcCamera: bulkProbe len=16384  n=16384 dt=0ms acacaeadacacaeadacacacaa
+15:45:02.316 UvcCamera: bulkProbe len=460822 n=-1 dt=1ms
+```
+
+- 512 / 16384 都能拿到数据（而且首字节就是 `0c 0f`，说明设备一直在出流）；
+- 只有 **460822** 失败，且 `dt≈0` ——这不是"设备没数据"，是 URB 提交被拒。
+
+**原因**：Android usbfs 单次 URB 最多 **16384 B**（与 libusb 的
+`MAX_BULK_BUFFER_LENGTH` 一致）。原厂 libusb 能写 `transferBufferSize=460822`，
+是因为 **libusb 内部把它拆成 ~29 个 16 KiB URB 再重组**，对 App 隐藏了拆分。
+`UsbDeviceConnection.bulkTransfer` 不拆，直接把 460822 交给内核 → `-EINVAL/-1`。
+
+**修法**：读线程改成每次 `bulkTransfer(ep, 16384)`，用 1 帧 + 1 chunk 的
+`rxBuf` 做字节流组帧（§6）。改完后 Pixel 上稳定 **29.7–30.4 fps**。
+
+> 该上限与 "URB 尺寸 = frameSize+22" 不矛盾：460822 是**协议层面的逻辑帧长**，
+> 16 KiB 是**主机侧单次 USB 请求**的限制。两者一个用于组帧，一个用于读。
 
 ---
 
-## 6. 帧同步算法
+## 6. 帧同步算法（16 KiB 分块 + 字节流组帧）
 
-真机行为是"一次 bulk 正好一帧"，但代码不能假设永远如此。下面是
-[`readLoop()`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcCamera.kt#L663-L743) 的判定逻辑：
+设备侧行为（本轮实测 + 原厂抓包一致）：
+
+- 一帧 = **12 B header + 460800 B 净荷**，**整帧只有 1 个 header**，
+  `bmHeaderInfo` 的 bit1(EOF)=1（样本 `0c 0f d9 75 00 00 d9 75 00 00 d9 75`）；
+- header 之后是连续净荷，后续 16 KiB 块里没有 header（首字节直接是亮度值）；
+- 帧与帧首尾相接，没有 gap。
+
+[`readLoop()`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcCamera.kt) 的逻辑：
 
 ```
 循环:
-  n = bulkTransfer(ep, transferBuf, urbSize, timeout=1000)
+  n = bulkTransfer(ep, chunkBuf, 16384, timeout=1000)
   if n < 0:
       若耗时很短（< 500 ms）→ fastFails++；连续 5 次 → 报错退出（设备拔了/接口被抢）
       否则是"设备在线但没数据" → 限流日志，继续
       continue
 
-  hdrLen   = buf[0]
-  hdrInfo  = buf[1]
-  errBit   = hdrInfo & 0x40
-  hdrOk    = hdrLen in 2..12 && hdrLen <= n
-
-  if !hdrOk || errBit:
-      if inSync: 追加 buf[0..n]          // 帧中间丢了 header，靠长度兜底
-      else:      丢弃 + onInvalidUrb()   // 流从帧中间开始，等下一个 0x0C
-      continue
-
-  if !inSync: frameLen = 0; inSync = true
-  追加 buf[hdrLen..n]
-  if hdrInfo & 0x02:                     // EOF
-      deliver(); inSync = false
-  else if frameLen >= frameSize:
-      deliver()                          // 设备没打 EOF 时的兜底
+  把 chunk 追加到 rxBuf（1 帧 + 1 chunk 的环形/线性缓冲）
+  解析 rxBuf:
+      未同步:
+          逐字节找 header（0x0C + EOF=1 + ERR=0 + SCR/PTS 自洽）
+          找到前的半帧全部丢弃（流可能从帧中间开始）
+      已同步:
+          若已收满 hdrLen + frameSize → 整块拷进 frameBuf → deliver()
+          否则等下一块
+          交帧后校验下一帧起点仍是合法 header，不是就重新同步
+  把已消费字节移出 rxBuf
 ```
 
 三条设计原则：
 
-1. **只认合法 header**。没有 `bHeaderLength ∈ 2..12` 就绝不把数据当像素画——
-   旧版的"raw 兜底"会把固件垃圾流画成彩色噪点，是用户看到"花屏"的真正原因。
-2. **未同步时丢弃，不同步时追加**。流可能从帧中间开始（打开摄像头时设备已经在发），
-   第一个合法 header 之前的数据必须丢，否则整帧永远错位。
-3. **连续 10 个无效 URB 上报一次**，文案直接告诉用户"固件媒体流水线卡死，拔插重灌"，
-   而不是让 UI 显示 "device idle"。
+1. **只认合法 header**，且用 header 自身的冗余位做校验：
+   `bHeaderLength ∈ 2..12`、EOF=1、ERR=0、带 SCR 时 `SCR[0..1] == PTS[0..1]`。
+   误判概率 ~1e-10，远低于"扫 0x0C"（后者在 460 KB 里平均会误判十几次）。
+2. **未同步时丢弃**。打开摄像头时设备早就在发，第一块从帧中间开始是常态；
+   不丢就会整帧永久错位 → 彩色噪点/斜移。
+3. **同步后按长度切帧，不依赖 EOF 位置**。本设备 EOF 打在帧首的 header 上，
+   按 `hdrLen + frameSize` 切才稳；下一帧 header 校验用来发现漏字节。
 
-> 当前实现**没有用 FID 做连续性校验**。如果将来遇到"每帧固定偏移几字节"的设备，
-> 可以加：同一帧内 FID 应保持不变，变了但没见 EOF → 丢弃当前帧重新同步。
+> 连续丢弃 > 4 MB 仍没同步 → 回调一次 `onError`（"固件媒体流水线可能已卡死"），
+> 而不是无限刷日志。真正的"垃圾流"（`n == 缓冲区大小`、首字节是亮度值）会命中这条。
 
 ---
 
-## 7. 实测数据
+## 7. 实测数据（2026-11-22，Pixel 10 Pro Fold / 2E09:0030）
 
 | 项 | 值 |
 |---|---|
 | 协商结果 | `format=YV12(idx=1) 640x480 frameIdx=4 maxFrame=460800B interval=333333(=30.0fps)` |
-| 缓冲 | `frameSize=460800 urbSize=460822` |
-| 单次 bulk | `actual=460812`（460800 + 12），首字节 `0C` |
-| 帧率 | 我们 App **20.0 → 25.0 fps**；原厂同设备同样约 20 fps（不是解码瓶颈） |
-| 解码 | YV12→ARGB 纯 Kotlin 约 8–15 ms/帧；Bitmap A/B 双缓冲，每帧零分配 |
-| 并发 | 投屏 25 fps 同时 UVC 24.6 fps（实测不互斥） |
-| 原始抓包 | 30 个 URB × (460812 + 4 B 长度前缀) = 13,824,480 B，与设备文件大小一致 |
+| probe 回读 | `bFormatIndex=1 bFrameIndex=4 maxVideoFrame=19693440 maxPayload=19693452`（= 原厂 SET_CUR 字节） |
+| 缓冲 | `frameSize=460800 chunk=16384 rxBuf≈477 KB urbSize=460822（仅日志）` |
+| 单次 bulk | `n = 16384`（分块上限），一帧由 ~29 块组成 |
+| 帧率（App 广播 `uvc_start`） | **29.7–30.4 fps**，首秒 17.8（组帧/同步） |
+| 帧率（UI「打开摄像头 → 枚举/启动」） | **29.8–30.4 fps**；停止再启动同样 30 fps |
+| 解码 | YV12→ARGB 纯 Kotlin；Bitmap A/B 双缓冲，每帧零分配 |
+| 整机 CPU | 约 53%（30 fps 解码 + Compose 预览同跑） |
+| 截图 | `/sdcard/Android/data/com.wzqvip.glxsscast/files/Pictures/uvc/*.png`（UI「拍照」/广播 `uvc_snapshot`） |
+
+本次真机日志（节选）：
+
+```
+15:53:20.660 UvcCamera: SET_CUR(commit) frame=4 len=34 -> 34
+15:53:20.662 UvcCamera: vendor post-commit: xu(0x0606) x2 -> true
+15:53:20.663 UvcCamera: negotiated: format=YV12(idx=1) 640x480 frameIdx=4 maxFrame=460800B urb=460822B interval=333333(=30.0fps)
+15:53:21.678 UvcCamera: fps=17.7 (YV12 640x480)
+15:53:22.704 UvcCamera: fps=30.2 (YV12 640x480)
+15:53:23.732 UvcCamera: fps=30.1 (YV12 640x480)
+```
+
+逐块实测（`bulkProbe`，见 §5.3）：
+
+```
+len=512    n=512    dt=1ms   head=0c0fd9750000d9750000d975   ← 合法 12 B header
+len=16384  n=16384  dt=0ms                                  ← 帧内净荷
+len=460822 n=-1     dt=1ms                                  ← 超过单 URB 上限
+```
 
 实拍对比（同一时刻）：
 
@@ -359,7 +460,7 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 |---|---|
 | ![yv12](img/uvc-frame-yv12.jpg) | ![i420](img/uvc-frame-i420.jpg) |
 
-恢复后 UVC 25 fps + 投屏并发：
+2026-11-21 恢复后 UVC 25 fps + 投屏并发（历史截图；2026-11-22 分块组帧后为 30 fps）：
 
 ![recovered](img/uvc-ours-25fps.jpg)
 
@@ -368,30 +469,43 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 ## 8. 坑与注意事项
 
 1. **header 是 12 B 不是 2 B**。按 2 B 取像素 = 整帧斜移 10 B，看起来像"彩虹噪点"。
-2. **URB 尺寸要按帧算**：`frameSize + 22`。太小会截断；太大（例如旧版 461824）会让异常固件
-   把整个 URB 灌满，`n` 恒等于缓冲区大小，反而掩盖了"没有帧边界"这个关键信号。
-3. **不要在未同步时追加数据**。流从帧中间开始时，追加 = 永久错位。
-4. **U/V 顺序**：YV12 是 `Y|V|U`；I420 是 `Y|U|V`。偏色先换这个，不要先怀疑白平衡。
-5. **alt setting 别照抄教程**：本设备 alt=0 就带端点；强行 `setInterface(alt=1)` 可能直接失败。
-6. **claim 顺序**：VC(if0) → VS(if1)；同时 claim HID(if2)（否则后面读版本会 -1，见 [ch-hid.md](ch-hid.md)）。
-7. **`setInterface` 返回 false 不等于没生效**：日志记录后继续跑，真没数据再排查。
-8. **Android 的 `bulkTransfer` 用 -1 表示"超时"和"设备错误"两种事**：用耗时区分，
-   否则拔线后会变成 100% CPU 热循环（实测 3 秒 1500 万次日志）。
-9. **不要同时开两个 App 抢 UVC**：原厂 App 和我们 App 同时 claim 会互相踢掉 alt，表现为 0 帧。
-10. **固件半死时 UVC 一定 0 帧**，而控制面/状态查询都正常。别改代码，先按
+2. **单次 `bulkTransfer` 必须 ≤ 16384 B**（usbfs 单 URB 上限）。超过不会超时，
+   而是**立刻 -1**（`dt≈0`），很容易误判成"设备没出流 / 接口被抢"。
+   原厂 libusb 的 `transferBufferSize=460822` 是 libusb 内部拆 URB，不能直接照抄到
+   Android 的 `bulkTransfer`。这是本轮"probe/commit 都成功但 0 帧"的真正原因。
+3. **一帧只有一个 header**：`0C 0F|0E` 在帧首，后面 460800 B 净荷里没有 header。
+   必须按 `hdrLen + frameSize` 切帧；指望"每块都以 0C 开头"会永远组不出帧。
+4. **不要在未同步时追加数据**。流从帧中间开始时，追加 = 永久错位。
+   同步时用 header 的 `SCR[0..1]==PTS[0..1]` 做校验，别只扫 `0x0C`。
+5. **U/V 顺序**：YV12 是 `Y|V|U`；I420 是 `Y|U|V`。偏色先换这个，不要先怀疑白平衡。
+6. **alt setting 别照抄教程**：本设备 alt=0 就带端点；强行 `setInterface(alt=1)` 可能直接失败。
+7. **claim 顺序**：VC(if0) → **HID(if2)** → VS(if1)（HID 不 claim 时读版本会 -1，
+   部分固件也不出流，见 [ch-hid.md](ch-hid.md)）。
+8. **`setInterface` 返回 false 不等于没生效**：日志记录后继续跑，真没数据再排查。
+9. **Android 的 `bulkTransfer` 用 -1 表示"超时"和"设备错误"两种事**：用耗时区分，
+   否则拔线后会变成 100% CPU 热循环（实测 3 秒 1500 万次日志）。区分出的
+   `dt≈0` 还要再分两种：尺寸超限（本文）和端点/接口被抢。
+10. **不要同时开两个 App 抢 UVC**：原厂 App 和我们 App 同时 claim 会互相踢掉 alt，表现为 0 帧。
+11. **固件半死时 UVC 一定 0 帧**，而控制面/状态查询都正常。别改代码，先按
     [ch-firmware.md §7](ch-firmware.md#7-半死现象与恢复-sop) 重灌。
-11. **1080p 档位**：净荷 3,110,400 B；20 fps 就是 62 MB/s，已经超过 USB 2.0 HS 的实际上限，
+12. **1080p 档位**：净荷 3,110,400 B；20 fps 就是 62 MB/s，已经超过 USB 2.0 HS 的实际上限，
     还要和投屏抢带宽。当前代码支持改 `TARGET_W/H`，但没有实测，标【未】。
-12. **厂商宣称的 800 万像素拍照 / 720p 录像不是这条 UVC 流**（见 [apk-versions.md §6](apk-versions.md#6-代码功能差异184--237)），
+13. **MJPEG 档不是"同样长度的帧"**：JPEG 压缩后帧长可变，本文的"12+frameSize 定长切帧"
+    不适用（`bFrameIndex` 也只暴露 3264×2448 / 4128×3104 两档，均未实测）。
+14. **厂商宣称的 800 万像素拍照 / 720p 录像不是这条 UVC 流**（见 [apk-versions.md §6](apk-versions.md#6-代码功能差异184--237)），
     很可能走另一条 vendor 通道，未逆向。
 
 ---
 
 ## 9. 待验证
 
-- [ ] 1920×1080 / 1280×720 档位的实际帧率与 URB 尺寸（当前只跑 640×480）。
-- [ ] MJPEG（`bFormatIndex=2`）是否真的可用，以及它的 `dwMaxVideoFrameSize`。
-- [ ] `bmFramingInfo` / FID 在长帧（>1 个 URB）时是否需要参与组帧。
-- [ ] 原厂 XU `0x21/0x01 wValue=0x0d0d wIndex=0x0400` 的真实作用（当前不发也能出流）。
+- [ ] 1920×1080 / 1280×720 档位的实际帧率（当前只跑 640×480；1280×720 可试）。
+- [ ] MJPEG（`bFormatIndex=2`）是否真的可用，以及它的 `dwMaxVideoFrameSize`；
+      JPEG 变长帧需要另一种边界判定（按 JPEG SOI/EOI 扫描）。
+- [ ] `bmFramingInfo` / FID 在长帧时是否需要参与组帧（本设备每帧 1 个 header，暂不需要）。
+- [ ] 原厂 XU `0x21/0x01 wValue=0x0d0d` 与 `0x0606` 的真实作用：本轮已照抄发送；
+     对照实验（发/不发）只影响"是否逐字节一致"，不影响出帧。
 - [ ] 相机自动对焦 / 曝光控制（2.3.7 有 `nativeGetmAutoFocus`，UVC PU 控制未试）。
 - [ ] 8 MP 静像与 720p 录像的数据通道。
+- [ ] 30 fps 下整机 CPU ~53%（解码 + Compose 预览），可考虑把 YUV→ARGB 换 `RenderScript`
+      替代 / native / 直接在 `ImageReader` 上做，当前未优化。
