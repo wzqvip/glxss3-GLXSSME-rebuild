@@ -39,6 +39,11 @@
             android:name=".cast.CastService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <!-- 实验/取证入口：exported=false，只能用 root shell 的 am broadcast 显式组件调用 -->
+        <receiver
+            android:name=".diag.DebugReceiver"
+            android:exported="false" />
     </application>
 </manifest>
 

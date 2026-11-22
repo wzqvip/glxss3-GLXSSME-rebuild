@@ -49,13 +49,16 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.wzqvip.glxsscast.audio.AudioEnh
+import com.wzqvip.glxsscast.diag.Oplog
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.lcd.ProductInfo
 import com.wzqvip.glxsscast.record.RecordSource
 import com.wzqvip.glxsscast.record.VideoRecorder
+import com.wzqvip.glxsscast.settings.HidAction
 import com.wzqvip.glxsscast.settings.Prefs
 import com.wzqvip.glxsscast.stress.CpuSampler
+import com.wzqvip.glxsscast.usb.HidSensor
 import com.wzqvip.glxsscast.usb.Peripherals
 import com.wzqvip.glxsscast.usb.UsbLink
 import com.wzqvip.glxsscast.uvc.UvcCamera
@@ -105,6 +108,19 @@ class MainActivity : ComponentActivity() {
     private var autoBrightness by mutableStateOf(false)
     private var hidOn by mutableStateOf(false)
     private var autoReconnect by mutableStateOf(true)
+
+    // ---- HID 传感器 / Fn 按键 ----
+    private var hidSensor: HidSensor? = null
+    private var hidInfo by mutableStateOf("HID 未启动")
+    private var hidHex by mutableStateOf("")
+    private var hidClickAction by mutableStateOf(HidAction.SNAPSHOT)
+    private var hidLongAction by mutableStateOf(HidAction.CAST_TOGGLE)
+    private var hidMode by mutableStateOf(HidSensor.Mode.POLL)
+
+    // ---- 崩溃现场 ----
+    private var crashInfo by mutableStateOf("")
+    private var crashDialog by mutableStateOf(false)
+    private var crashText by mutableStateOf("")
 
     /** 用户主动点「断开」后暂停自动重连（插拔/手动连接会恢复） */
     private var reconnectPaused = false
@@ -176,6 +192,10 @@ class MainActivity : ComponentActivity() {
             if (intent.action != UsbLink.ACTION_PERMISSION) return
             val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
             val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            Oplog.logf(
+                "CONN", "USB permission result dev=%s granted=%b",
+                dev?.deviceName ?: "null", granted
+            )
             when {
                 dev == null -> status = "USB 权限被拒绝"
                 !granted -> status = "USB 权限被拒绝"
@@ -200,6 +220,8 @@ class MainActivity : ComponentActivity() {
                     val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                     if (dev != null && dev.vendorId == 0x03E7) {
                         status = "检测到引导模式设备"
+                        // 掉回引导模式 = 固件崩溃复位；先把最后 200 条操作固化下来
+                        Oplog.dumpCrash("boot_mode_03e7(attach)")
                         autoFlashBoot(dev)
                     }
                     if (dev != null && dev.vendorId == UsbLink.VID) {
@@ -210,6 +232,7 @@ class MainActivity : ComponentActivity() {
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val dev = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
                     if (dev == null || dev.vendorId == UsbLink.VID) {
+                        Oplog.dumpCrash("usb_detached(productId=${dev?.productId})")
                         usb.close()
                         status = "设备已断开（等待自动重连…）"
                     }
@@ -221,6 +244,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         usb = UsbLink.get(this)
+        Oplog.init(this)
         prefs = Prefs.get(this)
 
         // ---- 恢复持久化设置 ----
@@ -232,9 +256,13 @@ class MainActivity : ComponentActivity() {
         applyAdjust(zoom, offsetX, offsetY, persist = false)
         autoBrightness = prefs.autoBrightness
         autoReconnect = prefs.autoReconnect
-        hidOn = prefs.hidEnabled && Peripherals.hidRunning
+        hidClickAction = HidAction.from(prefs.hidClickAction)
+        hidLongAction = HidAction.from(prefs.hidLongAction)
+        hidMode = if (prefs.hidMode == "interrupt") HidSensor.Mode.INTERRUPT else HidSensor.Mode.POLL
+        hidOn = false
         volume = AudioEnh.volume(this)
         refreshAudioDevices()
+        updateCrashInfo()
 
         // UVC 设备需要 CAMERA 权限才会授予 USB 访问
         if (androidx.core.content.ContextCompat.checkSelfPermission(
@@ -273,6 +301,71 @@ class MainActivity : ComponentActivity() {
 
         startAutoReconnectLoop()
         setContent { App() }
+        // 实验/自动化脚本用：`am start ... --es cmd cast` 这类命令在 onCreate 后延迟执行
+        window.decorView.postDelayed({ handleDebugIntent(intent) }, 800)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDebugIntent(intent)
+    }
+
+    /**
+     * 实验 harness 入口（`diag.DebugReceiver` / `adb am start --es cmd ...`）。
+     *
+     * 只服务长跑实验与取证：投屏需要系统授权对话框，所以这里只负责把
+     * `createScreenCaptureIntent()` 弹出来，授权仍需点一下。
+     */
+    private fun handleDebugIntent(intent: Intent?) {
+        val cmd = intent?.getStringExtra("cmd") ?: return
+        Oplog.logf("DEBUG", "intent cmd=%s", cmd)
+        when (cmd) {
+            "cast" -> {
+                if (com.wzqvip.glxsscast.cast.CastService.running) {
+                    status = "投屏已在运行"
+                } else if (!usb.isOpen) {
+                    status = "投屏前先连接眼镜"
+                } else {
+                    status = "请求投屏授权…"
+                    runCatching { mpLauncher.launch(projectionManager.createScreenCaptureIntent()) }
+                        .onFailure { status = "投屏授权启动失败: ${it.message}" }
+                }
+            }
+            "record_start" -> startRecording()
+            "record_stop" -> stopRecording()
+            "hid_start" -> startHidSensor()
+            "hid_stop" -> stopHidSensor()
+            "oplog_dump" -> {
+                Oplog.dumpCrash("manual")
+                updateCrashInfo()
+                status = "已写 crash_last.txt"
+            }
+            "status" -> readStatusFields()
+            else -> status = "未知调试命令: $cmd"
+        }
+    }
+
+    private fun updateCrashInfo() {
+        crashInfo = buildString {
+            append("oplog ${Oplog.entryCount()} 条 / ${Oplog.fileSize() / 1024} KB")
+            val reason = Oplog.lastCrashReason
+            if (reason != null) append(" · 上次现场: $reason")
+            else append(" · 暂无 crash 现场")
+        }
+    }
+
+    private fun openCrashSnapshot() {
+        val f = java.io.File(filesDir, "crash_last.txt")
+        crashText = if (!f.exists()) {
+            "还没有 crash_last.txt（未发生掉线/崩溃，或还没手动 dump）。\n\n" +
+                "oplog.txt 路径: ${java.io.File(filesDir, "oplog.txt").absolutePath}"
+        } else {
+            runCatching { f.readLines().takeLast(200).joinToString("\n") }
+                .getOrElse { "读取失败: ${it.message}" }
+        }
+        updateCrashInfo()
+        crashDialog = true
     }
 
     override fun onDestroy() {
@@ -308,6 +401,7 @@ class MainActivity : ComponentActivity() {
     // ==================================================================
 
     private fun autoFlashBoot(dev: UsbDevice) {
+        Oplog.logf("CONN", "autoFlashBoot dev=%s hasPerm=%b", dev.deviceName, usb.hasPermission(dev))
         if (!usb.hasPermission(dev)) { status = "引导模式设备，请求权限…"; usb.requestPermission(dev); return }
         val base = getExternalFilesDir(null)?.absolutePath ?: "/sdcard/Android/data/com.wzqvip.glxsscast/files"
         val img = base + "/G25_MainFW_1.9.1.img"
@@ -350,8 +444,8 @@ class MainActivity : ComponentActivity() {
                 usb.ensureHid()
                 val ab = autoBrightness
                 LcdControl.setAutoBrightness(c, ab)
-                if (prefs.hidEnabled && !Peripherals.hidRunning) Peripherals.startHid(usb)
             }
+            if (prefs.hidEnabled && hidSensor?.running != true) startHidSensor()
         }
     }
 
@@ -624,7 +718,16 @@ class MainActivity : ComponentActivity() {
         status = "枚举 UVC 档位…"
         lifecycleScope.launch {
             val res = withContext(Dispatchers.IO) {
-                if (!cam.prepare(dev)) {
+                // 单 owner：UVC 复用 UsbLink 的连接（不再 open(dev, null) 拿第二个 fd）
+                if (!usb.isOpen) {
+                    val opened = usbMutex.withLock { usb.open(dev) }
+                    if (!opened) {
+                        return@withContext UvcOpenResult(
+                            emptyList(), null, "USB 打开失败（${cam.lastError() ?: "设备被占用"}）"
+                        )
+                    }
+                }
+                if (!cam.prepare(dev, usb.connection)) {
                     return@withContext UvcOpenResult(emptyList(), null, "打开失败: ${cam.lastError()}")
                 }
                 val opts = cam.options()
@@ -665,19 +768,96 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun toggleHid() {
-        if (Peripherals.hidRunning) {
-            Peripherals.stopHid()
-            prefs.hidEnabled = false
-            status = "HID 已停止（共 ${Peripherals.hidPackets} 包）"
-        } else if (usb.isOpen) {
-            Peripherals.startHid(usb)
-            prefs.hidEnabled = true
-            status = "HID 监听中"
-        } else {
-            status = "未连接"
+    // ==================================================================
+    // HID 传感器 / Fn 按键
+    // ==================================================================
+
+    private fun startHidSensor() {
+        if (!usb.isOpen) {
+            status = "先连接眼镜再启动 HID"
+            return
         }
-        hidOn = Peripherals.hidRunning
+        val s = hidSensor ?: HidSensor(usb).also { sensor ->
+            hidSensor = sensor
+            sensor.onReport = { r ->
+                runOnUiThread {
+                    hidInfo = r.sensorLine()
+                    hidHex = r.hex()
+                }
+            }
+            sensor.onEvent = { e ->
+                runOnUiThread { handleHidEvent(e) }
+            }
+        }
+        if (s.start(hidMode)) {
+            prefs.hidEnabled = true
+            prefs.hidMode = if (s.mode == HidSensor.Mode.POLL) "poll" else "interrupt"
+            hidOn = true
+            status = "HID 传感器已启动（${s.mode.label}，300ms）"
+        } else {
+            status = "HID 启动失败: ${s.lastError}"
+        }
+    }
+
+    private fun stopHidSensor() {
+        hidSensor?.stop()
+        prefs.hidEnabled = false
+        hidOn = false
+        status = "HID 已停止"
+    }
+
+    /** 按键事件（已在主线程）：按配置执行动作 */
+    private fun handleHidEvent(e: HidSensor.Event) {
+        val action = when (e) {
+            is HidSensor.Event.Click -> hidClickAction
+            is HidSensor.Event.LongPress -> hidLongAction
+        }
+        Oplog.logf("HID", "button %s → %s", e.javaClass.simpleName, action.id)
+        when (action) {
+            HidAction.NONE -> status = "Fn 按键（未绑定动作）"
+            HidAction.SNAPSHOT -> lifecycleScope.launch {
+                val f = withContext(Dispatchers.IO) { activeUvc?.saveSnapshot() }
+                status = if (f != null) "Fn 单击：已拍照 ${f.absolutePath}"
+                else "Fn 单击：拍照失败（UVC 没有帧 / 未打开摄像头）"
+            }
+            HidAction.CAST_TOGGLE -> {
+                if (com.wzqvip.glxsscast.cast.CastService.running) {
+                    stopCastService()
+                    status = "Fn 长按：停止投屏"
+                } else if (!usb.isOpen) {
+                    status = "Fn 长按：未连接眼镜，无法投屏"
+                } else {
+                    status = "Fn 长按：请求投屏授权…"
+                    runCatching { mpLauncher.launch(projectionManager.createScreenCaptureIntent()) }
+                        .onFailure { status = "投屏授权启动失败: ${it.message}" }
+                }
+            }
+            HidAction.RECORD_TOGGLE -> {
+                if (recorder.isRecording) stopRecording() else startRecording()
+            }
+        }
+    }
+
+    private fun cycleHidClickAction() {
+        hidClickAction = hidClickAction.next()
+        prefs.hidClickAction = hidClickAction.id
+        status = "Fn 单击 = ${hidClickAction.label}"
+    }
+
+    private fun cycleHidLongAction() {
+        hidLongAction = hidLongAction.next()
+        prefs.hidLongAction = hidLongAction.id
+        status = "Fn 长按 = ${hidLongAction.label}"
+    }
+
+    private fun cycleHidMode() {
+        val next = if (hidMode == HidSensor.Mode.POLL) HidSensor.Mode.INTERRUPT else HidSensor.Mode.POLL
+        val wasRunning = hidSensor?.running == true
+        if (wasRunning) stopHidSensor()
+        hidMode = next
+        prefs.hidMode = if (next == HidSensor.Mode.POLL) "poll" else "interrupt"
+        if (wasRunning) startHidSensor()
+        status = "HID 读法 = ${next.label}"
     }
 
     // ==================================================================
@@ -952,8 +1132,31 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            if (crashDialog) {
+                AlertDialog(
+                    onDismissRequest = { crashDialog = false },
+                    title = { Text("崩溃现场 crash_last.txt") },
+                    text = {
+                        Column(
+                            Modifier
+                                .heightIn(max = 460.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                crashText,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { crashDialog = false }) { Text("关闭") }
+                    }
+                )
+            }
+
             Scaffold(
-                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.2") }) }
+                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.3") }) }
             ) { pad ->
                 Column(
                     Modifier
@@ -1131,7 +1334,8 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 "未投屏"
                             }
-                            hidOn = Peripherals.hidRunning
+                            hidOn = hidSensor?.running == true
+                            updateCrashInfo()
                             // 通知栏「画面模式」改了服务侧模式后，回 App 时同步显示
                             val svcMode = com.wzqvip.glxsscast.cast.CastService.fillMode
                             if (svcMode != fillMode) fillMode = svcMode
@@ -1315,15 +1519,58 @@ class MainActivity : ComponentActivity() {
                     ) { Text("发送黑屏") }
 
                     HorizontalDivider()
-                    Text("外设", style = MaterialTheme.typography.titleSmall)
+                    Text("外设 · HID 传感器 / Fn 按键（28B 报告）", style = MaterialTheme.typography.titleSmall)
                     Button(
-                        onClick = { toggleHid() },
+                        onClick = { if (hidOn) stopHidSensor() else startHidSensor() },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
                             if (hidOn)
-                                "停止 HID（已收 ${Peripherals.hidPackets}）"
-                            else "开始 HID 监听"
+                                "停止 HID（已读 ${hidSensor?.pollCount ?: 0} 次 / 失败 ${hidSensor?.failCount ?: 0}）"
+                            else "启动 HID 传感器（0xA1/0x16 · 300ms）"
+                        )
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { cycleHidMode() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("读法: ${hidMode.label}") }
+                        OutlinedButton(
+                            onClick = { cycleHidClickAction() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("单击: ${hidClickAction.label}") }
+                    }
+                    OutlinedButton(
+                        onClick = { cycleHidLongAction() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("长按: ${hidLongAction.label}") }
+                    OutlinedButton(
+                        onClick = {
+                            lifecycleScope.launch {
+                                val ok = withContext(Dispatchers.IO) {
+                                    val c = usb.connection ?: return@withContext false
+                                    // 0x10 光感 / 0x11 罗盘 / 0x12 加速度 / 0x14 陀螺
+                                    LcdControl.enableSensors(c)
+                                }
+                                status = if (ok) "传感器已使能（0x10/0x11/0x12/0x14）"
+                                else "传感器使能失败（未连接/未 ACK）"
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("使能传感器（让 acc / gyro 非零）") }
+                    Text(
+                        hidInfo,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    if (hidHex.isNotEmpty()) {
+                        Text(
+                            "raw: $hidHex",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
                         )
                     }
 
@@ -1471,6 +1718,31 @@ class MainActivity : ComponentActivity() {
                             style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace
                         )
+                    }
+
+                    HorizontalDivider()
+                    Text("崩溃现场 / 操作日志", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        crashInfo,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { openCrashSnapshot() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("查看 crash_last.txt") }
+                        Button(
+                            onClick = {
+                                Oplog.dumpCrash("manual")
+                                updateCrashInfo()
+                                status = "已写入 crash_last.txt（最后 200 条）"
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("立即 dump") }
                     }
 
                     HorizontalDivider()

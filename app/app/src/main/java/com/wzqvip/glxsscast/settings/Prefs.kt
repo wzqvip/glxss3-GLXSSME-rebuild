@@ -31,6 +31,9 @@ class Prefs private constructor(ctx: Context) {
         private const val KEY_UVC_H = "uvc_h"
         private const val KEY_AUTO_BRIGHT = "auto_brightness"
         private const val KEY_HID = "hid_enabled"
+        private const val KEY_HID_MODE = "hid_mode"
+        private const val KEY_HID_CLICK = "hid_click_action"
+        private const val KEY_HID_LONG = "hid_long_action"
         private const val KEY_AUTO_RECONNECT = "auto_reconnect"
 
         @Volatile private var inst: Prefs? = null
@@ -89,6 +92,21 @@ class Prefs private constructor(ctx: Context) {
     var hidEnabled: Boolean
         get() = sp.getBoolean(KEY_HID, false)
         set(v) { sp.edit().putBoolean(KEY_HID, v).apply() }
+
+    /** HID 读法：poll（0xA1/0x16，默认）/ interrupt（0x83 备选） */
+    var hidMode: String
+        get() = sp.getString(KEY_HID_MODE, "poll") ?: "poll"
+        set(v) { sp.edit().putString(KEY_HID_MODE, v).apply() }
+
+    /** 单击绑定（默认拍照：UVC snapshot） */
+    var hidClickAction: String
+        get() = sp.getString(KEY_HID_CLICK, "snapshot") ?: "snapshot"
+        set(v) { sp.edit().putString(KEY_HID_CLICK, v).apply() }
+
+    /** 长按绑定（默认投屏开关） */
+    var hidLongAction: String
+        get() = sp.getString(KEY_HID_LONG, "cast") ?: "cast"
+        set(v) { sp.edit().putString(KEY_HID_LONG, v).apply() }
 
     var autoReconnect: Boolean
         get() = sp.getBoolean(KEY_AUTO_RECONNECT, true)

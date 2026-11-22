@@ -12,8 +12,8 @@ android {
         applicationId = "com.wzqvip.glxsscast"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.1.3"
     }
 
     buildTypes {
@@ -32,6 +32,8 @@ android {
     }
     buildFeatures {
         compose = true
+        // Oplog 的 crash 头要带 versionName/versionCode（AGP 8 默认不生成 BuildConfig）
+        buildConfig = true
     }
 }
 

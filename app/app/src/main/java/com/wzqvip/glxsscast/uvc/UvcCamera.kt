@@ -12,6 +12,9 @@ import android.hardware.usb.UsbManager
 import android.os.Environment
 import android.os.SystemClock
 import android.util.Log
+import com.wzqvip.glxsscast.diag.Oplog
+import com.wzqvip.glxsscast.lcd.LcdControl
+import com.wzqvip.glxsscast.usb.UsbGate
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -56,11 +59,18 @@ fun interface UvcFrameTap {
  *   以前那种 `rawPayloadMode` 兜底会把垃圾当图像画出来 → 彩色噪点；
  *   现在直接判定为无效数据并报错，不再刷噪点。
  *
- * 与现有 [com.wzqvip.glxsscast.usb.UsbLink] 共存：
- * - 二者各自对同一个 [UsbDevice] 调 `openDevice` 是允许的（都拿独立 fd），
- *   UVC 只 claim INTF1，UsbLink 只 claim INTF3（厂商 LCD），互不冲突；
- * - 如果想让二者共用一个 [UsbDeviceConnection]（更省 fd），把
- *   `UsbLink.connection` 传进 [open] 的 `reuse` 参数即可；此时 [stop] 不会关闭它。
+ * 与 [com.wzqvip.glxsscast.usb.UsbLink] 的关系（0.1.3 起**默认共用同一个连接**）：
+ * - 原厂只 open 一个 fd，LCD/UVC/HID 都在上面 claim/控制；我们以前是 UVC 自己
+ *   `openDevice` 拿第二个 fd，两个 fd 都会 force claim，HID 的 claim 会被互相抢走，
+ *   同设备两个 fd 同时做 bulk（1 MB OUT + 460 KB IN）也是与「原厂不崩」的差异之一。
+ *   现在 UI 调 [prepare] 时传 `UsbLink.connection`（`reuse`），[releaseInternal] 不再
+ *   close 共享连接，也不 release HID（HID 归 UsbLink）；
+ * - 所有控制传输（claim/release/setInterface/probe/commit/CLEAR_HALT）都走 [UsbGate]，
+ *   不会插进 LCD 的 1 MB 帧中间；
+ * - [stop] 的收尾顺序（0.1.3）：停读线程 → `setInterface(alt0)` → `releaseInterface(VS)`
+ *   → 对 EP 0x81 发 `CLEAR_FEATURE(ENDPOINT_HALT)` → 共享连接时不 close。
+ *   之前只做 `setInterface(alt0)` 就 close/复用，端点若被上一次取消的 URB 留在
+ *   HALT/半配置状态，下一次 commit 会“成功但 0 帧”（半死）。
  */
 class UvcCamera(private val ctx: Context) {
 
@@ -202,6 +212,10 @@ class UvcCamera(private val ctx: Context) {
     private var vsAltZero: UsbInterface? = null    // 同 id 的 alt=0，stop 时切回去
     private var vsEpIn: UsbEndpoint? = null
     private var ownsConnection = false
+    /** 共用 UsbLink 的连接（true 时 [releaseInternal] 不 close、不 release HID） */
+    private var sharedConn = false
+    private var vcClaimed: UsbInterface? = null
+    private var vsClaimed = false
     /**
      * 是否已把 VS 接口切到带 bulk IN 的 alt。
      * 不能每次 select() 都重复 setInterface(同一个 alt)：部分固件会因此把刚启动的流复位掉
@@ -243,6 +257,8 @@ class UvcCamera(private val ctx: Context) {
     @Volatile private var fps = 0f
     /** 累计出帧数（压力测试统计用） */
     @Volatile private var totalFrames = 0L
+    /** fps 进 oplog 的节流计数（每 5 秒一条） */
+    private var fpsLogTick = 0
 
     // 双缓冲：每帧不再新建 Bitmap（createBitmap 每帧 1.2MB 分配 + 拷贝）
     private var bmpA: Bitmap? = null
@@ -251,6 +267,8 @@ class UvcCamera(private val ctx: Context) {
 
     val isOpen: Boolean get() = conn != null
     val isRunning: Boolean get() = running
+    /** 读线程是否还活着（设备断开/读循环退出后 running 可能滞后，实验 harness 用它判断僵死状态） */
+    fun isReaderAlive(): Boolean = thread?.isAlive == true
 
     /** 最近一秒的出流帧率（压力测试 / 状态栏显示） */
     fun currentFps(): Float = fps
@@ -353,7 +371,7 @@ class UvcCamera(private val ctx: Context) {
         vsEpIn = foundEp
         Log.i(TAG, "VS iface=#${foundAlt.id} alt=${foundAlt.alternateSetting} ep=0x%02x mps=${foundEp.maxPacketSize}".format(foundEp.address))
 
-        // 2) 打开连接
+        // 2) 打开连接（优先复用 UsbLink 的那个 fd —— 单 owner）
         val c = reuse ?: (usb.openDevice(dev) ?: run {
             lastError = "openDevice() failed"
             Log.e(TAG, lastError!!)
@@ -361,32 +379,50 @@ class UvcCamera(private val ctx: Context) {
         })
         conn = c
         ownsConnection = (reuse == null)
+        sharedConn = (reuse != null)
+        Oplog.logf(
+            "UVC", "prepare %s shared=%b", dev.deviceName, sharedConn
+        )
 
         // 2.5) 也 claim VideoControl 接口（原厂 libuvc 会 claim；部分设备要求先有 VC 才出流）
         val vc = (0 until dev.interfaceCount).map { dev.getInterface(it) }
             .firstOrNull { it.interfaceClass == 0x0e && it.interfaceSubclass == 0x01 }
         if (vc != null) {
-            val ok = c.claimInterface(vc, true)
+            val ok = UsbGate.io("claim:vc") { c.claimInterface(vc, true) }
+            if (ok) vcClaimed = vc
+            Oplog.logf("UVC", "claim VC if=%d -> %b", vc.id, ok)
             Log.i(TAG, "claim VC iface=#${vc.id} alt=${vc.alternateSetting} -> $ok")
         }
 
-        // 2.6) 摘掉内核 hid-generic 对 HID 接口(2)的占用：原厂 App 启动时也会 claim iface2。
-        // 不摘的话 dmesg 持续 `input irq status -75`，且 0xA1/0x16 返回 -1。
-        val hid = (0 until dev.interfaceCount).map { dev.getInterface(it) }
-            .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_HID }
-        if (hid != null) {
-            val ok = c.claimInterface(hid, true)
-            Log.i(TAG, "claim HID iface=#${hid.id} -> $ok")
+        // 2.6) 摘掉内核 hid-generic 对 HID 接口(2)的占用。
+        // 共用一个 fd 时 HID 已经由 UsbLink claim 过了，这里不要再碰：
+        // 重复 claim 没有意义，而 release 会把 UsbLink 的 claim 一起放掉。
+        if (!sharedConn) {
+            val hid = (0 until dev.interfaceCount).map { dev.getInterface(it) }
+                .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_HID }
+            if (hid != null) {
+                val ok = UsbGate.io("claim:hid_uvc") { c.claimInterface(hid, true) }
+                Oplog.logf("UVC", "claim HID if=%d -> %b", hid.id, ok)
+                Log.i(TAG, "claim HID iface=#${hid.id} -> $ok")
+            }
         }
 
         // 3) claim + 切 alt setting
-        if (!c.claimInterface(foundAlt, true)) {
+        val vsOk = UsbGate.io("claim:vs") { c.claimInterface(foundAlt, true) }
+        if (!vsOk) {
             lastError = "claimInterface(#${foundAlt.id} alt=${foundAlt.alternateSetting}) failed"
+            Oplog.logf("UVC", "claim VS if=%d -> false", foundAlt.id)
             Log.e(TAG, lastError!!)
             releaseInternal()
             return false
         }
-        if (!c.setInterface(foundAlt)) {
+        vsClaimed = true
+        val altOk = UsbGate.io("set_alt:vs") { c.setInterface(foundAlt) }
+        Oplog.logf(
+            "UVC", "claim VS if=%d alt=%d -> true; setInterface(alt%d)=%b",
+            foundAlt.id, foundAlt.alternateSetting, foundAlt.alternateSetting, altOk
+        )
+        if (!altOk) {
             // 少数机型要求先 claim alt0 再切 alt1；失败时也继续试（有的设备 setInterface 返回 false 但其实生效）
             Log.w(TAG, "setInterface(alt=${foundAlt.alternateSetting}) returned false, continuing anyway")
         }
@@ -457,9 +493,21 @@ class UvcCamera(private val ctx: Context) {
             return false
         }
         lastError = null
-        // 停止过流之后 alt 已被切回 0，这里重新切到带 bulk IN 的 alt；已经切过就不重复（会复位流）
+        // stop() 会 release VS，这里按需重新 claim；已经切过 alt 就不重复（会复位流）
+        if (!vsClaimed) {
+            val ok = UsbGate.io("claim:vs") { c.claimInterface(alt, true) }
+            vsClaimed = ok
+            altSelected = false
+            Oplog.logf("UVC", "re-claim VS if=%d -> %b", alt.id, ok)
+            if (!ok) {
+                lastError = "claimInterface(#${alt.id}) failed"
+                return false
+            }
+        }
         if (!altSelected) {
-            if (!c.setInterface(alt)) {
+            val ok = UsbGate.io("set_alt:vs") { c.setInterface(alt) }
+            Oplog.logf("UVC", "setInterface(alt=%d) -> %b", alt.alternateSetting, ok)
+            if (!ok) {
                 Log.w(TAG, "setInterface(alt=${alt.alternateSetting}) returned false, continuing anyway")
             }
             altSelected = true
@@ -513,6 +561,8 @@ class UvcCamera(private val ctx: Context) {
             lastError = "not prepared"
             return false
         }
+        // stop() 不会 close 共享连接；记住它，重新 probe 失败时也复用它（不要新开第二个 fd）
+        val reuse = conn
         stop()
         lastError = null
         // 先复用现有连接重新 probe；失败再彻底重开（部分固件在 alt 切换后需要新 fd）
@@ -522,7 +572,7 @@ class UvcCamera(private val ctx: Context) {
             return true
         }
         Log.w(TAG, "restartStream: re-probe failed (${lastError}), reopening device")
-        if (!prepare(dev, null)) return false
+        if (!prepare(dev, reuse)) return false
         if (!select(want)) return false
         start()
         Log.i(TAG, "restarted (reopened): ${negotiatedInfo()}")
@@ -615,11 +665,36 @@ class UvcCamera(private val ctx: Context) {
         f: FormatDesc,
         fr: FrameDesc
     ): Boolean {
+        // probe/commit 是 class 控制传输：走 UsbGate（不与 1 MB LCD 帧交错）+ 进 oplog
+        fun ioIn(tag: String, request: Int, value: Int, len: Int, buf: ByteArray): Int {
+            val t0 = SystemClock.elapsedRealtime()
+            val n = UsbGate.io("uvc:$tag") {
+                c.controlTransfer(REQ_IN, request, value, ifaceNum, buf, 0, len, CTRL_TIMEOUT)
+            }
+            Oplog.logf(
+                "UVC", "%s(IN) req=0x%02x wValue=0x%04x len=%d rc=%d ms=%d",
+                tag, request, value, len, n, SystemClock.elapsedRealtime() - t0
+            )
+            return n
+        }
+
+        fun ioOut(tag: String, value: Int, data: ByteArray, len: Int): Int {
+            val t0 = SystemClock.elapsedRealtime()
+            val n = UsbGate.io("uvc:$tag") {
+                c.controlTransfer(REQ_OUT, UVC_SET_CUR, value, ifaceNum, data, 0, len, CTRL_TIMEOUT)
+            }
+            Oplog.logf(
+                "UVC", "%s(OUT) wValue=0x%04x len=%d rc=%d ms=%d",
+                tag, value, len, n, SystemClock.elapsedRealtime() - t0
+            )
+            return n
+        }
+
         // 用 GET_CUR 得到的当前值做基底最稳（有些设备校验未用字段必须为 0）
         var probe = ByteArray(34)
-        var len = c.controlTransfer(REQ_IN, UVC_GET_CUR, VS_PROBE, ifaceNum, probe, 0, probe.size, CTRL_TIMEOUT)
+        var len = ioIn("GET_CUR(probe)", UVC_GET_CUR, VS_PROBE, probe.size, probe)
         if (len <= 0) {
-            len = c.controlTransfer(REQ_IN, UVC_GET_DEF, VS_PROBE, ifaceNum, probe, 0, probe.size, CTRL_TIMEOUT)
+            len = ioIn("GET_DEF(probe)", UVC_GET_DEF, VS_PROBE, probe.size, probe)
         }
         if (len <= 0) {
             Log.w(TAG, "GET_CUR/GET_DEF(probe) failed, building probe from scratch")
@@ -658,12 +733,12 @@ class UvcCamera(private val ctx: Context) {
         }
         putU32(probe, 22, payload)
 
-        var ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_PROBE, ifaceNum, probe, 0, len, CTRL_TIMEOUT)
+        var ret = ioOut("SET_CUR(probe)", VS_PROBE, probe, len)
         Log.i(TAG, "SET_CUR(probe) -> $ret (len=$len fmt=${f.index} frame=${fr.index} interval=${fr.defaultInterval})")
         if (ret < 0) {
             // 有些设备只接受 26 字节
             if (len > 26) {
-                ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_PROBE, ifaceNum, probe, 0, 26, CTRL_TIMEOUT)
+                ret = ioOut("SET_CUR(probe,26)", VS_PROBE, probe, 26)
                 Log.i(TAG, "SET_CUR(probe, 26) -> $ret")
                 if (ret >= 0) len = 26
             }
@@ -676,7 +751,7 @@ class UvcCamera(private val ctx: Context) {
 
         // 读回 probe 看设备给了什么（失败不致命）
         val back = ByteArray(34)
-        val n = c.controlTransfer(REQ_IN, UVC_GET_CUR, VS_PROBE, ifaceNum, back, 0, back.size, CTRL_TIMEOUT)
+        val n = ioIn("GET_CUR(probe,back)", UVC_GET_CUR, VS_PROBE, back.size, back)
         if (n >= 4) {
             Log.i(TAG, "probe result: bFormatIndex=${back[2]} bFrameIndex=${back[3]} " +
                 "maxVideoFrame=${u32(back, 18)} maxPayload=${u32(back, 22)}")
@@ -684,10 +759,10 @@ class UvcCamera(private val ctx: Context) {
 
         // commit：把 probe 内容原样提交
         val commitSrc = if (n > 0) back else probe
-        ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0, len, CTRL_TIMEOUT)
+        ret = ioOut("SET_CUR(commit)", VS_COMMIT, commitSrc, len)
         Log.i(TAG, "SET_CUR(commit) -> $ret")
         if (ret < 0 && len > 26) {
-            ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0, 26, CTRL_TIMEOUT)
+            ret = ioOut("SET_CUR(commit,26)", VS_COMMIT, commitSrc, 26)
             Log.i(TAG, "SET_CUR(commit, 26) -> $ret")
         }
         if (ret < 0) {
@@ -835,6 +910,7 @@ class UvcCamera(private val ctx: Context) {
         unalignedDrop = 0
         framesInWindow = 0
         windowStart = System.currentTimeMillis()
+        Oplog.logf("UVC", "start reader ep=0x%02x urb=%d", ep.address, transferBuf.size)
         thread = Thread({ readLoop(c, ep) }, "UvcReader").also {
             it.priority = Thread.NORM_PRIORITY + 1
             it.start()
@@ -881,11 +957,16 @@ class UvcCamera(private val ctx: Context) {
                 if (fastFails >= 5) {
                     val msg = "USB 传输连续失败（设备已断开，或接口被其它 App 抢走）。请重新插拔眼镜后再试。"
                     Log.e(TAG, "$msg dt=${dt}ms")
+                    Oplog.logf("UVC", "reader fast-fail x%d dt=%dms → stop", fastFails, dt)
+                    Oplog.dumpCrash("uvc_usb_fail(dt=${dt}ms)")
                     listener?.onError(msg)
                     break
                 }
                 timeouts++
-                if (timeouts == 3) Log.w(TAG, "no UVC data yet (${BULK_TIMEOUT}ms timeout) — device idle?")
+                if (timeouts == 3) {
+                    Log.w(TAG, "no UVC data yet (${BULK_TIMEOUT}ms timeout) — device idle?")
+                    Oplog.logf("UVC", "bulk-in timeout x3 (no data, urb=%d)", urbSize)
+                }
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastLog >= 3000) {
                     Log.w(TAG, "bulk in timeout x$timeouts (no data) fastFails=$fastFails")
@@ -936,6 +1017,9 @@ class UvcCamera(private val ctx: Context) {
             }
         }
         frameLen = 0
+        // 读循环退出（设备断开/连续 fast-fail）时把 running 归位，否则上层会以为还在出流
+        running = false
+        Oplog.logf("UVC", "reader stopped (invalidUrb=%d)", invalidTotal)
         Log.i(TAG, "reader stopped (invalidUrb=$invalidTotal)")
     }
 
@@ -950,6 +1034,19 @@ class UvcCamera(private val ctx: Context) {
                 "invalid UVC payload ($why): n=$n hdrLen=$hdrLen hdrInfo=0x%02x urbSize=$urbSize"
                     .format(hdrInfo)
             )
+            // 前 16 字节进 oplog：区分「整块灌满（首字节是亮度值）」还是「header 错位」
+            Oplog.logf(
+                "UVC", "invalid URB n=%d hdr=0x%02x info=0x%02x first16=%s",
+                n, hdrLen, hdrInfo,
+                (0 until minOf(16, n)).joinToString("") { "%02x".format(transferBuf[it]) }
+            )
+            // 第一个坏 URB 原样落盘，便于离线分析（是「整块灌满」还是「header 错位」）
+            if (invalidStreak == 1 && n in 1..transferBuf.size) {
+                try {
+                    File(ctx.filesDir, "uvc_bad.bin").writeBytes(transferBuf.copyOf(n))
+                } catch (ignored: Throwable) {
+                }
+            }
         }
         if (invalidStreak == INVALID_LIMIT && !invalidReported) {
             invalidReported = true
@@ -957,6 +1054,8 @@ class UvcCamera(private val ctx: Context) {
                 "固件媒体流水线已卡死。请拔插眼镜 USB —— App 会自动重灌固件（03E7:2150 → 2E09:0030）；" +
                 "若没自动重灌，等设备出现后用「加载固件（引导模式 03E7:2150）」。"
             Log.e(TAG, msg)
+            Oplog.logf("UVC", "invalid streak=%d (%s) n=%d hdr=0x%02x", invalidStreak, why, n, hdrInfo)
+            Oplog.dumpCrash("uvc_invalid_stream(streak=$invalidStreak,n=$n)")
             listener?.onError(msg)
         }
     }
@@ -1074,6 +1173,11 @@ class UvcCamera(private val ctx: Context) {
             framesInWindow = 0
             windowStart = now
             Log.i(TAG, "fps=${String.format(Locale.US, "%.1f", fps)} (${f.name} ${w}x${h})")
+            // 每 5 秒进一次 oplog，避免刷爆（crash 现场仍需能看到 UVC 是否在出流）
+            fpsLogTick++
+            if (fpsLogTick % 5 == 1) {
+                Oplog.logf("UVC", "fps=%.1f %s %dx%d frames=%d", fps, f.name, w, h, totalFrames)
+            }
         }
         lastBitmap = bmp
         try {
@@ -1165,26 +1269,56 @@ class UvcCamera(private val ctx: Context) {
         }
     }
 
+    /**
+     * 优雅停流（0.1.3）：
+     * 1. 停读线程（join；读循环最多被 BULK_TIMEOUT 卡 1 s）；
+     * 2. `setInterface(alt0)` —— 告诉固件 VS 停止；
+     * 3. `releaseInterface(VS)`；
+     * 4. 对 EP 0x81 发 `CLEAR_FEATURE(ENDPOINT_HALT)` —— 清掉上一次被取消的 URB
+     *    可能留下的 halt/半配置状态（这正是“commit 成功但 0 帧”的半死成因之一）；
+     * 5. 共享连接时**不** close（LCD/HID 还要用）。
+     */
     fun stop() {
         running = false
         val t = thread
         thread = null
         if (t != null && t.isAlive) {
             try {
-                t.join(1500)
+                t.join(2000)
             } catch (ignored: InterruptedException) {
             }
         }
-        // 回到 alt=0（停流），避免下次 open 时设备还停在 alt1
-        val c = conn
-        val itf = vsAltZero ?: vsAlt
-        if (c != null && itf != null) {
-            try {
-                c.setInterface(itf)
-                altSelected = false
-            } catch (ignored: Throwable) {
+        val c = conn ?: return
+        val itf = vsAlt ?: vsAltZero
+        if (vsClaimed) {
+            val alt0 = vsAltZero ?: vsAlt
+            if (alt0 != null) {
+                val ok = try {
+                    UsbGate.io("set_alt:vs0") { c.setInterface(alt0) }
+                } catch (e: Throwable) {
+                    false
+                }
+                Oplog.logf("UVC", "stop: setInterface(alt=%d) -> %b", alt0.alternateSetting, ok)
             }
+            val ep = vsEpIn
+            if (ep != null) {
+                try {
+                    LcdControl.clearEndpointHalt(c, ep.address)
+                } catch (ignored: Throwable) {
+                }
+            }
+            if (itf != null) {
+                val rel = try {
+                    UsbGate.io("release:vs") { c.releaseInterface(itf) }
+                } catch (e: Throwable) {
+                    false
+                }
+                Oplog.logf("UVC", "stop: releaseInterface(if=%d) -> %b", itf.id, rel)
+            }
+            vsClaimed = false
+            altSelected = false
         }
+        Oplog.logf("UVC", "stop done (shared=%b)", sharedConn)
     }
 
     fun close() {
@@ -1195,16 +1329,19 @@ class UvcCamera(private val ctx: Context) {
     private fun releaseInternal() {
         stopRawDump()
         val c = conn
-        val itf = vsAlt
-        if (c != null && itf != null) {
-            try {
-                c.releaseInterface(itf)
-            } catch (ignored: Throwable) {
+        val vc = vcClaimed
+        if (c != null && vc != null) {
+            val rel = try {
+                UsbGate.io("release:vc") { c.releaseInterface(vc) }
+            } catch (e: Throwable) {
+                false
             }
+            Oplog.logf("UVC", "release VC if=%d -> %b", vc.id, rel)
         }
         if (c != null && ownsConnection) {
             try {
                 c.close()
+                Oplog.log("UVC", "close own fd")
             } catch (ignored: Throwable) {
             }
         }
@@ -1213,7 +1350,10 @@ class UvcCamera(private val ctx: Context) {
         vsAlt = null
         vsAltZero = null
         vsEpIn = null
+        vcClaimed = null
+        vsClaimed = false
         ownsConnection = false
+        sharedConn = false
         altSelected = false
         lastBitmap = null
         bmpA = null

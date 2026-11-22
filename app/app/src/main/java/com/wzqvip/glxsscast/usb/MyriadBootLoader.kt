@@ -5,6 +5,7 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.util.Log
+import com.wzqvip.glxsscast.diag.Oplog
 import java.io.File
 import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
@@ -57,15 +58,21 @@ object MyriadBootLoader {
         done: (Boolean, String) -> Unit
     ) {
         val usb = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
+        Oplog.init(ctx)
         Thread {
             var conn: android.hardware.usb.UsbDeviceConnection? = null
             try {
                 val raw = File(imgPath).readBytes()
+                Oplog.logf("BOOT", "flash start dev=%s img=%s bytes=%d", dev.deviceName, File(imgPath).name, raw.size)
                 progress(0, "读取固件 ${raw.size} 字节")
                 val img = prepareImage(raw)
 
                 conn = usb.openDevice(dev)
-                if (conn == null) { done(false, "无法打开引导设备"); return@Thread }
+                if (conn == null) {
+                    Oplog.log("BOOT", "openDevice(boot) failed")
+                    done(false, "无法打开引导设备")
+                    return@Thread
+                }
                 // 找 bulk OUT 端点（EP1 OUT = 0x01）
                 var intf: android.hardware.usb.UsbInterface? = null
                 var ep: android.hardware.usb.UsbEndpoint? = null
@@ -78,8 +85,17 @@ object MyriadBootLoader {
                         ) { intf = itf; ep = x }
                     }
                 }
-                if (intf == null || ep == null) { done(false, "没有 bulk OUT 端点"); return@Thread }
-                if (!conn.claimInterface(intf, true)) { done(false, "claimInterface 失败"); return@Thread }
+                if (intf == null || ep == null) {
+                    Oplog.log("BOOT", "no bulk OUT endpoint on boot device")
+                    done(false, "没有 bulk OUT 端点")
+                    return@Thread
+                }
+                if (!conn.claimInterface(intf, true)) {
+                    Oplog.log("BOOT", "claimInterface(boot) failed")
+                    done(false, "claimInterface 失败")
+                    return@Thread
+                }
+                Oplog.logf("BOOT", "boot iface=%d ep=0x%02x writing %d bytes", intf.id, ep.address, img.size)
 
                 var off = 0
                 var retry = 0
@@ -89,17 +105,27 @@ object MyriadBootLoader {
                     if (sent < 0) {
                         retry++
                         Log.w(TAG, "bulk fail off=$off retry=$retry")
-                        if (retry > 3) { done(false, "传输失败 off=$off ret=$sent"); return@Thread }
+                        Oplog.logf("BOOT", "bulk fail off=%d retry=%d", off, retry)
+                        if (retry > 3) {
+                            Oplog.logf("BOOT", "transfer failed off=%d ret=%d", off, sent)
+                            done(false, "传输失败 off=$off ret=$sent")
+                            return@Thread
+                        }
                         Thread.sleep(50)
                         continue
                     }
                     off += sent
-                    if (off % (CHUNK * 64) == 0) progress(off * 100 / img.size, "写入 $off/${img.size}")
+                    if (off % (CHUNK * 64) == 0) {
+                        Oplog.logf("BOOT", "written %d/%d", off, img.size)
+                        progress(off * 100 / img.size, "写入 $off/${img.size}")
+                    }
                 }
+                Oplog.logf("BOOT", "flash sent %d bytes OK, waiting re-enum", img.size)
                 progress(100, "传输完成，等待设备重启…")
                 done(true, "固件已发送（${img.size} 字节），等待重枚举为 2E09:0030")
             } catch (e: Throwable) {
                 Log.e(TAG, "flash failed", e)
+                Oplog.logf("BOOT", "flash exception %s: %s", e.javaClass.simpleName, e.message)
                 done(false, "异常: ${e.message}")
             } finally {
                 try { conn?.close() } catch (_: Exception) {}

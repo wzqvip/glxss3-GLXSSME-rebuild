@@ -18,9 +18,11 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.WindowManager
+import com.wzqvip.glxsscast.diag.Oplog
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.settings.Prefs
@@ -68,6 +70,17 @@ class CastService : Service() {
         private const val TAG = "CastService"
         private const val CHANNEL_ID = "cast"
         private const val NOTIF_ID = 1001
+
+        /**
+         * 帧率上限 30 fps：动画时屏幕更新 25–30 fps，静止时 ~2 fps。
+         * 限制 + 「上一帧 bulk OUT 完整返回后才发下一帧」既保证不把 USB 写队列堆满，
+         * 也让帧与帧之间留出控制请求的窗口（控制请求另有 [com.wzqvip.glxsscast.usb.UsbGate] 串行化）。
+         */
+        private const val MAX_FPS = 30
+        private const val MIN_FRAME_INTERVAL_MS = 1000L / MAX_FPS
+
+        /** 连续多少帧 bulk OUT 失败就停流（不无限重试把固件继续打崩） */
+        private const val SEND_FAIL_LIMIT = 3
         /** 通知动作用的 requestCode（每个 PendingIntent 必须不同） */
         private const val RC_STOP = 2001
         private const val RC_MODE = 2002
@@ -118,6 +131,12 @@ class CastService : Service() {
     private var captureW = LcdProtocol.WIDTH
     private var captureH = LcdProtocol.HEIGHT
 
+    /** 上一帧 USB 发出的时刻（elapsedRealtime），用于 30 fps 上限 */
+    private var lastFrameAt = 0L
+    private var frameSeq = 0L
+    private var sendFailStreak = 0
+    @Volatile private var stopScheduled = false
+
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             stopCasting()
@@ -126,6 +145,7 @@ class CastService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Oplog.init(this)
         usb = UsbLink.get(this)
         // 服务可能先于 Activity 起来：先从 SharedPreferences 恢复画面调整/画面模式
         val prefs = Prefs.get(this)
@@ -288,9 +308,11 @@ class CastService : Service() {
             val dev = usb.findDevice()
             if (dev == null || !usb.open(dev)) {
                 lastError = "USB 未连接（找不到 0x2E09:0x0030）"
+                Oplog.log("CAST", "start aborted: USB not open / device not found")
                 return
             }
         }
+        Oplog.logf("CAST", "start requested mode=%d usb=%b", fillMode, usb.isOpen)
         usb.connection?.let { LcdControl.setDisplayMode(it, 2) }
 
         val mpm = getSystemService(MediaProjectionManager::class.java)
@@ -319,9 +341,14 @@ class CastService : Service() {
         createPipeline()
         registerDisplayListener()
         running = true
+        stopScheduled = false
+        sendFailStreak = 0
+        frameSeq = 0
+        lastFrameAt = 0
         countWindow = 0
         windowStart = System.currentTimeMillis()
         updateNotification()
+        Oplog.logf("CAST", "started capture=${captureW}x$captureH mode=%d", fillMode)
         Log.i(TAG, "casting started mode=$fillMode capture=${captureW}x$captureH")
     }
 
@@ -447,6 +474,11 @@ class CastService : Service() {
             if (r !== imageReader) return
             if (sending) return
             sending = true
+            // 帧率上限 30fps：超出的帧直接丢掉（不排队、不补发），保持 USB 写节奏平滑
+            val tNow = SystemClock.elapsedRealtime()
+            if (tNow - lastFrameAt < MIN_FRAME_INTERVAL_MS) return
+            lastFrameAt = tNow
+            val seq = ++frameSeq
             val w = img.width
             val h = img.height
             val plane = img.planes[0]
@@ -473,7 +505,15 @@ class CastService : Service() {
 
             val fb = frameBuf ?: return
             System.arraycopy(dst, 0, fb, LcdProtocol.HEADER_SIZE, dst.size)
-            if (usb.sendFrame(fb)) {
+            val t0 = SystemClock.elapsedRealtime()
+            val ok = usb.sendFrame(fb)
+            val dt = SystemClock.elapsedRealtime() - t0
+            Oplog.logf(
+                "LCD_FRAME", "seq=%d size=%d ms=%d ok=%b streak=%d",
+                seq, fb.size, dt, ok, if (ok) 0 else sendFailStreak + 1
+            )
+            if (ok) {
+                sendFailStreak = 0
                 frames++
                 countWindow++
                 val now = System.currentTimeMillis()
@@ -484,7 +524,18 @@ class CastService : Service() {
                     windowStart = now
                 }
             } else {
-                lastError = "发送失败"
+                sendFailStreak++
+                lastError = "发送失败（连续 $sendFailStreak/${SEND_FAIL_LIMIT}）"
+                if (sendFailStreak >= SEND_FAIL_LIMIT && !stopScheduled) {
+                    // 收敛：连续失败就停流，留 crash 现场，别再往一个可能已经挂掉的固件灌 1 MB
+                    stopScheduled = true
+                    Oplog.logf("CAST", "LCD 连续 %d 帧发送失败 → 停止投屏", sendFailStreak)
+                    Oplog.dumpCrash("cast_lcd_send_fail(streak=$sendFailStreak)")
+                    Handler(mainLooper).post {
+                        lastError = "投屏已停止：连续 $sendFailStreak 帧 USB 发送失败"
+                        stopCasting()
+                    }
+                }
             }
         } catch (e: Exception) {
             lastError = "帧处理异常: ${e.message}"
@@ -600,7 +651,9 @@ class CastService : Service() {
     }
 
     private fun stopCasting() {
+        val wasRunning = running
         running = false
+        Oplog.logf("CAST", "stop (was=%b frames=%d)", wasRunning, frames)
         try {
             val dl = displayListener
             if (dl != null) {

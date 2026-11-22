@@ -6,6 +6,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
+import com.wzqvip.glxsscast.diag.Oplog
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -22,8 +23,9 @@ object Peripherals {
     fun startHid(link: UsbLink) {
         if (hidRunning) return
         val ep = link.openHidEndpoint()
-        if (ep == null) { lastHidHex = "no HID endpoint"; return }
+        if (ep == null) { lastHidHex = "no HID endpoint"; Oplog.log("HID", "legacy interrupt: no endpoint"); return }
         hidRunning = true
+        Oplog.log("HID", "legacy interrupt reader start (0x83)")
         val t = Thread {
             val buf = ByteArray(64)
             while (hidRunning) {
@@ -44,7 +46,7 @@ object Peripherals {
         Log.i(TAG, "HID reader started")
     }
 
-    fun stopHid() { hidRunning = false; hidThread = null }
+    fun stopHid() { hidRunning = false; hidThread = null; Oplog.logf("HID", "legacy interrupt reader stop (%d pkts)", hidPackets) }
 
     fun playTone(freq: Double, seconds: Double): Boolean {
         return try {
