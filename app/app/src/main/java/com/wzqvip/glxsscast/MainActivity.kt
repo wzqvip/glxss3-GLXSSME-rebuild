@@ -1158,7 +1158,7 @@ class MainActivity : ComponentActivity() {
             }
 
             Scaffold(
-                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.3") }) }
+                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.3 Dev") }) }
             ) { pad ->
                 Column(
                     Modifier
@@ -1786,7 +1786,7 @@ class MainActivity : ComponentActivity() {
                             "① 拔掉眼镜 USB 再插上 → 设备会以 03E7:2150 出现；\n" +
                             "② App 会自动灌固件（约 2 秒），等它重新枚举成 2E09:0030；\n" +
                             "③ 再点「连接眼镜」，然后开摄像头 / 发色条。\n" +
-                            "原理与证据见 docs/device-recovery.md。",
+                            "仓库与原理/证据: https://github.com/wzqvip/glxss3-GLXSSME-rebuild\n开发者 bilibili: 塔可Tacoin",
                         style = MaterialTheme.typography.bodySmall
                     )
 
@@ -1818,6 +1818,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
 
 
 
