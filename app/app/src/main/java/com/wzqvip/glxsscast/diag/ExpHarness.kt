@@ -242,6 +242,7 @@ object ExpHarness {
     fun startCtrlPoll(ctx: Context, intervalMs: Long, durationMs: Long) {
         stopCtrlPoll()
         val t = Thread({
+            try {
             val link = UsbLink.get(ctx)
             val end = System.currentTimeMillis() + durationMs
             var n = 0L
@@ -271,6 +272,10 @@ object ExpHarness {
             }
             ctrlRequests += n
             Oplog.logf("EXP", "ctrl poll done n=%d fail=%d", n, fail)
+            } catch (t: Throwable) {
+                // 调试线程也不允许未捕获异常（Android 会杀进程）；stopCtrlPoll 的 interrupt 也走这里
+                Oplog.logf("EXP", "ctrl poll 异常 %s: %s", t.javaClass.simpleName, t.message)
+            }
         }, "CtrlPoll")
         t.isDaemon = true
         ctrlThread = t

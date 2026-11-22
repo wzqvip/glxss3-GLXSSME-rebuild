@@ -27,17 +27,22 @@ object Peripherals {
         hidRunning = true
         Oplog.log("HID", "legacy interrupt reader start (0x83)")
         val t = Thread {
-            val buf = ByteArray(64)
-            while (hidRunning) {
-                val n = try { link.readInterrupt(ep, buf, 500) } catch (e: Exception) { -1 }
-                if (n > 0) {
-                    hidPackets++
-                    val sb = StringBuilder()
-                    for (i in 0 until n) sb.append(String.format("%02x", buf[i]))
-                    lastHidHex = sb.toString()
-                } else {
-                    try { Thread.sleep(50) } catch (e: InterruptedException) { break }
+            try {
+                val buf = ByteArray(64)
+                while (hidRunning) {
+                    val n = try { link.readInterrupt(ep, buf, 500) } catch (e: Exception) { -1 }
+                    if (n > 0) {
+                        hidPackets++
+                        val sb = StringBuilder()
+                        for (i in 0 until n) sb.append(String.format("%02x", buf[i]))
+                        lastHidHex = sb.toString()
+                    } else {
+                        try { Thread.sleep(50) } catch (e: InterruptedException) { break }
+                    }
                 }
+            } catch (t: Throwable) {
+                // 后台线程未捕获异常会杀掉整个进程；这里只记日志
+                Log.w(TAG, "legacy HID reader 异常", t)
             }
         }
         t.isDaemon = true

@@ -5,12 +5,17 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.graphics.Point
 import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -22,12 +27,14 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.WindowManager
+import androidx.core.content.ContextCompat
 import com.wzqvip.glxsscast.diag.Oplog
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.settings.Prefs
 import com.wzqvip.glxsscast.usb.UsbLink
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 录像等旁路消费者：拿到投屏**映射之后、USB 组包之前**的 640×400 RGBA 帧。
@@ -106,6 +113,16 @@ class CastService : Service() {
         /** 垂直偏移 -1..1（归一化；映射时 = offset * 源高 / 2，再做 clamp） */
         @Volatile var offsetY = 0f
 
+        /**
+         * 画面 180° 软件翻转（实时生效）。
+         *
+         * 真正状态在 [LcdProtocol.flip180]，这样测试图（bars/solid）和投屏帧共用同一个开关；
+         * 这里只是别名，写它等价于写 LcdProtocol.flip180。由 [Prefs.flip180] 持久化。
+         */
+        var flip180: Boolean
+            get() = LcdProtocol.flip180
+            set(v) { LcdProtocol.flip180 = v }
+
         fun modeName(m: Int) = when (m) {
             MODE_FIT -> "适应(黑边)"
             MODE_STRETCH -> "拉伸(填满)"
@@ -137,9 +154,17 @@ class CastService : Service() {
     private var sendFailStreak = 0
     @Volatile private var stopScheduled = false
 
+    /** USB DETACHED 清理只跑一次（Activity 的 receiver 也会通知停止，避免重复收尾） */
+    private val detachCleanup = AtomicBoolean(false)
+    private var detachReceiver: BroadcastReceiver? = null
+
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            stopCasting()
+            try {
+                stopCasting()
+            } catch (t: Throwable) {
+                Oplog.logf("CAST", "projectionCallback 异常 %s", t.javaClass.simpleName)
+            }
         }
     }
 
@@ -153,44 +178,123 @@ class CastService : Service() {
         zoom = prefs.zoom
         offsetX = prefs.offsetX
         offsetY = prefs.offsetY
+        flip180 = prefs.flip180
+        registerDetachReceiver()
+    }
+
+    /**
+     * 拔线 / 设备重枚举时**自己**停投屏。
+     *
+     * 之前 CastService 完全不知道设备已经消失，投屏线程会继续对失效 fd 写 1 MB 帧
+     * （返 -1 → 连续 3 帧失败才收敛），既污染固件，也让 detach 后的收尾顺序变得不可控。
+     */
+    private fun registerDetachReceiver() {
+        if (detachReceiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+                try {
+                    // API 33 才有 getParcelableExtra(name, Class)。华为 PAL-AL00 是 Android 12
+                    // (API 31)，直接调两参重载会抛 NoSuchMethodError —— 0.1.5 就是它让
+                    // USB 广播（attach/detach）在华为机上变成闪退。
+                    @Suppress("DEPRECATION")
+                    val dev: UsbDevice? = if (Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    // null = 系统没带设备信息；只看眼镜（2E09）的 detach
+                    if (dev != null && dev.vendorId != UsbLink.VID) return
+                    Oplog.logf("CAST", "USB detach(dev=%s) → stop casting", dev?.deviceName ?: "null")
+                    if (detachCleanup.compareAndSet(false, true)) {
+                        stopCasting()
+                        try {
+                            stopSelf()
+                        } catch (ignored: Throwable) {
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Oplog.logf(
+                        "CAST", "detach receiver 异常 %s: %s",
+                        t.javaClass.simpleName, t.message
+                    )
+                }
+            }
+        }
+        detachReceiver = r
+        try {
+            ContextCompat.registerReceiver(
+                this, r, IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED),
+                ContextCompat.RECEIVER_EXPORTED
+            )
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "注册 detach receiver 失败 %s: %s", t.javaClass.simpleName, t.message)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                stopCasting()
-                stopSelf()
-            }
-            ACTION_SET_MODE -> {
-                // 通知栏「画面模式」不传 EXTRA_MODE → 循环 适应 → 裁剪 → 拉伸 → 适应
-                val m = if (intent.hasExtra(EXTRA_MODE)) {
-                    intent.getIntExtra(EXTRA_MODE, MODE_CROP).coerceIn(0, 2)
-                } else {
-                    (fillMode + 1) % 3
+        // Service 生命周期跑在主线程：这里任何未捕获异常 = App 闪退（用户看到「投屏就崩」）
+        try {
+            when (intent?.action) {
+                ACTION_STOP -> {
+                    stopCasting()
+                    stopSelf()
                 }
-                // 注意：Android 14+ 的 MediaProjection 只能建一个 VirtualDisplay，
-                // 不能重建管线；抓取尺寸固定，模式只在行映射时应用（下一帧生效）。
-                fillMode = m
-                Prefs.get(this).fillMode = m
-                lastError = "画面模式: ${modeName(m)}"
-                updateNotification()
-                if (!running) stopSelf()
+                ACTION_SET_MODE -> {
+                    // 通知栏「画面模式」不传 EXTRA_MODE → 循环 适应 → 裁剪 → 拉伸 → 适应
+                    val m = if (intent.hasExtra(EXTRA_MODE)) {
+                        intent.getIntExtra(EXTRA_MODE, MODE_CROP).coerceIn(0, 2)
+                    } else {
+                        (fillMode + 1) % 3
+                    }
+                    // 注意：Android 14+ 的 MediaProjection 只能建一个 VirtualDisplay，
+                    // 不能重建管线；抓取尺寸固定，模式只在行映射时应用（下一帧生效）。
+                    fillMode = m
+                    Prefs.get(this).fillMode = m
+                    lastError = "画面模式: ${modeName(m)}"
+                    updateNotification()
+                    if (!running) stopSelf()
+                }
+                ACTION_RESYNC -> {
+                    // 手动重新按当前屏幕方向适配抓取尺寸（DisplayListener 漏掉时兜底）
+                    val hd = handler
+                    if (hd != null && running) hd.post { applyScreenSizeSafe() }
+                    else lastError = "未投屏，无法重新适配方向"
+                }
+                ACTION_START -> {
+                    val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                    @Suppress("DEPRECATION")
+                    val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+                    fillMode = intent.getIntExtra(EXTRA_MODE, fillMode)
+                    if (!startForegroundCompat()) {
+                        // Android 14 前台服务类型/通知权限问题：不崩，直接退出并留提示
+                        lastError = "投屏服务启动失败（前台服务/通知权限）"
+                        try {
+                            stopCasting()
+                        } catch (ignored: Throwable) {
+                        }
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
+                    if (data != null) startCasting(code, data) else lastError = "缺少投影授权数据"
+                }
             }
-            ACTION_RESYNC -> {
-                // 手动重新按当前屏幕方向适配抓取尺寸（DisplayListener 漏掉时兜底）
-                val hd = handler
-                if (hd != null && running) hd.post { applyScreenSize() }
-                else lastError = "未投屏，无法重新适配方向"
+        } catch (t: Throwable) {
+            Oplog.logf(
+                "CAST", "onStartCommand 异常 action=%s %s: %s",
+                intent?.action, t.javaClass.simpleName, t.message
+            )
+            Log.e(TAG, "onStartCommand threw", t)
+            lastError = "投屏服务异常: ${t.javaClass.simpleName}: ${t.message}"
+            try {
+                stopCasting()
+            } catch (ignored: Throwable) {
             }
-            ACTION_START -> {
-                val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-                @Suppress("DEPRECATION")
-                val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
-                fillMode = intent.getIntExtra(EXTRA_MODE, fillMode)
-                startForegroundCompat()
-                if (data != null) startCasting(code, data) else lastError = "缺少投影授权数据"
+            try {
+                stopSelf()
+            } catch (ignored: Throwable) {
             }
         }
         return START_NOT_STICKY
@@ -247,18 +351,31 @@ class CastService : Service() {
         }
     }
 
-    private fun startForegroundCompat() {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL_ID) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "投屏", NotificationManager.IMPORTANCE_LOW)
+    private fun startForegroundCompat(): Boolean {
+        return try {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL_ID) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "投屏", NotificationManager.IMPORTANCE_LOW)
+                )
+            }
+            val notif: Notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(
+                    NOTIF_ID, notif,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+            true
+        } catch (t: Throwable) {
+            // 华为/Android 14：缺 POST_NOTIFICATIONS 或前台服务类型不被允许时会抛
+            Oplog.logf(
+                "CAST", "startForeground 失败 %s: %s", t.javaClass.simpleName, t.message
             )
-        }
-        val notif: Notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIF_ID, notif)
+            Log.e(TAG, "startForeground failed", t)
+            false
         }
     }
 
@@ -304,24 +421,57 @@ class CastService : Service() {
             fillMode = fillMode
             return
         }
+        // 新一轮投屏允许 detach 收尾再次触发
+        detachCleanup.set(false)
         if (!usb.isOpen) {
-            val dev = usb.findDevice()
-            if (dev == null || !usb.open(dev)) {
-                lastError = "USB 未连接（找不到 0x2E09:0x0030）"
+            // 设备可能刚重枚举（03E7→2E09）或已被拔：openDevice/claim 在部分 ROM 上会抛
+            val dev = try {
+                usb.findDevice()
+            } catch (t: Throwable) {
+                Oplog.logf("CAST", "findDevice 异常 %s: %s", t.javaClass.simpleName, t.message)
+                null
+            }
+            val opened = if (dev == null) {
+                false
+            } else {
+                try {
+                    usb.open(dev)
+                } catch (t: Throwable) {
+                    Oplog.logf("CAST", "usb.open 异常 %s: %s", t.javaClass.simpleName, t.message)
+                    false
+                }
+            }
+            if (!opened) {
+                lastError = "USB 未连接（找不到 0x2E09:0x0030 或打开失败）"
                 Oplog.log("CAST", "start aborted: USB not open / device not found")
                 return
             }
         }
         Oplog.logf("CAST", "start requested mode=%d usb=%b", fillMode, usb.isOpen)
-        usb.connection?.let { LcdControl.setDisplayMode(it, 2) }
+        try {
+            usb.connection?.let { LcdControl.setDisplayMode(it, 2) }
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "setDisplayMode(2) 异常 %s: %s", t.javaClass.simpleName, t.message)
+        }
 
         val mpm = getSystemService(MediaProjectionManager::class.java)
-        val mp = mpm.getMediaProjection(resultCode, data)
+        val mp = try {
+            mpm.getMediaProjection(resultCode, data)
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "getMediaProjection 异常 %s: %s", t.javaClass.simpleName, t.message)
+            null
+        }
         if (mp == null) {
             lastError = "MediaProjection 授权失败"
             return
         }
-        mp.registerCallback(projectionCallback, Handler(mainLooper))
+        try {
+            mp.registerCallback(projectionCallback, Handler(mainLooper))
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "registerCallback 异常 %s", t.javaClass.simpleName)
+            lastError = "投屏授权回调注册失败: ${t.javaClass.simpleName}"
+            return
+        }
         projection = mp
 
         val ht = HandlerThread("cast").also { it.start() }
@@ -338,8 +488,18 @@ class CastService : Service() {
             fb[7] = ((total ushr 24) and 0xFF).toByte()
         }
 
-        createPipeline()
-        registerDisplayListener()
+        try {
+            createPipeline()
+            registerDisplayListener()
+        } catch (t: Throwable) {
+            Oplog.logf(
+                "CAST", "创建抓屏管线失败 %s: %s", t.javaClass.simpleName, t.message
+            )
+            Log.e(TAG, "createPipeline failed", t)
+            lastError = "创建抓屏管线失败: ${t.javaClass.simpleName}: ${t.message}"
+            stopCasting()
+            return
+        }
         running = true
         stopScheduled = false
         sendFailStreak = 0
@@ -385,11 +545,26 @@ class CastService : Service() {
                 if (displayId != Display.DEFAULT_DISPLAY) return
                 val h = handler ?: return
                 // 等系统把旋转后的显示尺寸稳定下来再处理
-                h.postDelayed({ applyScreenSize() }, 250)
+                h.postDelayed({ applyScreenSizeSafe() }, 250)
             }
         }
         dm.registerDisplayListener(listener, hd)
         displayListener = listener
+    }
+
+    /**
+     * cast Handler 线程入口：ImageReader/VirtualDisplay 在拔线/旋转竞态下会抛，
+     * 不能让它打爆 "cast" HandlerThread（那会让投屏静默停摆）。
+     */
+    private fun applyScreenSizeSafe() {
+        try {
+            applyScreenSize()
+        } catch (t: Throwable) {
+            Oplog.logf(
+                "CAST", "applyScreenSize 异常 %s: %s", t.javaClass.simpleName, t.message
+            )
+            Log.w(TAG, "applyScreenSize threw", t)
+        }
     }
 
     /**
@@ -466,14 +641,28 @@ class CastService : Service() {
     private fun onFrame(r: ImageReader) {
         val img = try {
             r.acquireLatestImage()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             null
         } ?: return
         try {
+            if (!running) return
             // 旋转换过 reader 后，旧 reader 的残留帧直接丢弃
             if (r !== imageReader) return
             if (sending) return
             sending = true
+            // 设备已被拔（detach 清理可能还在后台线程排队）：别再组帧/写 USB，
+            // 直接走一次停止流程，避免继续往消失的 fd 发 1 MB。
+            if (!usb.isOpen) {
+                if (!stopScheduled) {
+                    stopScheduled = true
+                    Oplog.log("CAST", "onFrame: USB 已关闭 → 停止投屏")
+                    Handler(mainLooper).post {
+                        lastError = "投屏已停止：USB 设备已断开"
+                        stopCasting()
+                    }
+                }
+                return
+            }
             // 帧率上限 30fps：超出的帧直接丢掉（不排队、不补发），保持 USB 写节奏平滑
             val tNow = SystemClock.elapsedRealtime()
             if (tNow - lastFrameAt < MIN_FRAME_INTERVAL_MS) return
@@ -493,12 +682,16 @@ class CastService : Service() {
                 else -> mapCover(buf, w, h, rowStride, pixelStride, dst)
             }
 
+            // 180° 软件翻转：映射后再做一次扫描顺序反转（目标行/列都反），
+            // 对三种画面模式和任意抓取尺寸都等价，且不需要重启投屏。
+            if (flip180) LcdProtocol.flip180InPlace(dst)
+
             // 录像旁路：在组装 USB 帧（16B 头 + payload）之前把这一帧 640×400 RGBA 交出去。
             // 消费者只做一次拷贝就返回（满了就丢帧），不会拖慢 USB 发送。
             frameTap?.let { tap ->
                 try {
                     tap.onCastFrame(dst, LcdProtocol.WIDTH, LcdProtocol.HEIGHT, System.nanoTime() / 1000)
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     Log.w(TAG, "frameTap error", e)
                 }
             }
@@ -506,7 +699,12 @@ class CastService : Service() {
             val fb = frameBuf ?: return
             System.arraycopy(dst, 0, fb, LcdProtocol.HEADER_SIZE, dst.size)
             val t0 = SystemClock.elapsedRealtime()
-            val ok = usb.sendFrame(fb)
+            val ok = try {
+                usb.sendFrame(fb)
+            } catch (t: Throwable) {
+                Oplog.logf("CAST", "sendFrame 异常 %s: %s", t.javaClass.simpleName, t.message)
+                false
+            }
             val dt = SystemClock.elapsedRealtime() - t0
             Oplog.logf(
                 "LCD_FRAME", "seq=%d size=%d ms=%d ok=%b streak=%d",
@@ -537,11 +735,18 @@ class CastService : Service() {
                     }
                 }
             }
-        } catch (e: Exception) {
-            lastError = "帧处理异常: ${e.message}"
+        } catch (e: Throwable) {
+            // ImageReader/ByteBuffer 在设备拔出的竞态里会抛 IllegalStateException；
+            // Catch Throwable 保证 cast 线程不会因为一帧异常就静默死掉。
+            lastError = "帧处理异常: ${e.javaClass.simpleName}: ${e.message}"
+            Oplog.logf("CAST", "onFrame 异常 %s: %s", e.javaClass.simpleName, e.message)
         } finally {
             sending = false
-            img.close()
+            try {
+                img.close()
+            } catch (t: Throwable) {
+                Log.w(TAG, "img.close failed", t)
+            }
         }
     }
 
@@ -650,34 +855,78 @@ class CastService : Service() {
         }
     }
 
+    /**
+     * 停止投屏（主线程/投影回调都会走到）。
+     *
+     * 顺序：先停抓屏管线（不碰 USB），再让后台线程发一次「关屏」命令 ——
+     * `controlTransfer` 最长阻塞 2s，且设备可能已经拔掉会抛异常；
+     * 以前这段直接在主线程跑，detach/停止投屏时就可能闪退或 ANR。
+     */
     private fun stopCasting() {
-        val wasRunning = running
-        running = false
-        Oplog.logf("CAST", "stop (was=%b frames=%d)", wasRunning, frames)
         try {
-            val dl = displayListener
-            if (dl != null) {
-                getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(dl)
+            val wasRunning = running
+            running = false
+            Oplog.logf("CAST", "stop (was=%b frames=%d)", wasRunning, frames)
+            try {
+                val dl = displayListener
+                if (dl != null) {
+                    getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(dl)
+                }
+            } catch (_: Throwable) {
             }
-        } catch (_: Exception) {
+            displayListener = null
+            destroyPipeline()
+            try {
+                projection?.unregisterCallback(projectionCallback)
+                projection?.stop()
+            } catch (_: Throwable) {
+            }
+            projection = null
+            captureDesc = ""
+            try {
+                thread?.quitSafely()
+            } catch (_: Throwable) {
+            }
+            thread = null
+            handler = null
+            val c = try {
+                usb.connection
+            } catch (_: Throwable) {
+                null
+            }
+            if (c != null) {
+                Thread({
+                    try {
+                        LcdControl.setDisplayMode(c, 1)
+                    } catch (t: Throwable) {
+                        Oplog.logf(
+                            "CAST", "关屏命令异常 %s: %s", t.javaClass.simpleName, t.message
+                        )
+                    }
+                }, "CastLcdOff").apply { isDaemon = true }.start()
+            }
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
+            }
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "stopCasting 异常 %s: %s", t.javaClass.simpleName, t.message)
+            Log.w(TAG, "stopCasting threw", t)
         }
-        displayListener = null
-        destroyPipeline()
-        try {
-            projection?.unregisterCallback(projectionCallback)
-            projection?.stop()
-        } catch (_: Exception) {
-        }
-        projection = null
-        captureDesc = ""
-        thread?.quitSafely()
-        thread = null
-        handler = null
-        usb.connection?.let { LcdControl.setDisplayMode(it, 1) }
-        stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     override fun onDestroy() {
+        try {
+            detachReceiver?.let { r ->
+                try {
+                    unregisterReceiver(r)
+                } catch (t: Throwable) {
+                    Oplog.logf("CAST", "unregister detach receiver 异常 %s", t.javaClass.simpleName)
+                }
+            }
+            detachReceiver = null
+        } catch (ignored: Throwable) {
+        }
         stopCasting()
         // USB 连接是进程内共享的（Activity 还在用），这里不关闭
         super.onDestroy()

@@ -123,6 +123,11 @@ object MyriadBootLoader {
         Thread({
             var conn: UsbDeviceConnection? = null
             try {
+                if (!isPresent(usb, dev)) {
+                    Oplog.log("BOOT", "boot device 已不在 deviceList（插入后又被拔出/重枚举）")
+                    finish(false, "引导模式设备已拔出（03E7:2150 不在设备列表里）")
+                    return@Thread
+                }
                 val raw = imgFile.readBytes()
                 Oplog.logf(
                     "BOOT", "flash start dev=%s img=%s bytes=%d",
@@ -226,5 +231,15 @@ object MyriadBootLoader {
         } catch (t: Throwable) {
             Log.w(TAG, "progress callback threw", t)
         }
+    }
+
+    /** 设备是否还在系统列表里（拔线/重枚举后旧 UsbDevice 会失效，openDevice 可能抛异常） */
+    private fun isPresent(usb: UsbManager, dev: UsbDevice): Boolean = try {
+        usb.deviceList.values.any {
+            it.deviceId == dev.deviceId && it.vendorId == dev.vendorId && it.productId == dev.productId
+        }
+    } catch (t: Throwable) {
+        Oplog.logf("BOOT", "deviceList 读取失败 %s: %s", t.javaClass.simpleName, t.message)
+        false
     }
 }

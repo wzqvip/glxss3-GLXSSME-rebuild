@@ -7,6 +7,7 @@ import android.content.Context
  *
  * 收录：
  *  - 画面模式 / 画面调整（zoom、offsetX、offsetY）—— 原有
+ *  - 画面 180° 软件翻转（投屏 + 测试图）与 UVC 预览独立翻转
  *  - UVC 分辨率与像素格式（按 `格式名 + 宽 + 高` 记住，换档位时不依赖描述符 index）
  *  - 自动亮度开关
  *  - HID 监听开关
@@ -26,6 +27,8 @@ class Prefs private constructor(ctx: Context) {
         private const val KEY_ZOOM = "zoom"
         private const val KEY_OX = "ox"
         private const val KEY_OY = "oy"
+        private const val KEY_FLIP180 = "flip180"
+        private const val KEY_UVC_FLIP180 = "uvc_flip180"
         private const val KEY_UVC_FORMAT = "uvc_format"
         private const val KEY_UVC_W = "uvc_w"
         private const val KEY_UVC_H = "uvc_h"
@@ -62,6 +65,21 @@ class Prefs private constructor(ctx: Context) {
     var offsetY: Float
         get() = sp.getFloat(KEY_OY, 0f).coerceIn(-1f, 1f)
         set(v) { sp.edit().putFloat(KEY_OY, v.coerceIn(-1f, 1f)).apply() }
+
+    /**
+     * 画面 180° 软件翻转（投屏 + 测试色条共用）。
+     *
+     * 不用设备侧 roll：原厂 SDK 的 `setRoll` 实际是 0xA1/0x03（见 LcdControl），
+     * 我们之前发 0x02 只是屏开关，实测无方向效果。
+     */
+    var flip180: Boolean
+        get() = sp.getBoolean(KEY_FLIP180, false)
+        set(v) { sp.edit().putBoolean(KEY_FLIP180, v).apply() }
+
+    /** UVC 预览独立翻转（默认关，不影响投屏/测试图） */
+    var uvcFlip180: Boolean
+        get() = sp.getBoolean(KEY_UVC_FLIP180, false)
+        set(v) { sp.edit().putBoolean(KEY_UVC_FLIP180, v).apply() }
 
     // ---- UVC 分辨率/格式选择（按名字+尺寸匹配） ----
     var uvcFormat: String

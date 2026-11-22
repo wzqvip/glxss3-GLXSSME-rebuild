@@ -939,6 +939,9 @@ class UvcCamera(private val ctx: Context) {
         var timeouts = 0
         var fastFails = 0
         var lastLog = 0L
+        // 整个读循环再兜一层 Throwable：设备拔出后 bulkTransfer / append / dumpUrb 都可能抛，
+        // 后台线程的未捕获异常在 Android 上会杀掉整个进程（= 闪退）。
+        try {
         while (running) {
             val t0 = SystemClock.elapsedRealtime()
             val n = try {
@@ -1017,11 +1020,16 @@ class UvcCamera(private val ctx: Context) {
                 deliverSafe()
             }
         }
-        frameLen = 0
-        // 读循环退出（设备断开/连续 fast-fail）时把 running 归位，否则上层会以为还在出流
-        running = false
-        Oplog.logf("UVC", "reader stopped (invalidUrb=%d)", invalidTotal)
-        Log.i(TAG, "reader stopped (invalidUrb=$invalidTotal)")
+        } catch (t: Throwable) {
+            Oplog.logf("UVC", "reader 异常 %s: %s", t.javaClass.simpleName, t.message)
+            Log.e(TAG, "readLoop threw", t)
+        } finally {
+            frameLen = 0
+            // 读循环退出（设备断开/连续 fast-fail）时把 running 归位，否则上层会以为还在出流
+            running = false
+            Oplog.logf("UVC", "reader stopped (invalidUrb=%d)", invalidTotal)
+            Log.i(TAG, "reader stopped (invalidUrb=$invalidTotal)")
+        }
     }
 
     /** 无效 URB：丢弃 + 计数；连续太多次就上报一次（绝不再把垃圾画成噪点） */
@@ -1309,6 +1317,18 @@ class UvcCamera(private val ctx: Context) {
      * 5. 共享连接时**不** close（LCD/HID 还要用）。
      */
     fun stop() {
+        try {
+            stopInternal()
+        } catch (t: Throwable) {
+            Oplog.logf("UVC", "stop 异常 %s: %s", t.javaClass.simpleName, t.message)
+            Log.w(TAG, "stop threw", t)
+        } finally {
+            // 无论 release/setInterface 成败，读线程都已要求退出
+            running = false
+        }
+    }
+
+    private fun stopInternal() {
         running = false
         val t = thread
         thread = null
@@ -1352,8 +1372,13 @@ class UvcCamera(private val ctx: Context) {
     }
 
     fun close() {
-        stop()
-        releaseInternal()
+        try {
+            stop()
+            releaseInternal()
+        } catch (t: Throwable) {
+            Oplog.logf("UVC", "close 异常 %s: %s", t.javaClass.simpleName, t.message)
+            Log.w(TAG, "close threw", t)
+        }
     }
 
     private fun releaseInternal() {

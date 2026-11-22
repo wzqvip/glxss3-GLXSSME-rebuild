@@ -17,6 +17,40 @@ object LcdProtocol {
     const val HEADER_SIZE = 16
     const val PAYLOAD_SIZE = WIDTH * HEIGHT * 4
 
+    /**
+     * 画面 180° 软件翻转总开关（@Volatile，投屏与测试图共用）。
+     *
+     * 单一状态放在这里，[com.wzqvip.glxsscast.cast.CastService.flip180] 只是它的别名，
+     * 这样投屏帧和 [bars]/[solid] 生成的测试图不会出现一个翻一个不翻。
+     * 由 [com.wzqvip.glxsscast.settings.Prefs.flip180] 持久化。
+     */
+    @Volatile
+    var flip180 = false
+
+    /**
+     * 原地 180° 旋转 640×400 RGBA：目标 (x,y) ← 源 (W-1-x, H-1-y)。
+     *
+     * 等价于「扫描顺序反转」：第 y 行与第 H-1-y 行成对交换，且每行内像素逆序。
+     * 只交换 4 字节像素，不改变 RGBA 内部字节序。约 128k 次 4B 交换/帧。
+     */
+    fun flip180InPlace(buf: ByteArray) {
+        require(buf.size == PAYLOAD_SIZE) { "buffer must be $PAYLOAD_SIZE bytes, got ${buf.size}" }
+        val rowBytes = WIDTH * 4
+        for (y in 0 until HEIGHT / 2) {
+            val top = y * rowBytes
+            val bottom = (HEIGHT - 1 - y) * rowBytes
+            for (x in 0 until WIDTH) {
+                val i = top + x * 4
+                val j = bottom + (WIDTH - 1 - x) * 4
+                for (k in 0 until 4) {
+                    val t = buf[i + k]
+                    buf[i + k] = buf[j + k]
+                    buf[j + k] = t
+                }
+            }
+        }
+    }
+
     fun frame(payload: ByteArray): ByteArray {
         require(payload.size == PAYLOAD_SIZE) {
             "payload must be $PAYLOAD_SIZE bytes, got ${payload.size}"
@@ -41,6 +75,8 @@ object LcdProtocol {
             out[i] = rr; out[i + 1] = gg; out[i + 2] = bb; out[i + 3] = aa
             i += 4
         }
+        // 纯色旋转后仍是同一颜色；这里仍然执行，保证 solid/black 与 bars 走同一条翻转路径。
+        if (flip180) flip180InPlace(out)
         return out
     }
 
@@ -64,6 +100,8 @@ object LcdProtocol {
                 out[o + 3] = 255.toByte()
             }
         }
+        // 180° 后色条左右顺序反转、纵向渐变上下反转，一眼能看出翻转是否生效
+        if (flip180) flip180InPlace(out)
         return out
     }
 }

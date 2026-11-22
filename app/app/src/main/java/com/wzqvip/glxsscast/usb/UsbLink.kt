@@ -76,14 +76,39 @@ class UsbLink private constructor(private val ctx: Context) {
     @Volatile var lastSendOk: Boolean = true; private set
     @Volatile var failTotal: Long = 0; private set
 
-    /** 找 GLXSS3（优先精确匹配 VID/PID） */
-    fun findDevice(): UsbDevice? {
+    /** 找 GLXSS3（优先精确匹配 VID/PID）；USB 服务异常时返回 null，不抛 */
+    fun findDevice(): UsbDevice? = try {
         val list = usb.deviceList.values
-        return list.firstOrNull { it.vendorId == VID && it.productId == PID }
+        list.firstOrNull { it.vendorId == VID && it.productId == PID }
             ?: list.firstOrNull { it.vendorId == VID }
+    } catch (t: Throwable) {
+        Oplog.logf("CONN", "findDevice 失败 %s: %s", t.javaClass.simpleName, t.message)
+        null
     }
 
-    fun hasPermission(dev: UsbDevice): Boolean = usb.hasPermission(dev)
+    /**
+     * 设备是否还在系统设备列表里。
+     * 重枚举（03E7 → 2E09）/ 拔线之后，旧 [UsbDevice] 实例会失效，
+     * 对它做 `openDevice`/`claimInterface` 在部分 ROM（华为）上会直接抛异常。
+     */
+    fun isDevicePresent(dev: UsbDevice? = device): Boolean {
+        val d = dev ?: return false
+        return try {
+            usb.deviceList.values.any {
+                it.deviceId == d.deviceId && it.vendorId == d.vendorId && it.productId == d.productId
+            }
+        } catch (t: Throwable) {
+            Oplog.logf("CONN", "deviceList 读取失败 %s: %s", t.javaClass.simpleName, t.message)
+            false
+        }
+    }
+
+    fun hasPermission(dev: UsbDevice): Boolean = try {
+        usb.hasPermission(dev)
+    } catch (t: Throwable) {
+        Oplog.logf("CONN", "hasPermission 失败 %s: %s", t.javaClass.simpleName, t.message)
+        false
+    }
 
     fun requestPermission(dev: UsbDevice) {
         val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
@@ -95,21 +120,54 @@ class UsbLink private constructor(private val ctx: Context) {
         usb.requestPermission(dev, pi)
     }
 
-    /** 打开设备并选好 bulk OUT 端点；需已获得权限。已打开同一设备时直接复用，不重开。 */
-    fun open(dev: UsbDevice): Boolean {
+    /**
+     * 打开设备并选好 bulk OUT 端点；需已获得权限。已打开同一设备时直接复用，不重开。
+     *
+     * **绝不抛异常**：设备在重枚举/拔线后旧实例失效时 `openDevice` 可能抛
+     * `IllegalArgumentException`/`SecurityException`，以前会变成主线程协程崩溃（闪退）。
+     */
+    @Synchronized
+    fun open(dev: UsbDevice): Boolean = try {
+        openInternal(dev)
+    } catch (t: Throwable) {
+        Oplog.logf(
+            "CONN", "open 异常 %s: %s", t.javaClass.simpleName, t.message
+        )
+        try {
+            close()
+        } catch (ignored: Throwable) {
+        }
+        false
+    }
+
+    private fun openInternal(dev: UsbDevice): Boolean {
         val cur = conn
         if (cur != null && device?.deviceId == dev.deviceId && epOut != null) {
+            if (!isDevicePresent(dev)) {
+                Oplog.logf("CONN", "open: 缓存的设备已不在 deviceList，丢弃旧连接")
+                close()
+                return false
+            }
             Oplog.logf("CONN", "open: already open ${dev.deviceName}, reuse fd")
             ensureHid()
             return true
         }
         close()
-        if (!usb.hasPermission(dev)) {
+        if (!isDevicePresent(dev)) {
+            Oplog.logf("CONN", "open: 设备不在 deviceList（已拔出/重枚举）${dev.deviceName}")
+            return false
+        }
+        if (!hasPermission(dev)) {
             Oplog.logf("CONN", "open: no permission ${dev.deviceName}")
             Log.w(TAG, "no permission")
             return false
         }
-        val c = usb.openDevice(dev) ?: run {
+        val c = try {
+            usb.openDevice(dev)
+        } catch (t: Throwable) {
+            Oplog.logf("CONN", "openDevice 异常 %s: %s", t.javaClass.simpleName, t.message)
+            null
+        } ?: run {
             Oplog.logf("CONN", "openDevice failed ${dev.deviceName}")
             Log.e(TAG, "openDevice failed")
             return false
@@ -157,17 +215,27 @@ class UsbLink private constructor(private val ctx: Context) {
     }
 
     private fun claimHid(c: UsbDeviceConnection, dev: UsbDevice): Boolean {
-        for (i in 0 until dev.interfaceCount) {
-            val h = dev.getInterface(i)
-            if (h.interfaceClass == UsbConstants.USB_CLASS_HID) {
-                val ok = UsbGate.io("claim:hid") { c.claimInterface(h, true) }
-                if (ok) hid = h
-                Oplog.logf("CONN", "claim HID if=%d -> %b", h.id, ok)
-                Log.i(TAG, "claim HID if=${h.id} -> $ok")
-                return ok
+        return try {
+            for (i in 0 until dev.interfaceCount) {
+                val h = dev.getInterface(i)
+                if (h.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                    val ok = try {
+                        UsbGate.io("claim:hid") { c.claimInterface(h, true) }
+                    } catch (t: Throwable) {
+                        Oplog.logf("CONN", "claim HID 异常 %s: %s", t.javaClass.simpleName, t.message)
+                        false
+                    }
+                    if (ok) hid = h
+                    Oplog.logf("CONN", "claim HID if=%d -> %b", h.id, ok)
+                    Log.i(TAG, "claim HID if=${h.id} -> $ok")
+                    return ok
+                }
             }
+            false
+        } catch (t: Throwable) {
+            Oplog.logf("CONN", "claimHid 失败 %s: %s", t.javaClass.simpleName, t.message)
+            false
         }
-        return false
     }
 
     /**
@@ -247,64 +315,107 @@ class UsbLink private constructor(private val ctx: Context) {
     fun openHidEndpoint(): UsbEndpoint? {
         val c = conn ?: return null
         val dev = device ?: return null
-        for (i in 0 until dev.interfaceCount) {
-            val itf = dev.getInterface(i)
-            if (itf.interfaceClass == UsbConstants.USB_CLASS_HID) {
-                for (e in 0 until itf.endpointCount) {
-                    val ep = itf.getEndpoint(e)
-                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT && ep.direction == UsbConstants.USB_DIR_IN) {
-                        val ok = UsbGate.io("claim:hid_ep") { c.claimInterface(itf, true) }
-                        if (ok) {
-                            hid = itf
-                            Oplog.logf("HID", "interrupt endpoint 0x%02x claimed=%b", ep.address, ok)
-                            return ep
+        return try {
+            for (i in 0 until dev.interfaceCount) {
+                val itf = dev.getInterface(i)
+                if (itf.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                    for (e in 0 until itf.endpointCount) {
+                        val ep = itf.getEndpoint(e)
+                        if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT && ep.direction == UsbConstants.USB_DIR_IN) {
+                            val ok = try {
+                                UsbGate.io("claim:hid_ep") { c.claimInterface(itf, true) }
+                            } catch (t: Throwable) {
+                                Oplog.logf("HID", "claim 异常 %s", t.javaClass.simpleName)
+                                false
+                            }
+                            if (ok) {
+                                hid = itf
+                                Oplog.logf("HID", "interrupt endpoint 0x%02x claimed=%b", ep.address, ok)
+                                return ep
+                            }
                         }
                     }
                 }
             }
+            null
+        } catch (t: Throwable) {
+            Oplog.logf("HID", "openHidEndpoint 失败 %s: %s", t.javaClass.simpleName, t.message)
+            null
         }
-        return null
     }
 
     /** 拿 HID IN 中断端点（不 claim，用于已 claim 的场景） */
     fun hidInterruptEndpoint(): UsbEndpoint? {
         val dev = device ?: return null
-        for (i in 0 until dev.interfaceCount) {
-            val itf = dev.getInterface(i)
-            if (itf.interfaceClass == UsbConstants.USB_CLASS_HID) {
-                for (e in 0 until itf.endpointCount) {
-                    val ep = itf.getEndpoint(e)
-                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT &&
-                        ep.direction == UsbConstants.USB_DIR_IN
-                    ) return ep
+        return try {
+            for (i in 0 until dev.interfaceCount) {
+                val itf = dev.getInterface(i)
+                if (itf.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                    for (e in 0 until itf.endpointCount) {
+                        val ep = itf.getEndpoint(e)
+                        if (ep.type == UsbConstants.USB_ENDPOINT_XFER_INT &&
+                            ep.direction == UsbConstants.USB_DIR_IN
+                        ) return ep
+                    }
                 }
             }
+            null
+        } catch (t: Throwable) {
+            Oplog.logf("HID", "hidInterruptEndpoint 失败 %s: %s", t.javaClass.simpleName, t.message)
+            null
         }
-        return null
     }
 
-    fun readInterrupt(ep: UsbEndpoint, buf: ByteArray, timeoutMs: Int): Int =
+    fun readInterrupt(ep: UsbEndpoint, buf: ByteArray, timeoutMs: Int): Int = try {
         conn?.bulkTransfer(ep, buf, buf.size, timeoutMs) ?: -1
+    } catch (t: Throwable) {
+        -1
+    }
 
+    /**
+     * 安全关闭：所有 release/close 都吞异常并记日志。
+     *
+     * 以前 `releaseInterface` 在设备已拔出时会抛（主线程 BroadcastReceiver 里就是闪退），
+     * 现在无论是 DETACH 广播还是后台清理线程调用，都只会静默收尾。
+     */
+    @Synchronized
     fun close() {
         val c = conn
-        if (c != null) {
-            intf?.let {
-                UsbGate.io("release:if${it.id}") { c.releaseInterface(it) }
-            }
-            hid?.let {
-                UsbGate.io("release:hid") { c.releaseInterface(it) }
-            }
-            Oplog.log("CONN", "close fd (released iface ${intf?.id}, hid ${hid?.id})")
-            try {
-                c.close()
-            } catch (ignored: Throwable) {
-            }
-        }
+        // 先清引用，避免 release 过程中别的线程再拿到这个 fd
         conn = null
+        val itfToRelease = intf
+        val hidToRelease = hid
+        val dev = device
         intf = null
         hid = null
         epOut = null
         device = null
+        if (c == null) return
+        if (itfToRelease != null) {
+            try {
+                UsbGate.io("release:if${itfToRelease.id}") { c.releaseInterface(itfToRelease) }
+            } catch (t: Throwable) {
+                Oplog.logf(
+                    "CONN", "release if%d 异常 %s: %s",
+                    itfToRelease.id, t.javaClass.simpleName, t.message
+                )
+            }
+        }
+        if (hidToRelease != null) {
+            try {
+                UsbGate.io("release:hid") { c.releaseInterface(hidToRelease) }
+            } catch (t: Throwable) {
+                Oplog.logf("CONN", "release hid 异常 %s: %s", t.javaClass.simpleName, t.message)
+            }
+        }
+        Oplog.log("CONN", "close fd (released iface ${itfToRelease?.id}, hid ${hidToRelease?.id})")
+        try {
+            c.close()
+        } catch (t: Throwable) {
+            Oplog.logf("CONN", "close(fd) 异常 %s: %s", t.javaClass.simpleName, t.message)
+        }
+        if (dev != null) {
+            Oplog.logf("CONN", "closed device %s", dev.deviceName)
+        }
     }
 }

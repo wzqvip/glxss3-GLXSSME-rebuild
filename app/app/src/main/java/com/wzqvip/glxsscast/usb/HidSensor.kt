@@ -156,9 +156,19 @@ class HidSensor(private val link: UsbLink) {
             lastError = "USB 未连接"
             return false
         }
-        // HID claim 是「按 fd」的；同 fd 下 ensureHid 是幂等的
-        link.ensureHid()
-        if (want == Mode.INTERRUPT && link.hidInterruptEndpoint() == null) {
+        // HID claim 是「按 fd」的；同 fd 下 ensureHid 是幂等的。
+        // 设备刚重枚举时 claim 会失败/抛异常 —— 这里只记原因，不往上抛。
+        try {
+            link.ensureHid()
+        } catch (t: Throwable) {
+            Oplog.logf("HID", "ensureHid 异常 %s: %s", t.javaClass.simpleName, t.message)
+        }
+        val hasInterruptEp = try {
+            link.hidInterruptEndpoint() != null
+        } catch (t: Throwable) {
+            false
+        }
+        if (want == Mode.INTERRUPT && !hasInterruptEp) {
             lastError = "没有 HID 中断端点 0x83，回退控制请求轮询"
             Oplog.log("HID", lastError)
             mode = Mode.POLL
@@ -187,7 +197,7 @@ class HidSensor(private val link: UsbLink) {
         if (t != null && t.isAlive) {
             try {
                 t.join(1200)
-            } catch (ignored: InterruptedException) {
+            } catch (ignored: Throwable) {
             }
         }
         Oplog.logf("HID", "stop polls=%d fails=%d events=%d", pollCount, failCount, eventCount)
@@ -198,47 +208,74 @@ class HidSensor(private val link: UsbLink) {
     private fun pollLoop() {
         var failStreak = 0
         while (running) {
-            val t0 = SystemClock.elapsedRealtime()
-            val c = link.connection
-            if (c == null) {
-                lastError = "USB 连接已关闭"
-                break
-            }
-            val raw = try {
-                LcdControl.readHidReport(c, CTRL_TIMEOUT_MS)
-            } catch (t: Throwable) {
-                null
-            }
-            if (raw == null) {
-                failCount++
-                failStreak++
-                lastError = "HID 报告读取失败（n != 28，HID 接口可能被抢/固件异常）"
-                if (failStreak == 5) {
-                    Oplog.logf("HID", "read failed x5 (fails=%d)", failCount)
-                    Oplog.dumpCrash("hid_read_fail(streak=$failStreak)")
+            // HID 线程上任何未捕获异常都会被杀进程（0.1.5 起被 Oplog 兜住），
+            // 但线程死了会表现为「传感器不动」且没有现场 —— 每轮整体兜一层。
+            try {
+                val t0 = SystemClock.elapsedRealtime()
+                val c = link.connection
+                if (c == null) {
+                    lastError = "USB 连接已关闭"
+                    break
                 }
-                // 被 UVC/别的 fd 抢走后重新 claim 一次（同一 fd 时幂等）
-                if (failStreak % 10 == 0) link.ensureHid()
-            } else {
-                failStreak = 0
-                pollCount++
-                val r = parse(raw)
-                report = r
-                handleButton(r)
-                try {
-                    onReport?.invoke(r)
+                val raw = try {
+                    LcdControl.readHidReport(c, CTRL_TIMEOUT_MS)
                 } catch (t: Throwable) {
-                    Log.w(TAG, "onReport failed", t)
+                    null
                 }
-                if (pollCount == 1L || pollCount % 20 == 0L) {
-                    Oplog.logf("HID", "poll=%d %s", pollCount, r.sensorLine(accFsr, gyroFsr))
+                if (raw == null) {
+                    failCount++
+                    failStreak++
+                    lastError = "HID 报告读取失败（n != 28，HID 接口可能被抢/固件异常）"
+                    if (failStreak == 5) {
+                        Oplog.logf("HID", "read failed x5 (fails=%d)", failCount)
+                        Oplog.dumpCrash("hid_read_fail(streak=$failStreak)")
+                    }
+                    // 被 UVC/别的 fd 抢走后重新 claim 一次（同一 fd 时幂等）
+                    if (failStreak % 10 == 0) {
+                        try {
+                            link.ensureHid()
+                        } catch (ignored: Throwable) {
+                        }
+                    }
+                } else {
+                    failStreak = 0
+                    pollCount++
+                    val r = try {
+                        parse(raw)
+                    } catch (t: Throwable) {
+                        failCount++
+                        lastError = "HID 报告解析失败: ${t.javaClass.simpleName}"
+                        null
+                    }
+                    if (r != null) {
+                        report = r
+                        handleButton(r)
+                        try {
+                            onReport?.invoke(r)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "onReport failed", t)
+                        }
+                        if (pollCount == 1L || pollCount % 20 == 0L) {
+                            Oplog.logf("HID", "poll=%d %s", pollCount, r.sensorLine(accFsr, gyroFsr))
+                        }
+                    }
                 }
-            }
-            val spent = SystemClock.elapsedRealtime() - t0
-            val sleep = POLL_INTERVAL_MS - spent
-            if (sleep > 0) {
+                val spent = SystemClock.elapsedRealtime() - t0
+                val sleep = POLL_INTERVAL_MS - spent
+                if (sleep > 0) {
+                    try {
+                        Thread.sleep(sleep)
+                    } catch (ignored: InterruptedException) {
+                        break
+                    }
+                }
+            } catch (t: Throwable) {
+                // 设备拔出/连接被关时 controlTransfer 可能抛；绝不让异常逃出线程
+                failCount++
+                lastError = "HID 轮询异常: ${t.javaClass.simpleName}: ${t.message}"
+                Oplog.logf("HID", "poll loop 异常 %s: %s", t.javaClass.simpleName, t.message)
                 try {
-                    Thread.sleep(sleep)
+                    Thread.sleep(POLL_INTERVAL_MS)
                 } catch (ignored: InterruptedException) {
                     break
                 }
@@ -250,7 +287,11 @@ class HidSensor(private val link: UsbLink) {
     // ---------------- 备选：中断端点 0x83 ----------------
 
     private fun interruptLoop() {
-        val ep = link.hidInterruptEndpoint()
+        val ep = try {
+            link.hidInterruptEndpoint()
+        } catch (t: Throwable) {
+            null
+        }
         if (ep == null) {
             lastError = "没有 HID 中断端点"
             Oplog.log("HID", lastError)
@@ -259,28 +300,43 @@ class HidSensor(private val link: UsbLink) {
         val buf = ByteArray(64)
         Oplog.logf("HID", "interrupt read ep=0x%02x", ep.address)
         while (running) {
-            val n = try {
-                link.readInterrupt(ep, buf, 500)
+            try {
+                val n = try {
+                    link.readInterrupt(ep, buf, 500)
+                } catch (t: Throwable) {
+                    -1
+                }
+                if (n >= 28) {
+                    pollCount++
+                    val r = try {
+                        parse(buf)
+                    } catch (t: Throwable) {
+                        null
+                    }
+                    if (r != null) {
+                        report = r
+                        handleButton(r)
+                        try {
+                            onReport?.invoke(r)
+                        } catch (ignored: Throwable) {
+                        }
+                    }
+                } else if (n < 0) {
+                    failCount++
+                    try {
+                        Thread.sleep(50)
+                    } catch (ignored: InterruptedException) {
+                        break
+                    }
+                } else {
+                    try {
+                        Thread.sleep(50)
+                    } catch (ignored: InterruptedException) {
+                        break
+                    }
+                }
             } catch (t: Throwable) {
-                -1
-            }
-            if (n >= 28) {
-                pollCount++
-                val r = parse(buf)
-                report = r
-                handleButton(r)
-                try {
-                    onReport?.invoke(r)
-                } catch (ignored: Throwable) {
-                }
-            } else if (n < 0) {
-                failCount++
-                try {
-                    Thread.sleep(50)
-                } catch (ignored: InterruptedException) {
-                    break
-                }
-            } else {
+                Oplog.logf("HID", "interrupt loop 异常 %s: %s", t.javaClass.simpleName, t.message)
                 try {
                     Thread.sleep(50)
                 } catch (ignored: InterruptedException) {
