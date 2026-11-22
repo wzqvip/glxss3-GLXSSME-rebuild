@@ -1,72 +1,93 @@
-# 第 3 章 · HID
+# 第 3 章 · HID、传感器与机身按键
 
-> 本章讲清楚：眼镜的 HID 接口里到底有什么、28 B 报告解到哪一步、24 B 版本串怎么读，
-> 以及**为什么必须先 claim 接口**（不 claim 就一律返回 -1）。
+> 这一章回答三件事：**HID 接口里到底有什么**、**28 B 报告每个字节是什么意思**、
+> **眼镜上那一个按键是怎么上报的**。
+>
+> 结论来自两条独立证据链，能对上：
+> 1. 原厂 `libhid.so` 的反汇编（`hid_start_report_info` 里 `0xA1/0x16` 28 B 的解析，
+>    以及 `sensor_get_light/compass/acc_gyro/product_info` 的返回布局）；
+> 2. 社区开源客户端 [`happyme531/glxss-client`](https://github.com/happyme531/glxss-client)
+>    对同一协议的独立实现（`decode_sensor()` = `struct.unpack("<BBH9hBBf", ...)`）。
+>
+> 联网调研的出处与可信度见 **[hid-research.md](hid-research.md)**。
 >
 > 对应代码：[`usb/UsbLink.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/usb/UsbLink.kt)、
 > [`usb/Peripherals.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/usb/Peripherals.kt)、
 > [`lcd/LcdControl.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/lcd/LcdControl.kt)
 >
-> 原始数据：[usb-capture.md §3](usb-capture.md#3-控制传输全部实测)；
-> 请求全枚举：[firmware-extraction.md §3.2](firmware-extraction.md#32-全部-vendor-control-请求枚举没有读-flash内存)
+> 原始抓包：[usb-capture.md §3](usb-capture.md#3-控制传输全部实测)；
+> 原厂初始化序列：[device-recovery.md §4](device-recovery.md#4-原厂-app-的完整初始化序列健康设备hook-libusb100so)
 
 ---
 
-## 1. 原理：HID 接口承担三件事
+## 1. 一句话结论
 
-| 职责 | 通道 | 状态 |
+| 问题 | 答案 | 置信 |
 |---|---|---|
-| 按键 / 触摸 / 传感器上报 | 28 B class 控制请求 `0xA1/0x16`（另有一个中断 IN 端点 `0x83`） | ⚠️ 数据能拿，语义未全解 |
-| 真实固件版本 + 设备 ID | 24 B `0xA1/0x17` | ✅ 可用 |
-| LED / 自动亮度 / 传感器配置 | `0xA1/0x10`、`0x18`、`0x19`、`0x11`–`0x15` | 已知命令，未全部实测 |
+| 眼镜上有几个可编程按键？ | **1 个**（SDK 里叫 Fn 键），HID 码固定 `0x71 = 113` | 【验】 |
+| 28 B 报告解出多少？ | **28/28 B 全解**：15 个字段（按键 2 + 光感 1 + 磁罗盘 3 + 加速度 3 + 陀螺 3 + AF/CAF 2 + 温度 1） | 【验】 |
+| 按键怎么上报？ | 28 B 报告的 `byte[0]=keyStatus`（0=松开，1=按下）、`byte[1]=keyCode=0x71`；原厂 300 ms 轮询一次 `0xA1/0x16` | 【验】 |
+| 中断端点 `0x83` 用不用？ | 原厂 `libhid.so` **完全不用**（只 import 了 `libusb_control_transfer`，没有任何 bulk/interrupt 读）；`0x83` 是描述符里声明了但厂商没走的通道 | 【验】 |
+| 触摸/手势？ | HID 报告里**没有**触摸字段；GLXSS ME 的"手势"是摄像头识别，不是触摸板 | 【推】 |
+| 以前为什么只解出"计数器 + 时间戳"？ | `byte[2]` 其实是 **lux 低字节**，最后 4 B 是 **float 温度**；传感器没使能时 IMU 全 0，看起来像填充 | 【验】字段 /【推】零值原因 |
 
-HID 接口本身是标准 `class 0x03`，带一个中断 IN 端点；但厂商**没有**让 App 去读中断端点，
-而是用 **class control 请求**轮询（原厂约 300 ms 一次，即 ~3–5 次/秒）。
-中断端点 `0x83` 仍然存在，可以用来做事件式读取（本仓库 `Peripherals.startHid()` 走的就是它）。
+---
+
+## 2. 接口与描述符
+
+`if2` 是标准 HID 接口：`class 0x03 / subclass 0 / protocol 0`，一个中断 IN 端点 `0x83`
+（`wMaxPacketSize=64`，`bInterval=8`）。配置描述符里 HID 类描述符为：
+
+```
+offset 0x20b:  09 04 02 00 01 03 00 00     ; if2, 1 ep, class 3, sub 0, proto 0
+offset 0x213:  06 09 21 11 01 00 01 22 1f 00
+               ; bcdHID=0x0111, bNumDescriptors=1,
+               ; type=0x22 (report descriptor), wLength=0x001f (31 B)
+offset 0x21d:  07 05 83 03 40 00 08        ; ep 0x83 INT IN, 64 B, interval 8
+```
+
+> 31 B 的报告描述符内容**没有抓到**（要 `GET_DESCRIPTOR(0x22)` 才有）。
+> 从长度看，一个"厂商自定义 usage page + report ID 1 + 224 bit 输入"的描述符正好在这个量级，
+> 但**未验证**。见 §11。
+
+厂商实际只走 **class control 请求轮询**，不读 `0x83`：
 
 ```
 if2  class 0x03  ep 0x83 INT IN 64 (interval 8)
   │
-  ├─ control IN 0xA1/0x16  wIndex=2  len=28   ← 原厂轮询，稳定拿到报告
-  ├─ control IN 0xA1/0x17  wIndex=2  len=24   ← 版本 + 设备 ID
-  └─ bulk/interrupt IN ep 0x83                ← 本仓库可选路径（待验证）
+  ├─ control IN 0xA1/0x16  wIndex=2  wLen=28   ← 原厂每 300 ms 一次，28 B 报告
+  ├─ control IN 0xA1/0x17  wIndex=2  wLen=24   ← 版本串 + 设备 ID
+  ├─ control IN 0xA1/0x04/05/06                ← 光感/罗盘/IMU 的属性（不是数据）
+  └─ control OUT/IN 0xA1/0x10..0x1A            ← 传感器开关、FSR、LED、复位
 ```
 
 ---
 
-## 2. 接口与 claim 语义（最重要的一节）
+## 3. claim 语义（不 claim 就全是 -1）
 
-### 2.1 不 claim 就 -1
+### 3.1 内核 `hid-generic` 会先占住接口
 
-在 Android 上，`hid-generic` 内核驱动会先占用 HID 接口。此时：
-
-- 枚举正常；
-- 但 `0xA1/0x16`、`0xA1/0x17` **全部返回 -1**（`controlTransfer` 失败）；
-- dmesg 里持续出现 `input irq status -75`（EOVERFLOW）。
-
-一旦 `claimInterface(hid, force = true)`：
+Android/Linux 的 `hid-generic` 驱动会绑定 if2。此时枚举一切正常，但
+`0xA1/0x16`、`0xA1/0x17` **全部返回 -1**，dmesg 持续 `input irq status -75`。
 
 ```
 修复前：读取真实固件版本 → "读固件版本失败"   (0xA1/0x17 ret=-1)
 修复后：读取真实固件版本 → "G25_MainFW_1.9.1" (ret=24)
 ```
 
-原厂 App 冷启动时也是先 `CLAIM iface=2` 再发 `0xA1/0x16`（见
-[device-recovery.md §4](device-recovery.md#4-原厂-app-的完整初始化序列健康设备hook-libusb100so)），完全一致。
+原厂 App 冷启动也是先 `CLAIM iface=2` 再发 `0x16`（[device-recovery.md §4](device-recovery.md#4-原厂-app-的完整初始化序列健康设备hook-libusb100so)），
+与我们的做法一致。
 
-### 2.2 claim 是"按 fd"的，不是全局锁
-
-这是本项目踩过的最隐蔽的坑：
+### 3.2 claim 是按 fd 的，会被抢
 
 1. `UsbLink` 用自己的连接 claim 了 HID → `0x17` 正常；
 2. `UvcCamera` 用**另一个 fd** 打开设备，也 `claimInterface(hid, force=true)`；
-   usbfs 会把接口从 `UsbLink` 的连接上**抢走**；
+   usbfs 把接口从 `UsbLink` 的连接上抢走；
 3. 关掉 UVC 后，`UsbLink` 的 `0x17` 又变回 -1。
 
-解决办法：**每次读版本/轮询前重新 claim**：
+解决办法：**每次读之前重新 claim**：
 
 ```kotlin
-// usb/UsbLink.kt
 fun ensureHid(): Boolean {
     val c = conn ?: return false
     val d = device ?: return false
@@ -90,188 +111,410 @@ private fun claimHid(c: UsbDeviceConnection, dev: UsbDevice): Boolean {
 `UsbLink.open()` 里也会顺手 claim 一次；`UvcCamera.open()` 同样会 claim（保持兼容）。
 MainActivity 的「读取真实固件版本」按钮在调用前显式 `usb.ensureHid()`。
 
-### 2.3 dmesg 里的 `-75` 是正常的
+### 3.3 `-75` 是正常的
 
-每次枚举后 `hid-generic` 会打 4–6 条 `input irq status -75`，**健康设备也有**。
-它不是固件挂掉的证据（早期文档曾误判，已在
-[device-recovery.md §2.4](device-recovery.md#24-dmesg-里的-input-irq-status--75-是正常现象别误判) 更正）。
+每次枚举后 `hid-generic` 会打 4–6 条 `input irq status -75`，**健康设备也有**，
+不是固件挂掉的证据（[device-recovery.md §2.4](device-recovery.md#24-dmesg-里的-input-irq-status--75-是正常现象别误判)）。
 
 ---
 
-## 3. 请求总表
+## 4. 请求总表（已按 `libhid.so` 反汇编修正）
 
-全部是 `bmRequestType = 0xA1`（Device-to-Host | Class | Interface），`wIndex = 2`。
-长度和用途来自 `libhid.so` 的静态枚举 + 抓包交叉核对。
+全部 `bmRequestType = 0xA1`，`wIndex = 2`（HID 接口），`wValue` 见备注，超时 5000 ms。
 
-| 请求 | wValue | wLength | 用途 | 状态 |
+| 请求 | wLen | 方向 | 实际语义 | 状态 |
 |---|---|---|---|---|
-| `0xA1/0x04` | 0 | 12 | 传感器数据 | 未解 |
-| `0xA1/0x05` | 0 | 12 | 传感器数据 | 未解 |
-| `0xA1/0x06` | 0 | 16 | 原厂用于 HID 描述符 / 传感器数据（语义未定） | 未解 |
-| `0xA1/0x10` | 0/1 | 1 | 自动亮度开关 | 已用（`LcdControl.setAutoBrightness`） |
-| `0xA1/0x11` | 0 | 1 | 传感器开关 | 未用 |
-| `0xA1/0x12` | 0 | 1 | 传感器开关 | 未用 |
-| `0xA1/0x13` | 0 | 1 | 传感器量程 | 未用 |
-| `0xA1/0x14` | 0 | 1 | 传感器量程 | 未用 |
-| `0xA1/0x15` | 0 | 1 | 传感器配置 | 未用 |
-| `0xA1/0x16` | 0 | **28** | HID 传感器报告 | ⚠️ 部分解出 |
-| `0xA1/0x17` | 0 | **24** | **版本串 + 设备 ID** | ✅ 可用 |
-| `0xA1/0x18` | 0 | 1 | 配置 | 未用 |
-| `0xA1/0x19` | 0/1 | 1 | LED 指示灯 | 已用（`LcdControl.setLed`） |
-| `0xA1/0x1A` | 0 | 2 | 状态 | 未解 |
+| `0x04` | 12 | IN | 光感属性：`u8 status, u8 enabled, u16 rsvd, u64 chipId@4` | 已解【验】 |
+| `0x05` | 12 | IN | 罗盘属性：同 `0x04` 布局 | 已解【验】 |
+| `0x06` | 16 | IN | IMU 属性：`acc_status@0, acc_en@1, acc_fsr@2, gyro_status@3, gyro_en@4, gyro_fsr@5, u64 chipId@8` | 已解【验】 |
+| `0x10` | 1 | IN/OUT | 光感（自动亮度）开关，`wValue=0/1` | 已解【验】 |
+| `0x11` | 1 | IN/OUT | 罗盘开关，`wValue=0/1` | 已解【验】 |
+| `0x12` | 1 | IN/OUT | 加速度计开关，`wValue=0/1` | 已解【验】 |
+| `0x13` | 1 | IN/OUT | 加速度量程（FSR） | 【推】 |
+| `0x14` | 1 | IN/OUT | 陀螺仪开关，`wValue=0/1` | 已解【验】 |
+| `0x15` | 1 | IN/OUT | 陀螺量程（FSR）；字符串存在，**本库未见调用** | 【未】 |
+| `0x16` | **28** | IN | **HID 报告**（按键 + 光感 + 罗盘 + IMU + AF/CAF + 温度） | 已解【验】 |
+| `0x17` | **24** | IN | 产品信息：16 B 版本串 + 8 B 设备 ID | 已解【验】 |
+| `0x18` | 1 | IN/OUT | 系统复位（`sensor_set_system_reset_after_500_ms`） | 【推】 |
+| `0x19` | 1 | IN/OUT | 指示灯 LED，`wValue=0/1` | 已解【验】 |
+| `0x1A` | 2 | IN | MOVI（Myriad）last state，原厂只打日志 | 【未】 |
 
-> 表里没有"读 flash / 读内存"类请求；HID 侧最大读取就是 28 B 报告和 264 B EEPROM（LCD 侧）。
-> 这也是"固件无法从设备回读"的证据之一，见 [firmware-extraction.md](firmware-extraction.md)。
+补充事实：
+
+- **旧文档把 `0x04/0x05/0x06` 写成"传感器数据"是错的。** 它们返回的是
+  `LightAttribute` / `CompassAttribute` / `AcceleratorGyroAttribute`，
+  原生代码解析后调 Java 构造器 `(IZJ)V` / `(IZJ)V` / `(IZIIZIJ)V`，
+  字段与长度严格对应（见 §9）。
+- 13 个控制请求在 `libhid.so` 里全部是 `libusb_control_transfer` 调用；
+  **没有** `libusb_bulk_transfer` / 中断读 —— 这是"原厂不读 `0x83`"的直接证据。
+- `0x18` 在库里没有 500 ms 的 sleep，延迟复位是固件侧行为；**别随手试**。
 
 ---
 
-## 4. 28 B 报告：解到哪一步
+## 5. 28 B 报告：字段全解
 
-实测样本（`0xA1/0x16`）：
+原厂 `hid_start_report_info` 的线程循环（libhid.so Thumb，函数 `0x1b2c`）：
+
+```
+每 300 ms:
+  lock; n = control(0xA1,0x16,wValue=0,wIndex=2,buf,28,5000); unlock
+  if (n != 28) { log("hid get info fail"); 停止线程 }
+  解析 buf → HIDInfo → onHidInfoCallback(HIDInfo)
+  usleep(300000)
+```
+
+解析代码在 `0x1d38–0x1d4e`（取字段）和 `0x1b56–0x1c28`（按 `HIDInfo` 构造器顺序压栈），
+可以直接对出下面这张表。
+
+### 5.1 布局
+
+```
+偏移  类型        字段           说明
+0     u8          keyStatus      0=松开/抬起，1=按下（见 §6）
+1     u8          keyCode        固定 0x71 = 113 = KEY_CODE_GLXSS_BUTTON
+2     u16 LE      lux            环境光，原始值（样本 0x0050=80）
+4     i16 LE      compass_x      磁罗盘原始值
+6     i16 LE      compass_y
+8     i16 LE      compass_z
+10    i16 LE      acc_x          加速度原始值
+12    i16 LE      acc_y
+14    i16 LE      acc_z
+16    i16 LE      gyro_x         陀螺原始值
+18    i16 LE      gyro_y
+20    i16 LE      gyro_z
+22    u8          af_result      自动对焦结果（相机侧状态，语义未细究）
+23    u8          caf_flag       连续自动对焦标志
+24    f32 LE      temperature    温度，摄氏度（样本 60.527）
+```
+
+等价的 C/Python 解包：`struct.unpack("<BBH9hBBf", data)`（**验证过**，见社区实现）。
+
+### 5.2 实测样本逐字节
 
 ```
 00 71 50 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 41 1b 72 42
-    ▲  ▲                                                                 ▲────────▲
-    │  └ byte[2] 递增计数（0x50 → 0x65 …）                              最后 4 B 疑似时间戳
-    └ byte[1] = 0x71（固定？）
+│  │  └──┬──┘ └────────────────────────── 全 0 ──────────────────────────┘ └──┬───┘
+│  │     │                                                                     │
+│  │     └ byte[2..3] = 0x0050 = 80 lux                                        └ f32 = 60.527 °C
+│  └ byte[1] = 0x71 = 113（Fn 键码，松开时也保留）
+└ byte[0] = 0（松开）
 ```
 
-| 偏移 | 长度 | 当前结论 | 置信 |
-|---|---|---|---|
-| 0 | 1 | 固定 `0x00`（report ID？） | 【验】样本一致 |
-| 1 | 1 | `0x71`，含义未知（可能是报告类型/长度/标志） | 【未】 |
-| 2 | 1 | **递增计数器**（每包 +1，溢出回绕） | 【验】 |
-| 3–23 | 21 | 疑似若干传感器样本，**未解** | 【未】 |
-| 24–27 | 4 | 疑似时间戳（`41 1b 72 42`），与系统 uptime 的关系未验证 | 【推】 |
+> **对旧文档的更正**：`byte[2]` 不是"递增计数器"，是 lux 低字节（样本 80，
+> 之前记录 0x50→0x65 是室内光照从 80 变到 101）；最后 4 B 不是时间戳，是温度。
+> IMU/罗盘全 0 **很可能是**传感器没被使能（`0x10–0x14` 没发，或固件默认关闭）——
+> 社区客户端也是先 `enable_sensors()` 再读，使能后才有非零数据。【推】
 
-### 4.1 为什么只解出这么点
+### 5.3 单位换算
 
-- 厂商 App 对这些字段的用法是**不透明**的：`SensorService` 直接把 byte[] 交给上层，
-  Java 代码里没有逐字段解析（jadx 里也找不到 struct 定义）；
-- `0xA1/0x04`、`0x05`、`0x06` 还各有一份 12/12/16 B 的数据，说明传感器信息被拆成了多条请求，
-  28 B 报告可能只是其中一部分；
-- 固件 strings 里有加速度/陀螺/光感相关的驱动名，但没有报告布局。
+FSR 由 `0x06` 的 `acc_fsr` / `gyro_fsr`（0–3）决定：
 
-### 4.2 怎么继续解（建议）
+| fsr | 加速度量程 | 陀螺量程 |
+|---|---|---|
+| 0 | ±2 g | ±250 °/s |
+| 1 | ±4 g | ±500 °/s |
+| 2 | ±8 g | ±1000 °/s |
+| 3 | ±16 g | ±2000 °/s |
 
-1. 静止平放 10 秒，记录 200 个包，看哪些字段**恒定**（零偏/量程）；
-2. 绕三个轴分别旋转，看哪两组 int16 呈正弦变化 → 陀螺；
-3. 快速平移/倾斜，看另一组 → 加速度；
-4. 遮住光感/改变环境光，看哪个字节跳变；
-5. 按 `int16 LE` 切成若干通道，与 Android `SensorManager` 同姿态数据对齐。
-   （本项目**没有**做这一步，28 B 的语义仍是开放的。）
+```
+acc_g    = raw * (2,4,8,16)[acc_fsr] / 32768
+gyro_dps = raw * (250,500,1000,2000)[gyro_fsr] / 32768
+```
+
+坐标系与姿态约定（社区在真机上确认）：**抬头为 +**；
+`pitch = atan2(x, hypot(y,z))`，`roll = atan2(z, y)`。
+磁罗盘需要做硬铁/软铁校准（`glxss-client` 有 60 样本、3 轴跨度 ≥40 的校准流程）。
+
+### 5.4 新旧 SDK 的差异
+
+- 旧 SDK（`re/old-apks/me-jadx`，应用商店 1.8.4）的 `HIDInfo` 只有 **12 个字段**，
+  到 `gyro_z` 为止 —— 即 `byte[0..21]`，没有 `af/caf/temperature`。
+- 新 SDK（2.3.7，`re/liangliang`）的 `HIDInfo` 是 **15 个字段**，
+  构造器签名 `(IIIIIIIIIIIIIIF)V`，多了 `af_result`、`caf_flag`、`temperature`。
+- 结论：28 B 是**后加的 6 字节**（`byte[22..27]`）；老固件/老 App 只解析前 22 B 也能工作。
+  升级 App 时按 28 B 解析即可，向后兼容（老设备尾部可能是 0）。
 
 ---
 
-## 5. 24 B 版本查询（✅ 可用）
+## 6. 按键：一个 Fn 键，码 0x71
 
-`0xA1/0x17`，`wIndex=2`，`wLength=24`：
+### 6.1 码表
+
+| 常量 | 值 | 出处 |
+|---|---|---|
+| `KEY_CODE_GLXSS_BUTTON` | **113 = 0x71** | `IKeyEventClient.java`（新旧 SDK 相同） |
+| `KEY_STATUS_UP` | 0 | 同上 |
+| `KEY_STATUS_DOWN` | 1 | 同上 |
+
+SDK 里**只定义了这一个键码**。`libhid.so` 里没有任何 key 码表/字符串 —— 原生层只是把
+`byte[0]/byte[1]` 原样塞进 `HIDInfo`，语义完全在 Java 层。
+（Linux evdev 的 113 是 `KEY_MUTE`，但这里只是厂商自选值，别按 evdev 解释。）
+
+### 6.2 原厂怎么把"电平"变成"点击/长按"
+
+原厂不是收事件，而是**每 300 ms 采一次电平**，然后在 `KeyEventClient` 里数重复次数：
+
+```
+e = 上次 keyStatus（-1 表示第一包）
+if (e != status) count = 0 else count++
+isLong = (count == 3)          // 新版 2.3.7
+switch (status):
+  case 0 (UP):
+      if (!first && !longFired && count == 0) -> onClick(keyCode)
+      longFired = false
+  case 1 (DOWN):
+      if (!first && isLong) { longFired = true; onLongClick(keyCode) }
+e = status
+```
+
+- 单击 = 按下后**第一个松开包**（`count==0`）；
+- 长按 = **连续第 4 个按下包**（`count==3`），即 3 个轮询间隔 ≈ **0.9 s**（含抖动约 1.2 s）；
+- 旧 SDK（1.8.4）阈值是 `repeatCount == 15`（约 16 包），说明老版本轮询更快或防抖更保守；
+- 社区客户端用 0.8 s 时间阈值，效果等价。
+
+> 推论：如果一次按下-松开短于 300 ms 且固件不锁存，可能整段被漏掉。
+> 是否锁存**未验证**（§11）。
+
+### 6.3 原厂 App 把按键绑到了什么
+
+全仓库只有一处消费按键：`com/llvision/app/CameraFragment.setGlxssKey()`。
+
+```java
+mKeyEventClient.setOnGlxssFnClickListener(keyCode -> {
+    if (recordMode) {                  // 只在录像中生效
+        mFov++; if (mFov > 2) mFov = 0;
+        // 切 FOV 档位：图标换成 btn_fov_10x2x / btn_fov_15x2x / btn_fov_20x2x
+        mHandler.sendEmptyMessageDelayed(93, 500);   // 500ms 后再下发
+    }
+});
+```
+
+- **单击**：录像中循环切换 FOV 三档（图标 `btn_fov_10x2x` / `15x2x` / `20x2x`）；不在录像时**什么都不做**。
+- **长按**：原厂 App **没有**注册 `setOnGlxssFnLongClickListener`（SDK 提供，App 未用）。
+- **没有**"拍照 / 返回 / 菜单"的按键绑定。拍照/录像是屏幕上的按钮（另一路 UVC/LCD 命令）。
+
+### 6.4 没有触摸板
+
+- 28 B 报告没有触摸坐标/手势字段，SDK 也没有 `Touch` 相关类；
+- GLXSS ME 宣传里的"手势翻页"是**摄像头 RGB 识别**（青亭网 2018 发布会实测），不是触摸；
+- 初代 Glxss（2015，一体机）才有"电源键 + 拍照键 + 四手势触摸板"，**不是 G25**。
+
+---
+
+## 7. 读取与解析（Kotlin 可直接抄）
+
+### 7.1 claim + 读一包
 
 ```kotlin
-// lcd/LcdControl.kt
-fun getFirmwareVersion(conn: UsbDeviceConnection): String? {
-    val buf = ByteArray(24)
-    val n = conn.controlTransfer(REQ_CTRL, 0x17, 0, IFACE_AUX, buf, 24, TIMEOUT)
-    if (n <= 0) return null
-    val s = String(buf, 0, minOf(16, n), Charsets.US_ASCII)
-    return s.trim('\u0000', ' ', '\n')
+private const val REQ_TYPE_IN   = 0xA1          // 0x80 | 0x20 | 0x01
+private const val IFACE_HID     = 2
+private const val REQ_HID_INFO  = 0x17
+private const val REQ_HID_REPORT= 0x16
+private const val TIMEOUT_MS    = 1500
+
+private var hidItf: UsbInterface? = null
+
+fun claimHid(conn: UsbDeviceConnection, dev: UsbDevice): Boolean {
+    for (i in 0 until dev.interfaceCount) {
+        val itf = dev.getInterface(i)
+        if (itf.interfaceClass == UsbConstants.USB_CLASS_HID) {
+            val ok = conn.claimInterface(itf, true)
+            if (ok) hidItf = itf
+            return ok
+        }
+    }
+    return false
+}
+
+fun readReport(conn: UsbDeviceConnection): ByteArray? {
+    if (hidItf == null) return null
+    val buf = ByteArray(28)
+    val n = conn.controlTransfer(REQ_TYPE_IN, REQ_HID_REPORT, 0, IFACE_HID, buf, 28, TIMEOUT_MS)
+    return if (n == 28) buf else null   // -1 = 没 claim 住 / 被 UVC 抢走
 }
 ```
 
-返回布局（`libhid.so` 的 `sensor_get_product_info` 反汇编 + 实测）：
-
-| 偏移 | 长度 | 内容 |
-|---|---|---|
-| 0–15 | 16 | ASCII 版本串，实跑为 `G25_MainFW_1.9.1`（正好 16 字符） |
-| 16–23 | 8 | 设备 ID（两个 u32，拼成 64 位 `glxssId`） |
-
-> 这是**唯一可靠的"设备当前在跑哪版固件"来源**。
-> 原厂主界面那个 "Firmware: G25_MainFW_1.9.1" 是硬编码 asset 文件名，不是从设备读的；
-> LCD 侧的 `firmwareID`（EEPROM 偏移 52–59）是 8 字符工厂 ID，也不等于语义版本。
-
----
-
-## 6. 驱动步骤
-
-```
-1) 拿到 UsbDeviceConnection（可复用 UsbLink.connection），确认设备是 2E09:0030
-2) claimInterface(if2, force = true)        ← 必须；否则下面全部返回 -1
-3) （可选）0xA1/0x17 wIndex=2 wLen=24 读版本串 + 设备 ID
-4) 轮询 0xA1/0x16 wIndex=2 wLen=28           ← 原厂约 300 ms 一次
-   或尝试读中断端点 0x83（实验性，见 §7）
-5) 解析：byte[2] 计数器；其余字段待解（见 §4）
-6) 任何请求返回 -1 → 先 ensureHid() 重新 claim，再重试
-7) 关闭 UVC 之后也要 ensureHid()（它会抢走 HID）
-```
-
-## 7. 中断端点读取（可选路径）
-
-`Peripherals.startHid()` 用 `openHidEndpoint()` 找到 `0x83`，然后循环读：
+### 7.2 解析
 
 ```kotlin
-// usb/Peripherals.kt
-val ep = link.openHidEndpoint()
-if (ep == null) { lastHidHex = "no HID endpoint"; return }
-hidRunning = true
-val t = Thread {
-    val buf = ByteArray(64)
-    while (hidRunning) {
-        val n = try { link.readInterrupt(ep, buf, 500) } catch (e: Exception) { -1 }
-        if (n > 0) {
-            hidPackets++
-            val sb = StringBuilder()
-            for (i in 0 until n) sb.append(String.format("%02x", buf[i]))
-            lastHidHex = sb.toString()
-        } else Thread.sleep(50)
+data class HidReport(
+    val keyStatus: Int, val keyCode: Int,
+    val lux: Int,
+    val compass: IntArray, val acc: IntArray, val gyro: IntArray,
+    val afResult: Int, val cafFlag: Int,
+    val temperatureC: Float,
+)
+
+fun parseReport(b: ByteArray): HidReport {
+    require(b.size == 28)
+    val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
+    val keyStatus = bb.get().toInt() and 0xFF
+    val keyCode   = bb.get().toInt() and 0xFF
+    val lux       = bb.short.toInt() and 0xFFFF
+    val compass   = IntArray(3) { bb.short.toInt() }
+    val acc       = IntArray(3) { bb.short.toInt() }
+    val gyro      = IntArray(3) { bb.short.toInt() }
+    val af        = bb.get().toInt() and 0xFF
+    val caf       = bb.get().toInt() and 0xFF
+    val temp      = bb.float
+    return HidReport(keyStatus, keyCode, lux, compass, acc, gyro, af, caf, temp)
+}
+```
+
+### 7.3 按键状态机（单击 / 长按）
+
+```kotlin
+class FnButton(private val longMs: Long = 900) {
+    private var pressedAt = 0L
+    private var longFired = false
+
+    sealed class Event { data class Click(val code: Int) : Event()
+                          data class LongPress(val code: Int) : Event() }
+
+    fun feed(r: HidReport, now: Long = SystemClock.elapsedRealtime()): Event? {
+        if (r.keyCode != 113) return null
+        when (r.keyStatus) {
+            1 -> {
+                if (pressedAt == 0L) { pressedAt = now; longFired = false }
+                if (!longFired && now - pressedAt >= longMs) {
+                    longFired = true
+                    return Event.LongPress(r.keyCode)
+                }
+            }
+            0 -> {
+                val t = pressedAt
+                pressedAt = 0
+                if (t != 0L && !longFired) return Event.Click(r.keyCode)
+                longFired = false
+            }
+        }
+        return null
     }
 }
 ```
 
-`readInterrupt()` 实际调用的是 `UsbDeviceConnection.bulkTransfer(ep, ...)`：
+> 注意：`readReport()` 每 300 ms 一次即可（与固件节奏一致）。用
+> `lifecycleScope.launch(Dispatchers.IO) { while (active) { ...; delay(300) } }`，
+> 别在主线程轮询。
+
+### 7.4 先使能传感器，否则 IMU 全 0
 
 ```kotlin
-fun readInterrupt(ep: UsbEndpoint, buf: ByteArray, timeoutMs: Int): Int =
-    conn?.bulkTransfer(ep, buf, buf.size, timeoutMs) ?: -1
+fun enableSensors(conn: UsbDeviceConnection) {
+    // 0x10 light / 0x11 compass / 0x12 acc / 0x14 gyro
+    for (req in intArrayOf(0x10, 0x11, 0x12, 0x14)) {
+        val ack = ByteArray(1)
+        val n = conn.controlTransfer(0xA1, req, 1, IFACE_HID, ack, 1, TIMEOUT_MS)
+        Log.i(TAG, "enable 0x%02x -> n=%d ack=%d".format(req, n, ack[0].toInt()))
+    }
+}
+
+fun readLightAttr(conn: UsbDeviceConnection): ByteArray {   // 12 B
+    val b = ByteArray(12)
+    conn.controlTransfer(0xA1, 0x04, 0, IFACE_HID, b, 12, TIMEOUT_MS); return b
+}
+// 0x05 同构；IMU 用 0x06 + 16 B
 ```
 
-> **待验证**：Android 没有独立的 `interruptTransfer` API，社区常用 `bulkTransfer` 或
-> `UsbRequest.queue()` 读中断端点。前者在本设备上是否稳定收到包，本项目**没有留下实测记录**；
-> 更稳的做法是用 `UsbRequest`（`UsbRequest().initialize(conn, ep)` + `queue()/requestWait()`）。
-> 已知可靠的是 control 轮询 `0xA1/0x16`，UI 的「开始 HID 监听」属于实验功能。
+返回布局（原生 `0x2046` / `0x21fe` 处逐字节拷贝，已核对）：
+
+```
+0x04/0x05 (12B): status@0  enabled@1  chipId(u64 LE)@4
+0x06      (16B): acc_status@0 acc_en@1 acc_fsr@2 gyro_status@3 gyro_en@4 gyro_fsr@5
+                 chipId(u64 LE)@8
+```
+
+`acc_fsr` / `gyro_fsr` 就是 §5.3 的 0–3。
 
 ---
 
-## 8. 实测数据
+## 8. 24 B 产品信息（`0xA1/0x17`）
+
+```kotlin
+fun readProduct(conn: UsbDeviceConnection): Pair<String, Long>? {
+    val b = ByteArray(24)
+    val n = conn.controlTransfer(0xA1, 0x17, 0, IFACE_HID, b, 24, TIMEOUT_MS)
+    if (n != 24) return null
+    val version = String(b, 0, 16, Charsets.US_ASCII).trimEnd('\u0000', ' ')
+    val id = ByteBuffer.wrap(b, 16, 8).order(ByteOrder.LITTLE_ENDIAN).long
+    return version to id
+}
+```
+
+| 偏移 | 长度 | 内容 |
+|---|---|---|
+| 0–15 | 16 | ASCII 版本串，实跑 `G25_MainFW_1.9.1`（正好 16 字符，无 NUL） |
+| 16–23 | 8 | 设备 ID（u64 LE，Java 侧 `ProductInfo.getGlxssId()`） |
+
+原生 `sensor_get_product_info`（函数 `0x22b0`）先 `memcpy(16)` 到输出，
+再写一个 NUL，然后把 `buf+16..23` 的 8 字节拼成 `long`，调用
+`ProductInfo(String, long)` 构造器（签名 `(Ljava/lang/String;J)V`）。【验】
+
+> 注意：`ProductInfo(byte[])` 那个 256 B 的解析器走的是 **LCD/EEPROM**，不是这条 24 B
+> 请求。两个 `ProductInfo` 同名但来源不同，别混。
+
+---
+
+## 9. `0x1A` 与其余细节
+
+- `0x1A`（2 B）：`hid_get_movi_last_state`，日志格式
+  `hid_get_movi_last_state:ret=%d,DATA=0x%x`；ret==2 时返回 2 B 值，否则返回 ret。
+  猜测是 Myriad 的启动/运行状态（`[未]`），本项目没用到。
+- 所有请求的 `wIndex` 都是 **2**；`0x04/0x05/0x06/0x16/0x17` 的 `wValue` 都是 0。
+- `0x10/0x11/0x12/0x13/0x14/0x15/0x18/0x19` 是"写 1 字节"：`wValue` 是参数，
+  `data` 是 1 B 返回缓冲（原厂也读 1 B 回来做 ack）。
+
+---
+
+## 10. 实测数据与复现
 
 | 项 | 值 |
 |---|---|
 | `0xA1/0x17` 未 claim | `-1` |
-| `0xA1/0x17` 已 claim | `ret=24`，版本 `G25_MainFW_1.9.1` |
-| `0xA1/0x16` 频率 | 原厂约 300 ms 一次（~3.3 次/秒）；抓包描述约 5 次/秒 |
-| `0xA1/0x16` 计数器 | `byte[2]` 逐包 +1（样本 `0x50` → `0x65`） |
-| `0xA1/0x16` 尾部 | 最后 4 B 每包变化，疑似时间戳 |
-| 枚举后 dmesg | `input irq status -75` ×4–6，**正常** |
+| `0xA1/0x17` 已 claim | `ret=24`，`G25_MainFW_1.9.1` |
+| `0xA1/0x16` 频率 | 原厂 300 ms（`usleep(300000)`，反汇编 `0x1c90`） |
+| `0xA1/0x16` 长度 | 固定 28；≠28 时原厂打日志并**停线程** |
+| 中断端点 | 原厂零调用；本仓库 `bulkTransfer` 路径未验证 |
+
+复现反汇编（不碰设备）：
+
+```powershell
+# 本仓库外的分析脚本：re/liangliang/tools/dis4.py
+python dis4.py native/libhid.so .text thumb 1b2c 1e64   # 28B 轮询 + 解析
+python dis4.py native/libhid.so .text thumb 22b0 23dc   # 0x17 产品信息
+python dis4.py native/libhid.so .text thumb 203e 2060   # 0x04 属性
+```
+
+关键地址：`0x1d02` 发 `0x16` 请求，`0x1d38–0x1d4e` 取字段，
+`0x1b56–0x1c28` 按 `HIDInfo` 15 参构造器压栈；`0x1c90` 的 `usleep(0x493e0)` = 300 ms。
 
 ---
 
-## 9. 坑与注意事项
+## 11. 待验证
 
-1. **必须先 claim HID 接口**，否则所有 HID class 请求返回 -1。
-2. **claim 按 fd 生效**：UVC 用另一个连接 force claim 会抢走；关掉 UVC 后要 `ensureHid()`。
-3. **不要和 Linux 的 `hid-generic`/`hidraw` 抢**：在 PC 上调试时设备可能被内核接管，
-   需要 detach 或用 libusb 的 auto-detach（仅主机侧）。
-4. **`input irq status -75` 不是故障**，别据此判断固件挂了。
-5. **28 B 不是"传感器完整快照"**：还有 0x04/0x05/0x06 三条请求，别只抓一条就下结论。
-6. **`0xA1/0x17` 的 16 B 版本串不带 NUL**：正好 16 字符，读出来要自己 trim。
-7. **HID 报告里的计数器会回绕**（u8），丢包判断不能只看计数器差。
-8. **别把 `0xA1/0x19`（LED）当状态查询**：它是写命令，`wValue=0/1`。
+- [ ] `GET_DESCRIPTOR(0x22)` 拿 31 B 报告描述符：确认 28 B 报告是否有 report ID、
+      是否是标准 input report（决定 `0x83` 能不能当事件流用）。
+- [ ] `0x83` 中断端点用 `UsbRequest.queue()` 读是否稳定；有没有"按键事件"包。
+- [ ] 按下-松开的**锁存行为**：<300 ms 的点击会不会丢。
+- [ ] `keyStatus/keyCode` 之外的按键位：长按/双击是否还有别的码（目前只有 0x71）。
+- [ ] 传感器默认状态：不使能时 IMU 全 0 是否属实；使能后 `0x16` 是否立刻有数据。
+- [ ] `lux` 的量程/单位（原始值 vs lux 标定）、`temperature` 的准确性（样本 60.5 °C 偏高）。
+- [ ] `af_result` / `caf_flag` 的取值含义（相机 AF 状态？谁在写？）。
+- [ ] `0x13` / `0x15`（FSR 写）的取值范围与实际效果；`0x15` 为何在库里没有调用点。
+- [ ] `0x18` 复位的实际行为与恢复时间（**危险，别在正常设备上试**）。
+- [ ] `0x1A` 两个字节的定义。
+
+以上除 `0x18` 外都不需要拆机，用 `0x16` 轮询 + 手动按键/遮光/转动即可。
 
 ---
 
-## 10. 待验证
+## 12. 参考
 
-- [ ] 28 B 报告中 byte[3..23] 的字段语义（先用静止/旋转/遮光三组实验）。
-- [ ] `0xA1/0x04` / `0x05` / `0x06` 返回的 12/12/16 B 分别是什么。
-- [ ] `0xA1/0x11`–`0x15` 传感器开关/量程的实际效果。
-- [ ] 中断端点 `0x83` 是否能稳定收到事件（用 `UsbRequest` 重写后再测）。
-- [ ] 按键事件是否真的走 HID，还是走别的接口（至今没抓到明确的按键包）。
+- 本地证据：`re/liangliang/native/libhid.so`（ARM32 Thumb-2，符号已 strip）；
+  `re/liangliang/jadx-out/sources/com/llvision/glass3/{sdk,framework}/hid/**`；
+  `re/liangliang/usb-descriptors.bin`（配置描述符 752 B）。
+- 原厂 App：`com.llvision.glass3.sdk.service.KeyEventService`、
+  `com.llvision.glass3.framework.hid.KeyEventClient`、`com.llvision.app.CameraFragment`。
+- 社区独立实现（同协议）：[happyme531/glxss-client](https://github.com/happyme531/glxss-client)
+  —— `glxss.py: decode_sensor()`、`interaction.py: ButtonTracker`。
+- 联网调研与型号/功能资料：[hid-research.md](hid-research.md)。
