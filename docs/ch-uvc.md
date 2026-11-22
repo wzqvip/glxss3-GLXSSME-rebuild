@@ -1,12 +1,16 @@
 # 第 2 章 · 摄像头（UVC）
 
-> 本章讲清楚：怎么**不依赖任何 native 库**，用纯 Kotlin 把眼镜摄像头跑起来。
-> 关键结论：它是**标准 UVC 1.10 + bulk 端点 + 未压缩 YV12**，一次 bulk 传输正好是一帧；
+> 本章讲清楚：怎么**不依赖任何 native 库**，用纯 Kotlin / Python 把眼镜摄像头跑起来。
+> 关键结论：它是**标准 UVC 1.10 + bulk 端点 + 未压缩 YV12**；设备侧一帧 =
+> `12 B header + 460800 B`，但**主机侧单次 bulk 读最多 16 KiB**（usbfs 单 URB 上限），
+> 必须分块读、自己在字节流上组帧（2026-11-22 Pixel 真机定位，见 §5.3 / §7.2）。
 > 之前所有"彩色噪点/花屏"都不是协议问题，而是**固件卡死时在灌无边界垃圾流**。
 >
 > 对应代码：[`uvc/UvcCamera.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcCamera.kt)、
 > [`uvc/Yuv.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/Yuv.kt)、
-> [`uvc/UvcPreview.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcPreview.kt)
+> [`uvc/UvcPreview.kt`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcPreview.kt)；
+> Linux/Pi：[`linux/glxss/uvc.py`](../linux/glxss/uvc.py)、
+> [`linux/tools/uvc_pi_exp.py`](../linux/tools/uvc_pi_exp.py)
 >
 > 原始抓包与排障记录：[uvc-camera-plan.md §4](uvc-camera-plan.md#4-真机抓包与修复2026-11-21已完成)；
 > 固件卡死：[device-recovery.md](device-recovery.md)；选型对比：[uvc-camera-plan.md §2](uvc-camera-plan.md#2-四个方案横向对比)
@@ -24,8 +28,8 @@ UVC 摄像头通常分两部分：
 **bulk IN（`0x81`，512 B）**——不保证带宽，但**不丢数据**，而且带宽可以吃满。
 
 ```
-手机                                                    眼镜
-────                                                    ────
+手机 / Pi                                               眼镜
+────────                                                ────
 claim if0 (VC) + if1 (VS)
    │
    ├─ GET_CUR(probe, 34B) ─────────────────────────────► 返回当前/默认参数
@@ -33,8 +37,9 @@ claim if0 (VC) + if1 (VS)
    ├─ GET_CUR(probe, 34B) ◄───────────────────────────── 看设备认可了什么
    ├─ SET_CUR(commit, 34B) ────────────────────────────► 正式生效
    │
-   └─ bulkTransfer(0x81, 460822B) ◄───────────────────── 每次一整帧：
-                                                          12B header + 460800B YV12
+   └─ bulkTransfer(0x81, **16384**) × N ◄────────────── 设备侧一帧 = 12B header
+                                                          + 460800B YV12，主机侧
+                                                          16 KiB 一块读、自己组帧
 ```
 
 ### 1.1 设备事实（实测，别再猜）
@@ -47,10 +52,11 @@ claim if0 (VC) + if1 (VS)
 | UVC 版本 | `bcdUVC = 0x0110`（1.10）→ probe 结构 34 B（UVC 1.0 是 26 B） |
 | 格式 | `bFormatIndex=1` → **YV12 未压缩**（`idx2` 是 MJPEG） |
 | 帧档位 | 1920×1080、1280×720、640×480；实测选中 `bFrameIndex=4` → 640×480@30 |
-| 实际帧率 | **20–25 fps**（30 只是描述符上限） |
+| 实际帧率 | **29.7–30.4 fps**（2026-11-22 Pixel 实测；描述符上限 30） |
 | 一帧 | `460800 = 640×480×1.5`，**无 stride padding** |
-| 一次 bulk | `460812 = 460800 + 12`（12 B UVC payload header） |
-| URB 尺寸 | `460822 = frameSize + 22`（原厂 `frameBufferSize` 日志） |
+| 一帧总长 | `460812 = 460800 + 12`（12 B UVC payload header，整帧只有这 1 个） |
+| 原厂 transfer | `460822 = frameSize + 22`（libusb `frameBufferSize` 日志；libusb 内部拆成 ~29 个 16 KiB URB） |
+| **主机侧单次 bulk** | **16384 B 上限**（usbfs 单 URB = libusb `MAX_BULK_BUFFER_LENGTH`；460822 一次读在 Android 上立刻 -1） |
 
 > ⚠️ 早期文档按"常见摄像头"假设了 `alt=1`、`2 B header`、`iso 端点`，全部被真机抓包推翻。
 > 本文以抓包为准：[uvc-camera-plan.md §4](uvc-camera-plan.md#4-真机抓包与修复2026-11-21已完成)。
@@ -119,19 +125,26 @@ bmHint fmt  frm   333333              460800        16384
 ```
 
 > `GET_MAX` 会回 `dwMaxVideoFrameSize=0x012c7f80 (19,693,440)`、`maxPayload=0x012c7f8c`
-> ——这是设备/格式的**全局上限**，不是当前档位，**不能拿来当 URB 尺寸**。
-> URB 必须按"当前档位的净荷 + 12"算。
+> ——这是设备/格式的**全局上限**，不是当前档位，**不能拿来当读缓冲尺寸**。
+> 读缓冲按"当前档位净荷 + 12"组帧，单次 USB 读则固定 16 KiB（见 §5.3）。
 
-### 2.4 原厂额外发的一条 XU（不是必需）
+### 2.4 原厂额外发的 vendor XU（不是必需）
 
-健康设备初始化时原厂还会发：
+健康设备初始化时原厂还会发（2026-11-22 Frida 抓包，Android `cc310be` 起照抄）：
 
 ```
-0x21/0x01  wValue=0x0d0d  wIndex=0x0400  wLength=1  data=01
+probe 之前：  0x21/0x01  wValue=0x0d0d  wIndex=0x0400  wLength=1  data=01
+commit 之后： 0x21/0x01  wValue=0x0606  wIndex=0x0400  wLength=1  data=00  ×2
 ```
 
-这是相机侧一个 1 字节 vendor 开关（entity 4）。**本实现不发，实测 25 fps 正常**。
-如果某天遇到"probe/commit 都成功但 0 帧"，可以把它列为待试项。
+这是相机侧 vendor 开关（entity 4）。**实测不是出流的开关**：设备在 probe/commit
+**之前**就已经在吐 `0c 0f …` 数据；发不发这两条只影响"是否与原厂逐字节一致"。
+Android 与 Linux（`UvcStream.vendor_pre_probe()` / `vendor_post_commit()`）都照发，
+失败只记 verbose、不影响取流。
+
+> Linux 侧**不重放**原厂序列里的 `0xA1/0x05 显示模式=1` ×2 + `0xA1/0x04 状态读`：
+> 这两条属于 LCD 显示面，由 `lcd.initialize()`（开屏 + 模式 2）统一管理；在 UVC
+> 打开时发模式 1 会把屏切回待机，监看模式直接黑屏。
 
 ---
 
@@ -226,10 +239,10 @@ Yuv.yuv420ToArgb(argb, src, uOff, vOff, w, h)
 5. claim if1 (VS alt=0)
 6. setInterface(VS alt=0)    ← 返回 false 也可能已生效；**alt=0 也要发**
 7. 解析 rawDescriptors → VS_FORMAT_* / VS_FRAME_*
-8. GET_CUR(probe) 拿基底 → 填 fmt/frame/interval/maxFrame/maxPayload
+8. GET_CUR(probe) 拿基底 → 填 fmt/frame/interval/maxFrame（`18..21`）
 9. SET_CUR(probe) → GET_CUR(probe) 读回 → SET_CUR(commit)
-10. 分配 transferBuf = frameSize + 22
-11. 线程循环 bulkTransfer(0x81)，按 §6 组帧
+10. 组帧缓冲 = frameSize + 12 + 一个 chunk；**单次 bulk 读 = 16384 B**（§5.3）
+11. 线程循环 bulkTransfer(0x81, 16384) → 按 §6 组帧
 12. 停止：setInterface(alt0) → CLEAR_FEATURE(ENDPOINT_HALT, 0x81) → releaseInterface → close
 ```
 
@@ -289,47 +302,70 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 > 最强诊断行是 **`probe result:`**——它告诉你设备最终认可了哪个 format/frame/maxFrame。
 > 失败时按这个顺序降级：34 B → 26 B → `bmHint=0` → 改 `dwMaxPayloadTransferSize`。
 
+### 5.3 收流：单次 bulk 读上限 16 KiB（本轮真正的坑）
+
+**现象**（Android，2026-11-22）：probe/commit 全部成功（`rc=34`），但读线程里
+`bulkTransfer(ep, buf, 460822, 1000)` **立刻返回 -1**（dt≈0/几十 ms，不是 1000 ms
+超时）；同一个端点换成 512 / 16384 都能拿到数据，首字节就是 `0c 0f`。
+
+**原因**：Android/Linux 的 usbfs 单次 bulk URB 上限是 **16384 B**（与 libusb 的
+`MAX_BULK_BUFFER_LENGTH` 一致）。原厂 libusb 之所以能写 `frameBufferSize=460822`，
+是因为 **libusb 内部把它拆成 ~29 个 16 KiB URB 再重组**，对 App 隐藏了拆分；
+`UsbDeviceConnection.bulkTransfer` / 一次 `dev.read(…, 460822)` 不拆，直接交给内核
+→ `-EINVAL`（Android 表现为 -1）或设备侧一直 NAK。
+
+**修法**：读循环每次只读 **16384**，用"一帧 + 一个 chunk"的 `rx` 缓冲做字节流组帧
+（§6）。改完后 Pixel 上稳定 **29.7–30.4 fps、4900 帧 0 无效 URB**；Pi 侧同样改成
+`BULK_CHUNK=16384`（`linux/glxss/uvc.py`），不再依赖 libusb 拆 URB 的后端行为。
+
+> 与"URB 尺寸 = frameSize+22"不矛盾：460822 是**协议层面的逻辑帧长**
+> （原厂 `frameBufferSize`），16 KiB 是**主机侧单次 USB 请求**的限制。
+> 一个用于组帧/日志，一个用于读。
+
 ---
 
-## 6. 帧同步算法
+## 6. 帧同步算法（16 KiB 分块 + 字节流组帧）
 
-真机行为是"一次 bulk 正好一帧"，但代码不能假设永远如此。下面是
-[`readLoop()`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcCamera.kt#L663-L743) 的判定逻辑：
+设备侧行为（Pixel 实测 + 原厂抓包一致）：
+
+- 一帧 = **12 B header + 460800 B 净荷**，**整帧只有 1 个 header**，
+  `bmHeaderInfo` bit1(EOF)=1（样本 `0c 0f d9 75 00 00 d9 75 00 00 d9 75`）；
+- header 之后是连续净荷，后续 16 KiB 块里没有 header（首字节直接是亮度值）；
+- 帧与帧首尾相接，没有 gap。
+
+读循环（Android [`readLoop()`](../app/app/src/main/java/com/wzqvip/glxsscast/uvc/UvcCamera.kt)，
+Linux [`UvcStream.read_frame()`](../linux/glxss/uvc.py)）：
 
 ```
 循环:
-  n = bulkTransfer(ep, transferBuf, urbSize, timeout=1000)
-  if n < 0:
+  chunk = bulkTransfer(ep, 16384, timeout=1000)
+  if chunk < 0:
       若耗时很短（< 500 ms）→ fastFails++；连续 5 次 → 报错退出（设备拔了/接口被抢）
       否则是"设备在线但没数据" → 限流日志，继续
-      continue
-
-  hdrLen   = buf[0]
-  hdrInfo  = buf[1]
-  errBit   = hdrInfo & 0x40
-  hdrOk    = hdrLen in 2..12 && hdrLen <= n
-
-  if !hdrOk || errBit:
-      if inSync: 追加 buf[0..n]          // 帧中间丢了 header，靠长度兜底
-      else:      丢弃 + onInvalidUrb()   // 流从帧中间开始，等下一个 0x0C
-      continue
-
-  if !inSync: frameLen = 0; inSync = true
-  追加 buf[hdrLen..n]
-  if hdrInfo & 0x02:                     // EOF
-      deliver(); inSync = false
-  else if frameLen >= frameSize:
-      deliver()                          // 设备没打 EOF 时的兜底
+  rx += chunk
+  解析 rx:
+      未同步:
+          逐字节找 header（0x0C/长度 2..12 + EOF=1 + ERR=0 + SCR/PTS 自洽）
+          找到前的字节全部丢弃（流可能从帧中间开始）
+      已同步:
+          若已收满 hdrLen + frameSize → 整块交帧；否则等下一块
+      帧起点 header 不合法 → 丢 1 字节重新同步
 ```
 
 三条设计原则：
 
-1. **只认合法 header**。没有 `bHeaderLength ∈ 2..12` 就绝不把数据当像素画——
-   旧版的"raw 兜底"会把固件垃圾流画成彩色噪点，是用户看到"花屏"的真正原因。
-2. **未同步时丢弃，不同步时追加**。流可能从帧中间开始（打开摄像头时设备已经在发），
+1. **只认合法 header**，且用 header 自身的冗余位做校验：
+   `bHeaderLength ∈ 2..12`、EOF=1、ERR=0、带 SCR 时 `SCR[0..1] == PTS[0..1]`
+   （实测 `0c 0f d9 75 00 00 d9 75…`）。误判概率 ~1e-10，远低于"扫 0x0C"
+   （后者在 460 KB 里平均会误判十几次）。
+2. **未同步时丢弃，绝不追加**。流可能从帧中间开始（打开摄像头时设备已经在发），
    第一个合法 header 之前的数据必须丢，否则整帧永远错位。
-3. **连续 10 个无效 URB 上报一次**，文案直接告诉用户"固件媒体流水线卡死，拔插重灌"，
-   而不是让 UI 显示 "device idle"。
+3. **异常流要有上限**：连续丢弃超过 4 MB 还没有合法 header，就报"固件媒体流水线
+   卡死，拔插重灌"，而不是让 UI 一直显示 "device idle"（Android 侧）；
+   Linux 侧 `read_frame()` 超时/积压时会带上"已同步帧数 / 丢弃字节 / 缓冲字节"。
+
+> 当前实现**没有用 FID 做连续性校验**。如果将来遇到"每帧固定偏移几字节"的设备，
+> 可以加：同一帧内 FID 应保持不变，变了但没见 EOF → 丢弃当前帧重新同步。
 
 > 当前实现**没有用 FID 做连续性校验**。如果将来遇到"每帧固定偏移几字节"的设备，
 > 可以加：同一帧内 FID 应保持不变，变了但没见 EOF → 丢弃当前帧重新同步。
@@ -341,12 +377,14 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 | 项 | 值 |
 |---|---|
 | 协商结果 | `format=YV12(idx=1) 640x480 frameIdx=4 maxFrame=460800B interval=333333(=30.0fps)` |
-| 缓冲 | `frameSize=460800 urbSize=460822` |
-| 单次 bulk | `actual=460812`（460800 + 12），首字节 `0C` |
-| 帧率 | 我们 App **20.0 → 25.0 fps**；原厂同设备同样约 20 fps（不是解码瓶颈） |
+| 缓冲 | `frameSize=460800 chunk=16384 rxBuf≈477 KB urbSize=460822（仅日志）` |
+| 单次 bulk | `n = 16384`（分块上限），一帧由 ~29 块组成（`460812 = 12 + 460800`） |
+| 帧率（Pixel） | **29.7–30.4 fps**，首秒 17.8（组帧/同步）；4900 帧 0 无效 URB |
+| 帧率（Pi） | 见 §7.2（16 KiB 分块后待真机复测） |
 | 解码 | YV12→ARGB 纯 Kotlin 约 8–15 ms/帧；Bitmap A/B 双缓冲，每帧零分配 |
 | 并发 | 投屏 25 fps 同时 UVC 24.6 fps（实测不互斥） |
 | 原始抓包 | 30 个 URB × (460812 + 4 B 长度前缀) = 13,824,480 B，与设备文件大小一致 |
+
 
 ### 7.1 Linux / Pi 实测（2026-11-22，Raspberry Pi Zero 2 W + pyusb 1.2.1）
 
@@ -356,7 +394,7 @@ Android 侧的打开方式在 Pi 上**必须显式写回**，否则会踩到下�
 | 坑 | 实测现象 | 修法 |
 |---|---|---|
 | GET_CUR 残留档位 | `pi/stream.py --check --fps 30` 回读 `bFrameIndex=1`（1080p）、`dwMaxPayloadTransferSize=19693452`（GET_MAX 全局上限）；bulk IN 直接 `[Errno 110]` | probe 固定写 `format=1 / frame=4 / interval=333333 / maxFrame=460800 / maxPayload=16384`，不再继承 GET_CUR |
-| URB 尺寸 | 旧代码把读缓冲算成 65536（`min(64 KiB, frameSize+22)`），不是原厂的 460822 | 固定 `frameSize + 22 = 460822`，一次 bulk 正好一整帧 |
+| 读尺寸 | 旧代码把读缓冲算成 65536（`min(64 KiB, frameSize+22)`），不是原厂的 460822；而且一次读整帧 | `frameSize+22=460822` 只作逻辑帧长/日志；实际每次读 **16384** 再组帧（§7.2，与 Android `cc310be` 一致） |
 | SET_INTERFACE 从未发出 | pyusb 1.2 **没有** `Device.set_interface`：旧代码调用抛 AttributeError 被吞成“失败（继续）”，等于没发；而 Android 每次都发（alt=0 也发） | `usb.set_alt()` 用 `Device.set_interface_altsetting()`，失败再退回 `0x01/0x0B` 标准控制请求 |
 | 缺 HID claim | Pi 只 claim 了 VC/VS | `UvcStream.open()` 按 **VC(if0) → HID(if2) → VS(if1)** claim（与 `UvcCamera.prepare()` 逐行一致），stop 时对 0x81 补 CLEAR_FEATURE(HALT) |
 
@@ -407,11 +445,19 @@ C Bi:1:003:1 -2 0                ← 设备一直 NAK，最后被 cancel（不�
 ⇒ 结论：Pi 侧打开顺序/参数已不再是阻塞点，剩下的是**设备侧 camera 流水线
 （IMX214）没起来**。还需要一次设备侧确认：同一副眼镜在 Android 上复测
 （若 Android 也 0 帧，就是设备/相机硬件或固件状态，需要更彻底的断电冷却或返修）。
-逐项对照用 `linux/tools/uvc_pi_exp.py`：
+
+> **2026-11-22 更新**：同一副眼镜在 Pixel 上复测时发现 Android 侧真正的坑是
+> **usbfs 单次 bulk 读上限 16 KiB**（§5.3）。Pi 的 usbmon 里 `S Bi:… 16384`
+> 说明 Linux libusb 已经替我们拆了 URB，所以 Pi 上"460822 一次读"不是被拒，
+> 而是设备侧没有数据（状态 B）。两件事叠加：Android 修好分块后设备恢复出流，
+> Pi 侧再把读路径显式改成 16 KiB（§7.2），主机行为就与 Android 完全一致。
+
+逐项对照用 `linux/tools/uvc_pi_exp.py`（默认就是 16 KiB 分块 + 组帧）：
 
 ```bash
-python3 tools/uvc_pi_exp.py --urb 460822 --frame 4 --interval 333333 --hid --lcd --seconds 10
-python3 tools/uvc_pi_exp.py --urb 65536        # 复现旧实现的 64 KiB 读缓冲
+python3 tools/uvc_pi_exp.py --chunk 16384 --frame 4 --interval 333333 --hid --lcd --seconds 10
+python3 tools/uvc_pi_exp.py --chunk 460822       # 复现“一次读整帧”（usbfs 拒绝 / 设备 NAK）
+python3 tools/uvc_pi_exp.py --chunk 65536        # 复现旧实现的 64 KiB 读缓冲
 ```
 
 实拍对比（同一时刻）：
@@ -430,14 +476,53 @@ python3 tools/uvc_pi_exp.py --urb 65536        # 复现旧实现的 64 KiB 读�
 
 ![recovered](img/uvc-ours-25fps.jpg)
 
+### 7.2 Linux / Pi 移植：16 KiB 分块 + 字节流组帧（2026-11-22）
+
+把 Android `cc310be` 的修复原样搬到 `linux/glxss/uvc.py`：
+
+| 改动 | 内容 |
+|---|---|
+| 读尺寸 | `BULK_CHUNK = 16384`；`UvcStream.read_chunk()` 每次只读一个块，**绝不超过 16 KiB**。`urb_size = frameSize + 22 = 460822` 只保留为逻辑帧缓冲/日志 |
+| 组帧 | `read_frame()` 把块追加进 `_rx`，`_take_frame()` 按 `hdrLen + frameSize` 切帧；`_header_ok()` 校验 `bHeaderLength 2..12 + EOF=1 + ERR=0 + SCR[0..1]==PTS[0..1]`；未同步时丢到下一个合法 header |
+| XU | `negotiate()` 补原厂 vendor 序列：pre-probe `0x0d0d=01`，commit 后 `0x0606=00 ×2` + CLEAR_HALT(0x81)；失败不影响取流 |
+| 实验台 | `linux/tools/uvc_pi_exp.py` 默认 `--chunk 16384`，同样组帧统计（帧数/fps/丢弃字节） |
+| 测试 | 新增 `UvcChunkFramingTests`：460800 B 生产帧由 29 个 ≤16384 块拼出、header 跨块、假 header 重同步、超时诊断 |
+
+离线单测（Windows / Pi 均可跑）：
+
+```bash
+cd linux && python -m unittest discover -s tests -v
+# 45 tests OK（含 640×480 生产尺寸组帧用例）
+```
+
+Pi Zero 2 W 上的离线组帧基准（假设备按 16 KiB 返回 6 帧连续数据，跑 3 帧）：
+**5.1 ms/帧、~196 fps 组帧吞吐、0 丢弃字节**，远高于 30 fps 目标——组帧不是瓶颈。
+
+Pi 真机验证（眼镜插回 Pi 后；当前设备不在 Pi 上，尚未复测）：
+
+```bash
+sudo python3 pi/stream.py --check --fps 30 --detach
+python3 -m glxss cast --source uvc --fps 10 --duration 10 --detach --rotate 180
+sudo python3 pi/stream.py --rtsp rtsp://127.0.0.1:8554/glxss --fps 20   # 另开 ffprobe 验证
+```
+
+> Linux 的 libusb 本来就会把 460822 拆成 16 KiB URB（usbmon 可见 `S Bi:… 16384`），
+> 所以这一步在 Pi 上**不会改变 USB 线上看到的 URB 大小**；它的价值是：不再依赖
+> libusb 后端的拆分行为、与 Android 共用同一套组帧/重同步逻辑、并且在任何
+> 只支持单 URB ≤16 KiB 的 usbfs 上都成立（Android 就是被这个上限挡住）。
+
 ---
 
 ## 8. 坑与注意事项
 
 1. **header 是 12 B 不是 2 B**。按 2 B 取像素 = 整帧斜移 10 B，看起来像"彩虹噪点"。
-2. **URB 尺寸要按帧算**：`frameSize + 22`。太小会截断；太大（例如旧版 461824）会让异常固件
-   把整个 URB 灌满，`n` 恒等于缓冲区大小，反而掩盖了"没有帧边界"这个关键信号。
+2. **单次 bulk 读必须 ≤ 16384 B**（usbfs 单 URB 上限 = libusb
+   `MAX_BULK_BUFFER_LENGTH`）。超过在 Android 上不会超时，而是**立刻 -1**（`dt≈0`），
+   很容易误判成"设备没出流 / 接口被抢"；原厂 libusb 的 `460822` 是它内部拆 URB，
+   不能直接照抄到一次 `bulkTransfer` / `dev.read`。读 16 KiB、按
+   `hdrLen + frameSize = 460812` 组帧。
 3. **不要在未同步时追加数据**。流从帧中间开始时，追加 = 永久错位。
+   同步时用 header 的 `SCR[0..1]==PTS[0..1]` 做校验，别只扫 `0x0C`。
 4. **U/V 顺序**：YV12 是 `Y|V|U`；I420 是 `Y|U|V`。偏色先换这个，不要先怀疑白平衡。
 5. **alt setting 别照抄教程**：本设备 alt=0 就带端点；强行 `setInterface(alt=1)` 可能直接失败。
    但 **alt=0 的 SET_INTERFACE 也要发**（Android 每次都发，用于复位端点状态）。
@@ -463,6 +548,7 @@ python3 tools/uvc_pi_exp.py --urb 65536        # 复现旧实现的 64 KiB 读�
 - [ ] 1920×1080 / 1280×720 档位的实际帧率与 URB 尺寸（当前只跑 640×480）。
 - [ ] MJPEG（`bFormatIndex=2`）是否真的可用，以及它的 `dwMaxVideoFrameSize`。
 - [ ] `bmFramingInfo` / FID 在长帧（>1 个 URB）时是否需要参与组帧。
-- [ ] 原厂 XU `0x21/0x01 wValue=0x0d0d wIndex=0x0400` 的真实作用（当前不发也能出流）。
+- [ ] 原厂 XU `0x21/0x01 wValue=0x0d0d / 0x0606` 的真实作用（Android 与 Linux 已照抄发送；
+      对照实验发/不发都能出流，见 §2.4）。
 - [ ] 相机自动对焦 / 曝光控制（2.3.7 有 `nativeGetmAutoFocus`，UVC PU 控制未试）。
 - [ ] 8 MP 静像与 720p 录像的数据通道。

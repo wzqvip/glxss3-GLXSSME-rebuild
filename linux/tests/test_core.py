@@ -484,6 +484,112 @@ class MonitorCliTests(unittest.TestCase):
                          "monitor")
 
 
+class UvcChunkFramingTests(unittest.TestCase):
+    """16 KiB 分块 + 字节流组帧（Android cc310be 的移植）。
+
+    背景：usbfs 单次 bulk 读上限 16384 B（= libusb MAX_BULK_BUFFER_LENGTH），
+    一次读 460822 在 Android 上立刻 -1；设备侧一帧仍是 12 B header + 460800 B。
+    """
+
+    @staticmethod
+    def _frame(w, h, pts=0x2B4):
+        y_size = w * h
+        c_size = y_size // 4
+        payload = bytes([16]) * y_size + bytes([128]) * (2 * c_size)
+        header = bytes([12, 0x0F]) + struct.pack("<I", pts) + bytes([pts & 0xFF,
+                                                                    (pts >> 8) & 0xFF,
+                                                                    0, 0, 0, 0])
+        return header + payload, payload
+
+    class ChunkDev:
+        """按请求尺寸返回连续字节流的假设备（模拟 16 KiB bulk 读）。"""
+
+        def __init__(self, blob, max_chunk=uvc.BULK_CHUNK):
+            self.blob = bytes(blob)
+            self.pos = 0
+            self.max_chunk = max_chunk
+            self.sizes = []
+
+        def read(self, endpoint, size, timeout=0):
+            self.sizes.append(size)
+            take = min(int(size), self.max_chunk, len(self.blob) - self.pos)
+            chunk = self.blob[self.pos:self.pos + take]
+            self.pos += len(chunk)
+            return chunk
+
+    def test_production_frame_uses_16k_chunks(self):
+        header, payload = self._frame(640, 480)
+        # 从帧中间开始（前面 3 B 是上一帧的尾字节）+ 两帧首尾相接
+        dev = self.ChunkDev(b"\x7f\x80\x81" + header + payload + header + payload)
+        stream = uvc.UvcStream(dev, SimpleNamespace(bInterfaceNumber=1),
+                               SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
+        stream.set_dimensions(640, 480)
+        self.assertEqual(stream.chunk_size, uvc.BULK_CHUNK)
+        frame = stream.read_frame()
+        self.assertEqual(frame.data, payload)
+        self.assertEqual(len(frame.data), 460800)
+        self.assertEqual(frame.header.header_len + len(frame.data), 460812)
+        # 每个 bulk 读都不超过 16384，且第一帧由多块拼成
+        self.assertTrue(dev.sizes)
+        self.assertLessEqual(max(dev.sizes), 16384)
+        self.assertEqual(dev.sizes[0], 16384)
+        self.assertGreater(len(dev.sizes), 20)
+        self.assertGreaterEqual(stream.dropped_bytes, 3)
+        # 第二帧的首块已在缓冲里：继续读完即可，仍然按 ≤16 KiB 块拼
+        second = stream.read_frame()
+        self.assertEqual(second.data, payload)
+        self.assertEqual(stream.synced_frames, 2)
+        self.assertLessEqual(max(dev.sizes), 16384)
+
+    def test_header_split_across_chunks(self):
+        header, payload = self._frame(8, 8)
+        dev = self.ChunkDev(header + payload, max_chunk=7)
+        stream = uvc.UvcStream(dev, SimpleNamespace(bInterfaceNumber=1),
+                               SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
+        stream.set_dimensions(8, 8)
+        stream.chunk_size = 7  # 人为把 header 切碎（真实 16 KiB 块也可能跨 header）
+        frame = stream.read_frame()
+        self.assertEqual(frame.data, payload)
+        self.assertEqual(frame.header.pts, 0x2B4)
+
+    def test_resync_skips_fake_headers(self):
+        header, payload = self._frame(8, 8)
+        # 假 header：0x0C 开头但 EOF=0 / SCR 与 PTS 不一致，都不能被当成帧起点
+        fake1 = bytes([12, 0x0D, 1, 2, 0, 0, 9, 9, 0, 0, 0, 0])
+        fake2 = bytes([12, 0x0E, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        dev = self.ChunkDev(b"\x00" * 5 + fake1 + b"abc" + fake2 + header + payload)
+        stream = uvc.UvcStream(dev, SimpleNamespace(bInterfaceNumber=1),
+                               SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
+        stream.set_dimensions(8, 8)
+        frame = stream.read_frame()
+        self.assertEqual(frame.data, payload)
+        self.assertGreaterEqual(stream.dropped_bytes, len(fake1) + len(fake2))
+
+    def test_header_checks(self):
+        good = bytes.fromhex("0c 0f b4 02 00 00 b4 02 00 00 b4 02")
+        self.assertTrue(uvc.UvcStream._header_ok(good, 0, 12))
+        no_eof = bytes.fromhex("0c 0d b4 02 00 00 b4 02 00 00 b4 02")
+        self.assertFalse(uvc.UvcStream._header_ok(no_eof, 0, 12))
+        err = bytes.fromhex("0c 4f b4 02 00 00 b4 02 00 00 b4 02")
+        self.assertFalse(uvc.UvcStream._header_ok(err, 0, 12))
+        bad_scr = bytes.fromhex("0c 0f b4 02 00 00 b5 02 00 00 b4 02")
+        self.assertFalse(uvc.UvcStream._header_ok(bad_scr, 0, 12))
+        self.assertFalse(uvc.UvcStream._header_ok(good, 0, 1))
+        self.assertFalse(uvc.UvcStream._header_ok(good[:8], 0, 12))
+
+    def test_timeout_reports_framing_state(self):
+        class EmptyDev:
+            def read(self, endpoint, size, timeout=0):
+                return b""
+
+        stream = uvc.UvcStream(EmptyDev(), SimpleNamespace(bInterfaceNumber=1),
+                               SimpleNamespace(bEndpointAddress=0x81), timeout=60)
+        stream.set_dimensions(640, 480)
+        with self.assertRaises(GlxssError) as ctx:
+            stream.read_frame()
+        self.assertIn("超时", str(ctx.exception))
+
+
 class UvcHeaderTests(unittest.TestCase):
     def test_parse_12_byte_header(self):
         header = bytes.fromhex("0c 0f b4 02 00 00 b4 02 00 00 b4 02")
@@ -556,7 +662,9 @@ class UvcNegotiateTests(unittest.TestCase):
         self.assertEqual(probe.frame_index, 4)
         self.assertEqual(probe.interval, 333333)
         self.assertEqual(stream.frame_size, 460800)
-        self.assertEqual(stream.urb_size, 460822)
+        self.assertEqual(stream.urb_size, 460822)       # 逻辑帧缓冲（日志用）
+        self.assertEqual(stream.chunk_size, 16384)      # 单次 bulk 读 ≤16 KiB
+        self.assertEqual(stream.frame_size + uvc.MAX_HEADER, 460812)
         probe_out = [p for (value, p) in writes if value == uvc.UVC_VS_PROBE][0]
         self.assertEqual(probe_out[3], 4)                      # bFrameIndex
         self.assertEqual(struct.unpack_from("<I", probe_out, 22)[0], 16384)

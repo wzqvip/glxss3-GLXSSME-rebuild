@@ -5,8 +5,9 @@
 用途：在不改主代码的前提下逐项对照 Android 的成功参数，找出 Pi 上
 “probe/commit 成功但 bulk IN 超时”的差异。
 
-    python3 tools/uvc_pi_exp.py --urb 460822 --frame 4 --interval 333333
-    python3 tools/uvc_pi_exp.py --urb 65536            # 旧实现的 URB，复现超时
+    python3 tools/uvc_pi_exp.py --chunk 16384 --frame 4 --interval 333333
+    python3 tools/uvc_pi_exp.py --chunk 460822        # 复现“一次读整帧”（usbfs 拒绝）
+    python3 tools/uvc_pi_exp.py --chunk 65536         # 复现旧实现的 64 KiB 读缓冲
     python3 tools/uvc_pi_exp.py --hid --lcd --seconds 10
 
 关键点（与 Android 一致）：
@@ -14,7 +15,8 @@
   * setInterface(VS alt) 即使返回 false 也继续；
   * probe: bmHint=1, format=1, frame=4, interval=333333, maxFrame=460800,
     maxPayload=16384；commit 原样提交 GET_CUR 回读；
-  * URB = 460822 = 460800 + 22；单次 bulk timeout 5000 ms；
+  * 单次 bulk 读默认 16384 B（usbfs 单 URB 上限）；读到的字节流按
+    `hdrLen + maxFrame` 组帧（与 glxss.uvc 相同的 header 校验/重同步）；
   * header 无效只计一次、继续读（不中止）。
 """
 
@@ -210,9 +212,37 @@ def lcd_thread(dev, gate, stop, fps=10.0, verbose=True):
     print("  [LCD] 共发 %d 帧" % sent)
 
 
+def header_ok(buf, off, hdr_len):
+    """与 glxss.uvc.UvcStream._header_ok / Android headerOk() 一致。"""
+    if not 2 <= hdr_len <= 12:
+        return False
+    if off + hdr_len > len(buf):
+        return False
+    info = buf[off + 1]
+    if info & 0x40:                      # ERR
+        return False
+    if not info & 0x02:                  # EOF
+        return False
+    if hdr_len >= 12 and info & 0x08:    # SCR[0..1] == PTS[0..1]
+        if buf[off + 6] != buf[off + 2] or buf[off + 7] != buf[off + 3]:
+            return False
+    return True
+
+
+def find_header(buf):
+    last = len(buf) - 12
+    if last < 0:
+        return None
+    for i in range(last + 1):
+        if header_ok(buf, i, buf[i]):
+            return i
+    return None
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--urb", type=int, default=460822)
+    p.add_argument("--chunk", "--urb", dest="chunk", type=int, default=16384,
+                   help="单次 bulk 读字节数（usbfs 单 URB 上限 16384）")
     p.add_argument("--frame", type=int, default=4)
     p.add_argument("--format", type=int, default=1)
     p.add_argument("--interval", type=int, default=333333)
@@ -305,12 +335,13 @@ def main(argv=None):
         t.start()
         threads.append(t)
 
-    print("开始 bulk IN：ep=0x%02x urb=%d timeout=%dms" % (EP_IN, args.urb, args.timeout))
+    print("开始 bulk IN：ep=0x%02x chunk=%d timeout=%dms" % (
+        EP_IN, args.chunk, args.timeout))
     t0 = time.monotonic()
     reads = timeouts = errors = frames = 0
-    invalid = 0
-    frame_len = 0
-    in_sync = False
+    invalid = dropped = 0
+    rx = bytearray()
+    synced = False
     first = True
     dump_fh = open(args.dump, "wb") if args.dump else None
     dumped = 0
@@ -319,7 +350,7 @@ def main(argv=None):
             break
         started = time.monotonic()
         try:
-            buf = bytes(dev.read(EP_IN, args.urb, timeout=args.timeout))
+            buf = bytes(dev.read(EP_IN, args.chunk, timeout=args.timeout))
             n = len(buf)
         except usb.core.USBTimeoutError:
             timeouts += 1
@@ -339,38 +370,50 @@ def main(argv=None):
             dump_fh.write(struct.pack("<I", n))
             dump_fh.write(bytes(buf[:n]))
             dumped += 1
-        if first or n == args.urb or reads <= 3:
-            print("  [%5.1fs] URB #%d n=%d first16=%s" % (
+        if first or reads <= 3:
+            print("  [%5.1fs] chunk #%d n=%d first16=%s" % (
                 time.monotonic() - t0, reads, n, bytes(buf[:16]).hex()))
             sys.stdout.flush()
             first = False
-        hdr_len = buf[0]
-        hdr_info = buf[1] if n >= 2 else 0
-        ok = 2 <= hdr_len <= 12 and hdr_len <= n and not (hdr_info & 0x40)
-        if not ok:
-            invalid += 1
-            if invalid <= 5:
-                print("    无效 header: bHeaderLength=%d info=0x%02x n=%d" % (
-                    hdr_len, hdr_info, n))
-            # 与 Android 一致：已同步就续传，否则丢弃等下一帧
-            if in_sync:
-                frame_len += n
-                if frame_len >= args.max_frame:
-                    frames += 1
-                    in_sync = False
-                    frame_len = 0
-            continue
-        if not in_sync:
-            in_sync = True
-            frame_len = 0
-        frame_len += n - hdr_len
-        if hdr_info & 0x02 or frame_len >= args.max_frame:
+        rx.extend(buf)
+        pos = 0
+        while True:
+            if not synced:
+                found = find_header(rx[pos:] if pos else rx)
+                if found is None:
+                    # 保留末尾 11 B（header 可能跨块）
+                    keep = 11
+                    if len(rx) - pos > keep:
+                        pos = len(rx) - keep
+                    break
+                pos += found
+                synced = True
+            if len(rx) - pos < 2:
+                break
+            hdr_len = rx[pos]
+            if len(rx) - pos < hdr_len:
+                break
+            if not header_ok(rx, pos, hdr_len):
+                invalid += 1
+                if invalid <= 5:
+                    print("    无效 header: bHeaderLength=%d info=0x%02x" % (
+                        hdr_len, rx[pos + 1]))
+                synced = False
+                pos += 1
+                continue
+            need = hdr_len + args.max_frame
+            if len(rx) - pos < need:
+                break
             frames += 1
-            in_sync = False
-            frame_len = 0
+            if frames <= 3:
+                print("    帧 #%d hdr=%s len=%d" % (
+                    frames, bytes(rx[pos:pos + 12]).hex(), need))
+            pos += need
+        dropped += pos
+        del rx[:pos]
     elapsed = max(1e-6, time.monotonic() - t0)
-    print("结果：%.1f s  读=%d 帧=%d 超时=%d 错误=%d 无效header=%d  fps=%.1f" % (
-        elapsed, reads, frames, timeouts, errors, invalid, frames / elapsed))
+    print("结果：%.1f s  读块=%d 帧=%d 超时=%d 错误=%d 无效header=%d 丢弃=%dB  fps=%.1f" % (
+        elapsed, reads, frames, timeouts, errors, invalid, dropped, frames / elapsed))
     stop.set()
     for t in threads:
         t.join(timeout=2.0)

@@ -339,6 +339,12 @@ glxss ctl rec on
   需要更低延迟可设 30，但会多占 USB 带宽；
 * UVC 读帧 + YV12→RGBA 在后台线程，主循环永远取“最新完成的一帧”发送；
   解码慢只丢旧帧，不拖慢发送；
+* **UVC 每次 bulk 读 16384 B（16 KiB），按字节流组帧**：usbfs 单 URB 上限就是
+  16384（= libusb `MAX_BULK_BUFFER_LENGTH`）。一帧仍是 `12 B header + 460800 B
+  YV12 = 460812`，由 `UvcStream.read_frame()` 从 ~29 个 16 KiB 块拼出来；
+  460822 只是原厂 `frameBufferSize`（libusb 内部拆 URB），不能拿来当单次读尺寸。
+  header 校验用 `bHeaderLength=12 + EOF=1 + ERR=0 + SCR[0..1]==PTS[0..1]`，
+  未同步时丢弃到下一个合法 header（流从帧中间开始是常态）；
 * 同一 `UsbDeviceConnection` 上 UVC bulk IN 与 LCD bulk OUT 并发；HID/亮度/模式
   等控制请求和 LCD 帧走 `usb.UsbGate` 串行，避免控制请求插进 1 MB 帧中间；
 * 切回 HUD 时停流（alt=0）并释放 UVC 接口，下次切监看重开；
