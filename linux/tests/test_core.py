@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import io
 import os
+import socket
 import struct
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
-from glxss import capture, firmware, hid, lcd, uvc
+from glxss import capture, control, firmware, hid, hud, lcd, uvc
 from glxss.cli import build_parser
+from glxss.cli import main as cli_main
 
 
 class FrameTests(unittest.TestCase):
@@ -91,6 +93,120 @@ class CaptureTests(unittest.TestCase):
                 roundtrip = image.copy()
             data = roundtrip.tobytes()
             self.assertEqual(data, rgba.tobytes())
+
+
+class HudTests(unittest.TestCase):
+    """HUD 渲染是纯软件路径；有 Pillow+numpy 就能在无硬件环境验证。"""
+
+    READY = hud.Image is not None and hud.np is not None
+
+    def test_heading_from_compass(self):
+        self.assertAlmostEqual(hud.heading_from_compass(1, 0), 0.0)
+        self.assertAlmostEqual(hud.heading_from_compass(0, 1), 90.0)
+        self.assertAlmostEqual(hud.heading_from_compass(-1, 0), 180.0)
+        self.assertAlmostEqual(hud.heading_from_compass(0, -1), 270.0)
+        self.assertAlmostEqual(hud.heading_from_compass(0, 0), 0.0)
+        self.assertAlmostEqual(hud.heading_from_compass(1, 0, 10), 10.0)
+        demo = hud.demo_state()
+        self.assertTrue(35 <= demo.heading <= 38)
+
+    def test_pitch_roll(self):
+        self.assertEqual(hud.pitch_roll_from_acc(0, 0, 0), (0.0, 0.0))
+        pitch, roll = hud.pitch_roll_from_acc(-350, 9200, 120)
+        self.assertAlmostEqual(pitch, -2.18, delta=0.1)
+        self.assertAlmostEqual(roll, 0.75, delta=0.1)
+
+    @unittest.skipUnless(READY, "需要 Pillow + numpy")
+    def test_render_size_layers_and_png(self):
+        source = hud.HudSource(demo=True)
+        image = source.render()
+        self.assertEqual(image.mode, "RGBA")
+        self.assertEqual(image.size, (640, 400))
+        self.assertEqual(len(image.tobytes()), 640 * 400 * 4)
+        colors = image.convert("RGB").getcolors(maxcolors=100000)
+        self.assertIsNotNone(colors)
+        self.assertGreater(len(colors), 16)  # 不是纯黑/纯色帧
+        self.assertIsNotNone(image.getbbox())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hud.png")
+            source.save_png(path)
+            self.assertGreater(os.path.getsize(path), 5000)
+            from PIL import Image
+            with Image.open(path) as saved:
+                self.assertEqual(saved.size, (640, 400))
+                self.assertEqual(saved.mode, "RGBA")
+
+    @unittest.skipUnless(READY, "需要 Pillow + numpy")
+    def test_grab_shape_and_cache(self):
+        source = hud.HudSource(demo=True, render_interval=60.0)
+        rgb = source.grab()
+        self.assertEqual(rgb.shape, (400, 640, 3))
+        self.assertEqual(rgb.dtype.name, "uint8")
+        # 60 s 内应直接命中缓存（同一个对象）
+        self.assertIs(source.grab(), rgb)
+
+    @unittest.skipUnless(READY, "需要 Pillow + numpy")
+    def test_hud_paused_and_nav(self):
+        source = hud.HudSource(demo=True)
+        source.set_hud_enabled(False)
+        paused = source.render()
+        self.assertEqual(paused.size, (640, 400))
+        self.assertNotEqual(paused.tobytes(), source._background().tobytes())
+        source.set_hud_enabled(True)
+        source.set_nav(90, 1234, "Gate")
+        self.assertIsNotNone(source.snapshot().nav)
+        source.clear_nav()
+        self.assertIsNone(source.snapshot().nav)
+
+    @unittest.skipUnless(READY, "需要 Pillow + numpy")
+    def test_update_report(self):
+        sample = struct.pack(
+            "<BBH9hBBf", 0, 0x71, 80,
+            100, 200, 300, 10, 20, 30, 0, 0, 0, 0, 0, 36.5)
+        source = hud.HudSource()
+        source.update_report(hid.parse_report(sample))
+        state = source.snapshot()
+        self.assertEqual(state.lux, 80)
+        self.assertAlmostEqual(state.temperature, 36.5, places=2)
+        self.assertTrue(state.sensors_valid)
+        self.assertTrue(state.compass_valid)
+        self.assertTrue(state.acc_valid)
+        self.assertAlmostEqual(state.heading, 63.43, delta=0.1)
+
+    @unittest.skipUnless(READY, "需要 Pillow + numpy")
+    def test_cli_hud_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hud.png")
+            with redirect_stdout(io.StringIO()):
+                code = cli_main(["hud", "--dry-run", "--save-png", path])
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.exists(path))
+            self.assertGreater(os.path.getsize(path), 5000)
+
+
+class ControlTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"),
+                         "当前平台没有 AF_UNIX")
+    def test_server_client_roundtrip(self):
+        def handler(request):
+            if request.get("cmd") == "ping":
+                return {"ok": True, "pong": True, "status": {"connected": True}}
+            return {"ok": True, "echo": request}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "glxss.sock")
+            server = control.ControlServer(path, handler)
+            server.start()
+            try:
+                client = control.ControlClient(path, timeout=2)
+                self.assertTrue(client.available())
+                response = client.request("status")
+                self.assertTrue(response["ok"])
+                self.assertTrue(response["status"]["connected"])
+            finally:
+                server.stop()
+            self.assertFalse(os.path.exists(path))
 
 
 class YuvTests(unittest.TestCase):
@@ -186,7 +302,8 @@ class AesTests(unittest.TestCase):
 class CliParserTests(unittest.TestCase):
     def test_all_subcommands_help_exit_zero(self):
         for command in ("list", "status", "bright", "screen", "mode", "roll",
-                        "eeprom", "version", "hid", "uvc", "frame", "flash", "cast"):
+                        "eeprom", "version", "hid", "uvc", "frame", "flash",
+                        "cast", "hud", "ctl"):
             with self.subTest(command=command):
                 parser = build_parser()
                 with redirect_stdout(io.StringIO()):

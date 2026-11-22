@@ -21,12 +21,17 @@ linux/
 │  ├─ hid.py       # 300ms 轮询 28B 报告、版本串、传感器使能
 │  ├─ firmware.py  # AES-128-ECB 尾部解密 + 03e7:2150 灌写（默认 dry-run）
 │  ├─ capture.py   # ImageSource / TestPatternSource / mss 屏幕采集 / 三种映射
+│  ├─ hud.py       # HUD 渲染源：时间/罗盘/姿态/lux/温度/亮度/固件/导航占位
+│  ├─ control.py   # 与 LCD HAT 的 JSON over Unix socket 控制通道
 │  ├─ app.py       # 采集→640×400→发送主循环，带 fps/MB/s 统计
-│  └─ cli.py       # glxss 子命令
+│  └─ cli.py       # glxss 子命令（含 hud / ctl）
 ├─ pi/
-│  ├─ lcdhat.py    # Waveshare 1.3inch LCD HAT：ST7789 状态页 + 按键 + 投屏
-│  ├─ service/glxss-cast.service
-│  └─ README.md    # 接线、SPI、依赖、systemd
+│  ├─ lcdhat.py    # Waveshare 1.3inch LCD HAT：状态页 + 菜单 + socket 控制
+│  ├─ SETUP.md     # 从零安装（SD 卡、SPI、接线、udev、systemd、排障）
+│  ├─ service/glxss-cast.service      # HUD 主进程 + 控制 socket
+│  ├─ service/glxss-lcdhat.service    # HAT 控制器
+│  └─ README.md    # 接线/菜单/最短命令
+├─ packaging/      # PyInstaller：build.sh / build.ps1 / glxss.spec / README
 ├─ udev/99-glxss.rules
 ├─ tests/test_core.py
 ├─ tools/make_test_png.py
@@ -41,11 +46,15 @@ linux/
 | LCD 帧/控制/状态/EEPROM/版本 | ✅ 已实现，复用已验证协议；尚未在真机跑本版本 |
 | UVC probe/commit + 读帧 + PNG | ✅ 已实现；YV12→RGB 用 numpy |
 | HID 轮询/传感器使能 | ✅ 已实现 |
-| 固件 AES 尾部解密 + 灌写 | ✅ 已实现，默认 dry-run，必须 `--yes` |
-| 屏幕采集 | ✅ `mss`（可选依赖）；无桌面用 `--source test` |
-| Pi LCD HAT 状态页/按键 | ✅ 代码完成；需按实际面板微调 offset |
+| HUD 渲染源（默认） | ✅ 已实现：Pillow 640×400 RGBA，2 fps 级别重绘 |
+| Pi LCD HAT 状态页/菜单 | ✅ 已实现：状态页 + 6 项菜单 + Unix socket |
+| PyInstaller 三端打包 | ✅ 脚本/spec 完成；Windows onedir 实测可运行 |
+| 屏幕采集 | ✅ `mss`（可选依赖）；无桌面用 HUD/test |
 | 音频/UAC、NPU、录像、MJPEG | ❌ 未实现（不在本次范围） |
 | 写 EEPROM | ❌ 故意不实现（危险，会改 SN/BOM） |
+
+> 用户定位：**LCD HAT = 状态/控制面板，眼镜 = 主显示，内容用 HUD 渲染**，
+> 不是完整桌面镜像。`glxss hud` 是默认推荐入口。
 
 ---
 
@@ -64,10 +73,10 @@ python -m pip install -U pip
 python -m pip install -e ".[dev]"     # pyusb + numpy + mss + Pillow
 ```
 
-没有桌面、只投测试图案时，最少只需要 `pyusb` + `numpy`：
+没有桌面、只投 HUD/测试图案时，最少只需要 `pyusb` + `numpy` + `Pillow`：
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[image]"
 ```
 
 推荐 udev 权限（不要每次 sudo）：
@@ -100,7 +109,7 @@ python -m pip install -e ".[dev]"
 > 建议在 Linux/树莓派上做完整功能，Windows 只做验证。
 > `glxss list` 在绑定前也能枚举设备，但 `status/frame` 会因没有 WinUSB 而打不开。
 
-Windows 下 `mss` 用 GDI 采集，`frame image`/`--save-png` 需要 Pillow。
+Windows 下 `mss` 用 GDI 采集，`frame image`/`--save-png`/HUD 需要 Pillow。
 
 ### 2.3 macOS
 
@@ -131,30 +140,42 @@ glxss list
 # 1) 枚举（不需要眼镜；有眼镜时会出现 2e09:0030 或 03e7:2150）
 glxss list
 
-# 2) 读 LCD 状态，控制亮度/屏/模式
+# 2) 离线验证 HUD（不需要眼镜；生成 640×400 RGBA PNG）
+glxss hud --dry-run --save-png /tmp/hud.png
+
+# 3) 跑 HUD（默认 2 fps；眼镜是主显示）
+glxss hud --listen --fps 2 --brightness 180
+# 另一个终端：控制主进程
+glxss ctl status
+glxss ctl bright 200
+glxss ctl hud off
+glxss ctl test 5
+
+# 4) 读 LCD 状态，控制亮度/屏/模式
 glxss status
 glxss bright 180
 glxss screen on
 glxss mode 2
 
-# 3) 离线验证帧格式（不碰硬件）
+# 5) 离线验证帧格式（不碰硬件）
 glxss frame test --dry-run
 glxss frame bars --dry-run
+glxss frame hud --dry-run
 glxss frame solid --color ff8000 --dry-run
 
-# 4) 发帧/投屏
-glxss frame bars --fps 10 --seconds 5
-glxss frame image screenshot.png --fit cover --seconds 5
+# 6) 发帧/投屏（HUD 是默认源）
+glxss cast                          # = hud，2 fps
 glxss cast --source screen --fps 10
 glxss cast --source test --fps 15 --duration 10
+glxss frame bars --fps 10 --seconds 5
 
-# 5) 摄像头 / 传感器 / 版本
+# 7) 摄像头 / 传感器 / 版本
 glxss uvc --frames 3 --save first-frame.png
 glxss hid --enable-sensors --count 10
 glxss version
 glxss eeprom --raw
 
-# 6) 固件（默认只分析，不加 --yes 不写）
+# 8) 固件（默认只分析，不加 --yes 不写）
 glxss flash /path/to/G25_MainFW_1.9.1.img
 glxss flash /path/to/G25_MainFW_1.9.1.img --yes
 ```
@@ -187,9 +208,11 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 | `version` | `0xA1/0x17` 24 B：版本串 + 设备 ID |
 | `hid` | `0xA1/0x16` 28 B，默认 300 ms 轮询 |
 | `uvc` | GET/SET probe + commit，bulk IN 读 YV12；`--save` 存首帧 PNG |
-| `frame` | 测试图案/图片，按 16B 头发送；`--dry-run` 不碰设备 |
+| `frame` | 测试图案/图片/HUD，按 16B 头发送；`--dry-run` 不碰设备 |
 | `flash` | 03e7:2150 灌写；默认 dry-run，`--yes` 真写 |
-| `cast` | 采集屏幕/测试图案，连续投屏；`--fps`、`--fit` |
+| `cast` | 连续投屏；`--source hud`（默认）/`screen`/`test` |
+| `hud` | HUD 主进程；`--dry-run` 离线出 PNG，`--listen` 开控制 socket |
+| `ctl` | 通过 socket 控制 HUD 主进程（status/bright/screen/mode/hud/test/nav/quit） |
 
 `--fit` 支持：
 
@@ -201,13 +224,89 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 
 ---
 
-## 5. 代码里复用
+## 5. HUD 渲染源
+
+`glxss/hud.py` 用 Pillow 画 **640×400 RGBA**，组合以下图层：
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│ 01:18 LOCAL   ● GLASSES ONLINE          2.0 fps   HUD ON  │
+├──────────┬───────────────────────────────┬─────────────────┤
+│ LIGHT    │             N                 │ ATTITUDE        │
+│  321 lux │        ╭───────────╮          │   ────────      │
+│ TEMP     │      W │   036 deg  │ E        │  PITCH  -2.2    │
+│  36.5 C  │        ╰───────────╯          │  ROLL   +0.7    │
+│ SENSOR OK│             S                 │  GYRO  +2 -1 0  │
+├──────────┴───────────────────────────────┴─────────────────┤
+│ BRIGHT 185 ████████      FW G25_MainFW_1.9.1   HUD ON LIVE │
+└────────────────────────────────────────────────────────────┘
+```
+
+* 顶部：本地时间、连接状态、fps；
+* 中心：磁罗盘刻度环（N/E/S/W + 15° 刻度）、heading 指针、数值；
+* 左侧：光感 lux、温度、传感器状态；
+* 右侧：加速度姿态仪（pitch/roll）、陀螺数值；
+* 底部：亮度条、固件版本、HUD/连接状态；
+* 罗盘下方：可选导航占位（相对方位箭头 + 距离 + 标签）。
+
+### 5.1 使用方式
+
+```bash
+# 离线预览（演示数据；不碰硬件）
+glxss hud --dry-run --save-png /tmp/hud.png
+glxss frame hud --dry-run
+
+# 真机：2 fps 发送；同时监听控制 socket
+glxss hud --listen --fps 2 --brightness 180
+
+# 只发送、不监听
+glxss hud --fps 2
+
+# 使用演示数据（不读 HID）
+glxss hud --demo --fps 2
+```
+
+### 5.2 刷新/发送频率
+
+* HID 固件 300 ms 一包；HUD 每 0.5 s 重绘一次（`render_interval`）；
+* 发送频率由 `--fps` 控制，默认 2 fps；HUD 是静态信息，不需要 25 fps；
+* `--fps 0` 表示不限速（只建议调试）。
+
+### 5.3 导航占位接口
+
+不实现真实导航协议，只留接口：
 
 ```python
-from glxss import capture, lcd, usb
+source.set_nav(bearing=72, distance=320, label="Main St")
+source.clear_nav()
+```
 
-source = capture.TestPatternSource()          # 或 capture.ScreenSource()
-rgba = capture.map_to_rgba(source.grab(), mode="fit")
+或通过 CLI：
+
+```bash
+glxss ctl nav 72 --distance 320 --label "Main St"
+glxss ctl nav-clear
+```
+
+### 5.4 字体与校准
+
+* 字体优先系统 Noto/DejaVu/Arial/Consolas，找不到才退回 Pillow 内置字体；
+  仓库不自带字体文件；HUD/HAT 文本保持 ASCII，避免 Pi 缺中文字形。
+* heading 约定 +X=北、+Y=东，`--heading-offset` 可整体旋转校准。
+* 磁罗盘硬铁/软铁校准**未实现**，只显示原始值；姿态公式按
+  `docs/ch-hid.md §5.3`，未在真机标定。
+
+---
+
+## 6. 代码里复用
+
+```python
+from glxss import capture, hud, lcd, usb
+
+source = hud.HudSource(brightness=180)        # 或 capture.TestPatternSource()
+source.set_connected(True)
+source.set_firmware("G25_MainFW_1.9.1")
+rgba = capture.map_to_rgba(source.grab(), mode="stretch")
 packet = lcd.build_frame(capture.rgba_bytes(rgba))
 
 dev = usb.find_normal()
@@ -219,40 +318,98 @@ with usb.DeviceSession(dev, detach=False) as session:
     link.send_packet(packet)
 ```
 
+`HudSource` 实现 `capture.ImageSource`，可直接注入 `CastApp`；`attach_hid(dev)`
+会在后台按 300 ms 轮询 HID 并更新图层。`glxss.app.CastApp` 是带 fps 统计的
+主循环，可注入任意 `sender`。
+
 `capture.ImageSource` 是采集抽象；`TestPatternSource` 无依赖桌面，`ScreenSource`
 使用 `mss`（Linux 上经 X11/XShm）。当前没有实现直接读 `/dev/fb0`/DRM 的源，
 需要无 X11 的 framebuffer 采集时可以实现自己的 `ImageSource` 注入 `CastApp`。
-`glxss.app.CastApp` 是带 fps 统计的主循环，可注入任意 `sender`。
 
 ---
 
-## 6. Raspberry Pi + LCD HAT
+## 7. Raspberry Pi + LCD HAT
 
-完整接线（按 Waveshare 官方 wiki）、SPI 打开、依赖、systemd 安装见
-[`pi/README.md`](pi/README.md)。一句话流程：
+完整从零安装（刷 Pi OS Lite 64-bit、SPI、`config.txt`、接线、udev、systemd、
+offset 微调、供电/排障）见 **[`pi/SETUP.md`](pi/SETUP.md)**。
 
-```bash
-# 在 Pi 上，仓库放在 /opt/glxss，虚拟环境在 /opt/glxss/venv
-cd /opt/glxss/linux
-.venv/bin/python pi/lcdhat.py --source test --fps 15
+架构：
+
+```text
+glxss hud --listen  ──USB──►  眼镜 640×400 HUD
+       ▲
+       │ /run/glxss/glxssctl.sock（JSON）
+       │
+pi/lcdhat.py  ──SPI/GPIO──►  ST7789 240×240 + 摇杆/按键
 ```
 
-状态页显示眼镜连接、FPS、亮度、模式、采集源和最近按键；摇杆/按键直接下发
-亮度/模式/开关屏命令。服务示例：
+最短流程（仓库 `/opt/glxss`，venv `/opt/glxss/venv`）：
+
+```bash
+cd /opt/glxss/linux
+/opt/glxss/venv/bin/python -m glxss hud --listen --fps 2
+# 另一个终端或 systemd：HAT 控制器
+/opt/glxss/venv/bin/python pi/lcdhat.py --socket /run/glxss/glxssctl.sock
+```
+
+HAT 默认会在 socket 不存在时自动拉起 `glxss hud --listen` 子进程
+（`--no-spawn` 可禁用）。状态页显示眼镜连接、fps、亮度、HUD 状态、lux、温度、
+时间；菜单 6 项：亮度、显示模式、开关屏、HUD 开关、发测试帧、退出：
+
+| 按键 | 状态页 | 菜单页 |
+|---|---|---|
+| UP/DOWN | — | 选择菜单项 |
+| LEFT/RIGHT | — | 调值/切换 |
+| PRESS | 进入菜单 | 确认 |
+| KEY1 | HUD 开关 | — |
+| KEY2 | 发测试帧 | — |
+| KEY3 | 退出 | 返回状态页 |
+
+面板 offset 默认 `x=0, y=80`；不同批次试 `0/80`、`80/0`、`--rotation 1`。
+颜色反相时改 `pi/lcdhat.py` 的 `_INIT`（`0x21` INVON ↔ `0x20` INVOFF）。
+
+服务：
 
 ```bash
 sudo cp pi/service/glxss-cast.service /etc/systemd/system/
+sudo cp pi/service/glxss-lcdhat.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now glxss-cast
+sudo systemctl enable --now glxss-cast glxss-lcdhat
 journalctl -u glxss-cast -f
 ```
 
-注意：`mss` 在树莓派上需要 X11/XWayland；Raspberry Pi OS Lite 没有桌面时，
-把 service 的 `--source screen` 改为 `--source test`，或接 HDMI 并启动桌面。
+> Raspberry Pi OS Lite 没有 X11：HUD 是默认源，不需要桌面；只有
+> `--source screen` 才需要桌面/XWayland。
 
 ---
 
-## 7. 平台差异与排障
+## 8. PyInstaller 打包
+
+`packaging/` 提供三端脚本：
+
+```bash
+# Linux/macOS
+packaging/build.sh              # onefile
+packaging/build.sh --onedir     # 启动更快
+
+# Windows
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1 -OneDir
+```
+
+要点：
+
+* PyInstaller **不能跨平台**：Windows 包在 Windows 上打，Linux/macOS 同理；
+* Windows 需要 `libusb-1.0.dll`，可用 `-LibusbDll` 打进包；否则放 System32/PATH；
+* macOS 用 `brew install libusb`，必要时设 `DYLD_LIBRARY_PATH`；
+* `--onefile` 体积约 30–90 MB、每次启动解压 1–3 秒；`--onedir` 启动快但文件多；
+* 受限 Windows 环境 onefile 可能无法创建临时目录，改用 `-OneDir`；
+
+详情见 [`packaging/README.md`](packaging/README.md)。
+
+---
+
+## 9. 平台差异与排障
 
 | 现象 | 处理 |
 |---|---|
@@ -260,9 +417,11 @@ journalctl -u glxss-cast -f
 | `未找到 2e09:0030` | 设备可能还在 `03e7:2150`（需先灌固件）；或线材/供电；先 `glxss list` |
 | `权限不足` / `Access denied` | Linux 装 udev 规则；Windows 用 Zadig 绑 WinUSB；macOS 检查 libusb |
 | `接口忙` / claim 失败 | 退出厂商 App；Linux 加 `--detach`；同一进程不要重复 claim |
-| 发帧成功但屏不亮 | 先 `glxss screen on` + `glxss mode 2`（`frame/cast` 默认会做） |
+| 发帧成功但屏不亮 | 先 `glxss screen on` + `glxss mode 2`（`frame/cast/hud` 默认会做） |
 | UVC 超时 / 0 帧 | 关掉其他摄像头程序；Linux `--detach` 摘掉 uvcvideo；固件假死需重灌 |
-| 屏幕采集全黑 | Linux Wayland 用 XWayland，或改 `--source test` |
+| HUD 显示 NO MAG / NO IMU | 传感器未使能/全 0；`glxss hid --enable-sensors --count 5` 验证 |
+| `glxss ctl` 连不上 | 两个进程 `GLXSS_SOCK`/`--socket` 必须一致；先 `glxss hud --listen` |
+| 屏幕采集全黑 | Linux Wayland 用 XWayland，或改 `--source hud`/`test` |
 | LCD HAT 画面偏移 | 调 `pi/lcdhat.py --x-offset/--y-offset`（默认 `0/80`），或换 `--rotation` |
 | 刷写中设备断开 | 正常：写完会重枚举为 `2e09:0030`；不要拔线，等 8 s |
 
@@ -276,34 +435,40 @@ journalctl -u glxss-cast -f
 
 ---
 
-## 8. 自检
+## 10. 自检
 
 无眼镜、无桌面也能跑：
 
 ```bash
 cd linux
-python -m compileall -q glxss pi tests tools
+python -m compileall -q glxss pi tests tools packaging
 python -m unittest discover -s tests -v
 python -m glxss --help
-for c in list status bright screen mode roll eeprom version hid uvc frame flash cast; do
+for c in list status bright screen mode roll eeprom version hid uvc frame flash cast hud ctl; do
   python -m glxss "$c" --help >/dev/null || exit 1
 done
+python -m glxss hud --dry-run --save-png /tmp/glxss-hud.png
+python -m glxss frame hud --dry-run
 python -m glxss frame test --dry-run
+python pi/lcdhat.py --preview /tmp/glxss-hat
 python tools/make_test_png.py --out /tmp/glxss-test-pattern.png
 ```
 
 Windows PowerShell 对应：
 
 ```powershell
-python -m compileall -q glxss pi tests tools
+python -m compileall -q glxss pi tests tools packaging
 python -m unittest discover -s tests -v
-python -m glxss frame test --dry-run
-python tools/make_test_png.py --out "$env:TEMP\glxss-test-pattern.png"
+python -m glxss hud --dry-run --save-png "$env:TEMP\glxss-hud.png"
+python pi/lcdhat.py --preview "$env:TEMP\glxss-hat"
 ```
+
+> `unittest` 里控制 socket 的用例在没有 `AF_UNIX` 的平台会 skip；
+> HUD 用例需要 Pillow + numpy，缺失时也会 skip。
 
 ---
 
-## 9. 协议出处
+## 11. 协议出处
 
 * 显示：`docs/ch-display.md` §2–§3
 * UVC：`docs/ch-uvc.md` §1–§5

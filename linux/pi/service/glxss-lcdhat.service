@@ -1,0 +1,24 @@
+[Unit]
+Description=Waveshare 1.3inch LCD HAT status/control panel
+After=glxss-cast.service
+Wants=glxss-cast.service
+
+[Service]
+Type=simple
+# 按实际用户名/安装路径修改
+User=pi
+Group=pi
+SupplementaryGroups=spi gpio video
+WorkingDirectory=/opt/glxss/linux
+Environment=PYTHONUNBUFFERED=1
+Environment=GLXSS_SOCK=/run/glxss/glxssctl.sock
+# HUD 主进程由 glxss-cast.service 负责；这里 --no-spawn 避免重复拉起。
+ExecStart=/opt/glxss/venv/bin/python /opt/glxss/linux/pi/lcdhat.py \
+    --socket /run/glxss/glxssctl.sock \
+    --no-spawn
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

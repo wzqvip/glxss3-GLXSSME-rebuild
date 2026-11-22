@@ -112,10 +112,23 @@ dist/         构建好的 APK
 
 本仓库另有一个 **Linux / 跨平台 Python 版本**，代码在 [`linux/`](linux/) 目录，
 位于 **`linux` 分支**（`git checkout linux`），不影响 `main` 分支的 Android App。
-它提供 `glxss` CLI（list/status/bright/screen/mode/roll/eeprom/version/hid/uvc/frame/flash/cast）、
-可复用的 pyusb/numpy 核心库，以及 Raspberry Pi Zero 2 W + Waveshare 1.3inch LCD HAT
-的状态页/按键投屏示例。安装、Windows（Zadig/WinUSB）、macOS（libusb）和 Pi 部署说明见
-[`linux/README.md`](linux/README.md) 与 [`linux/pi/README.md`](linux/pi/README.md)。
+
+它提供 `glxss` CLI（list/status/bright/screen/mode/roll/eeprom/version/hid/uvc/frame/flash/cast/hud/ctl）、
+可复用的 pyusb/numpy 核心库，以及面向 **Raspberry Pi Zero 2 W + Waveshare 1.3inch
+LCD HAT** 的完整方案：
+
+* **HUD 渲染源**（默认）：Pillow 绘制 640×400 RGBA，包含时间/连接/fps、罗盘、
+  光感/温度、姿态、亮度/固件和导航占位；`glxss hud --dry-run --save-png` 可离线出图。
+* **LCD HAT = 状态/控制面板**：240×240 状态页 + 摇杆菜单（亮度/显示模式/开关屏/
+  HUD 开关/测试帧/退出），通过 Unix socket 控制 HUD 主进程。
+* **PyInstaller 三端打包**：`linux/packaging/` 提供 Linux/macOS 的 `build.sh`、
+  Windows 的 `build.ps1` 和 `.spec`。
+* **从零安装文档**：[`linux/pi/SETUP.md`](linux/pi/SETUP.md)（刷系统、SPI、接线、
+  udev、systemd、offset 微调、供电/排障）。
+
+安装、Windows（Zadig/WinUSB）、macOS（libusb）和 Pi 部署说明见
+[`linux/README.md`](linux/README.md)、[`linux/pi/README.md`](linux/pi/README.md)
+与 [`linux/packaging/README.md`](linux/packaging/README.md)。
 
 ## 文档
 

@@ -249,4 +249,8 @@ def create_source(name: str, monitor: int = 1,
         return TestPatternSource(pattern="bars" if key == "bars" else test_pattern)
     if key in ("screen", "display", "desktop"):
         return ScreenSource(monitor=monitor)
-    raise GlxssError("未知采集源 %r（可选 test / screen）" % name)
+    if key == "hud":
+        # 延迟导入，避免 capture ↔ hud 的模块级循环依赖。
+        from .hud import HudSource
+        return HudSource()
+    raise GlxssError("未知采集源 %r（可选 hud / test / screen）" % name)

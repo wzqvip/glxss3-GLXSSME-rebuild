@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""树莓派 Waveshare 1.3inch LCD HAT：240×240 状态页 + 按键控制 + 投屏。
+"""树莓派 Waveshare 1.3inch LCD HAT：240×240 状态页 + 菜单 + 眼镜 HUD 控制。
 
-硬件：
+定位（重要）：
+  * LCD HAT 是**状态/控制面板**，不是眼镜画面的镜像；
+  * 眼镜由 `glxss hud --listen` 主进程渲染 HUD 并发送；
+  * 本程序通过 Unix socket（`glxss.control`）读状态、发命令，默认在 socket
+    不存在时自动拉起一个 `python -m glxss hud --listen` 子进程。
+
+硬件（Waveshare 官方 wiki）：
   * ST7789 SPI：SCLK=BCM11、MOSI=BCM10、CS=BCM8(CE0)、DC=BCM25、RST=BCM27、BL=BCM24
   * 摇杆/按键：UP=6、DOWN=19、LEFT=5、RIGHT=26、PRESS=13、
-               KEY1=21、KEY2=20、KEY3=16（全部低电平有效，内部上拉）
-  引脚来自 Waveshare 官方 wiki：
-  https://www.waveshare.com/wiki/1.3inch_LCD_HAT
+               KEY1=21、KEY2=20、KEY3=16（低电平有效，内部上拉）
 
-按键映射：
-  * 摇杆 左/右 : 显示模式 1（待机）/ 2（投屏）
-  * 摇杆 按下  : 开/关屏
-  * 摇杆 上/下 : 亮度 ±20
-  * KEY1       : 切换 fit / cover / stretch
-  * KEY2       : 切换 screen / test 采集源
-  * KEY3       : 退出
+操作：
+  状态页：PRESS 进菜单；KEY1 HUD 开关；KEY2 发测试帧；KEY3 退出。
+  菜单页：UP/DOWN 选项；LEFT/RIGHT 调值；PRESS 确认；KEY3 返回。
 
-依赖：spidev、Pillow、numpy、pyusb，以及 RPi.GPIO / lgpio / gpiod 之一。
-这是一个**没有真机时也能编译**的实现；真实 SPI/GPIO 操作只在树莓派上执行。
+无树莓派硬件时可以用 `--preview` 生成状态页/菜单页 PNG：
+    python pi/lcdhat.py --preview /tmp/glxss-hat-preview
 """
 
 from __future__ import annotations
@@ -26,16 +26,17 @@ from __future__ import annotations
 import argparse
 import os
 import struct
+import subprocess
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from glxss import capture, lcd, usb  # noqa: E402
+from glxss.control import ControlClient, default_socket_path  # noqa: E402
 from glxss.errors import GlxssError  # noqa: E402
 
 try:  # 只在真正运行 Pi 界面时必需
@@ -46,14 +47,14 @@ except Exception:  # pragma: no cover
     ImageFont = None  # type: ignore
 
 try:
-    import numpy as np  # type: ignore
-except Exception:  # pragma: no cover
-    np = None  # type: ignore
-
-try:
     import spidev  # type: ignore
 except Exception:  # pragma: no cover
     spidev = None  # type: ignore
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
 
 
 LCD_W = 240
@@ -199,7 +200,8 @@ class Buttons:
         events = []
         for name, pin in BUTTON_PINS.items():
             pressed = self.gpio.input(pin) == 0
-            if pressed and not self._last[name] and now - self._last_at.get(name, 0) >= self.debounce:
+            if (pressed and not self._last[name]
+                    and now - self._last_at.get(name, 0) >= self.debounce):
                 events.append(name)
                 self._last_at[name] = now
                 self.last_event = name
@@ -348,68 +350,286 @@ class ST7789:
 
 
 # ---------------------------------------------------------------------------
-# 状态页
+# 状态页 / 菜单页
 # ---------------------------------------------------------------------------
-class StatusPage:
+MENU_ITEMS = (
+    ("brightness", "BRIGHTNESS"),
+    ("mode", "DISPLAY"),
+    ("screen", "SCREEN"),
+    ("hud", "HUD"),
+    ("test", "TEST FRAME"),
+    ("exit", "EXIT"),
+)
+
+
+class Pages:
+    """240×240 英文界面；避免 Pi 默认字体缺中文字形。"""
+
     def __init__(self):
-        self._font_cache: Dict[int, object] = {}
-        self.last_state = None
+        self._font_cache: Dict[Tuple[int, bool], object] = {}
+        self.last_state = {}
 
-    def _font(self, size: int):
-        if size not in self._font_cache:
-            font = None
-            for path in (
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-            ):
-                try:
-                    font = ImageFont.truetype(path, size)
-                    break
-                except Exception:
-                    continue
-            if font is None:
-                font = ImageFont.load_default()
-            self._font_cache[size] = font
-        return self._font_cache[size]
-
-    def render(self, state: dict):
-        image = Image.new("RGB", (LCD_W, LCD_H), (12, 16, 24))
-        draw = ImageDraw.Draw(image)
-        title_font = self._font(20)
-        font = self._font(15)
-        small = self._font(12)
-
-        draw.rectangle((0, 0, LCD_W, 34), fill=(30, 110, 190))
-        draw.text((10, 7), "GLXSS CAST", font=title_font, fill=(255, 255, 255))
-        draw.ellipse((204, 9, 224, 29), fill=(40, 220, 100) if state.get("connected") else (220, 60, 60))
-
-        y = 46
-        lines = [
-            ("GLASSES", "ONLINE" if state.get("connected") else "OFFLINE",
-             (120, 230, 150) if state.get("connected") else (255, 120, 120)),
-            ("FPS", "%.1f  %.1f MB/s" % (state.get("fps", 0.0), state.get("mbps", 0.0)),
-             (230, 230, 230)),
-            ("BRIGHT", str(state.get("brightness", 0)), (230, 230, 230)),
-            ("MODE", state.get("mode", "-"), (230, 230, 230)),
-            ("SOURCE", state.get("source", "-"), (230, 230, 230)),
-            ("FIT", state.get("fit", "-"), (230, 230, 230)),
-            ("KEY", state.get("last_key", "-"), (250, 210, 120)),
+    def _font(self, size: int, bold: bool = False):
+        key = (int(size), bool(bold))
+        if key in self._font_cache:
+            return self._font_cache[key]
+        font = None
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf" if bold else
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
         ]
-        for label, value, color in lines:
-            draw.text((12, y), label, font=small, fill=(140, 150, 165))
-            draw.text((92, y - 2), str(value), font=font, fill=color)
-            y += 23
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                font = ImageFont.truetype(path, int(size))
+                break
+            except Exception:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default(size=int(size))
+            except TypeError:
+                font = ImageFont.load_default()
+        self._font_cache[key] = font
+        return font
 
-        draw.line((10, 215, LCD_W - 10, 215), fill=(55, 65, 80), width=1)
-        if state.get("error"):
-            draw.text((10, 219), "ERR " + str(state["error"])[:30], font=small,
-                      fill=(255, 120, 120))
+    def _text_width(self, draw, text: str, font) -> int:
+        try:
+            return int(draw.textlength(text, font=font))
+        except Exception:
+            box = draw.textbbox((0, 0), text, font=font)
+            return box[2] - box[0]
+
+    def _right(self, draw, right: int, y: int, text: str, font, fill) -> None:
+        draw.text((right - self._text_width(draw, text, font), y),
+                  text, font=font, fill=fill)
+
+    def status(self, state: dict, error: str = "", notice: str = ""):
+        image = Image.new("RGB", (LCD_W, LCD_H), (10, 15, 24))
+        draw = ImageDraw.Draw(image)
+        title = self._font(16, bold=True)
+        font = self._font(13)
+        small = self._font(10)
+        tiny = self._font(8)
+
+        draw.rectangle((0, 0, LCD_W, 32), fill=(24, 92, 156))
+        draw.text((10, 6), "GLXSS HAT", font=title, fill=(255, 255, 255))
+        dot = (48, 220, 120) if state.get("connected") else (235, 72, 84)
+        draw.ellipse((208, 9, 224, 25), fill=dot)
+        draw.text((10, 34), "GLASSES", font=small, fill=(130, 142, 158))
+        draw.text((78, 32), "ONLINE" if state.get("connected") else "OFFLINE",
+                  font=font, fill=dot)
+
+        rows = [
+            ("FPS", "%.1f" % float(state.get("fps", 0.0)), (225, 230, 238)),
+            ("BRIGHT", str(state.get("brightness", "-")), (225, 230, 238)),
+            ("HUD", "ON" if state.get("hud") else "PAUSED",
+             (120, 230, 150) if state.get("hud") else (255, 190, 72)),
+            ("LUX", "%s lx" % state.get("lux", "-"), (255, 208, 120)),
+            ("TEMP", "%.1f C" % float(state.get("temperature", 0.0)),
+             (255, 208, 120)),
+            ("MODE", "CAST" if state.get("mode") == 2 else "STANDBY",
+             (225, 230, 238)),
+            ("TIME", state.get("time") or time.strftime("%H:%M:%S"),
+             (190, 200, 214)),
+        ]
+        y = 54
+        for label, value, color in rows:
+            draw.text((10, y + 2), label, font=small, fill=(120, 132, 148))
+            draw.text((78, y), str(value), font=font, fill=color)
+            y += 21
+
+        draw.line((8, 202, LCD_W - 8, 202), fill=(44, 62, 82), width=1)
+        if error:
+            draw.text((8, 207), "ERR " + error[:33], font=tiny, fill=(255, 110, 120))
+            draw.text((8, 220), "K3 QUIT   PRESS MENU", font=tiny,
+                      fill=(130, 140, 156))
         else:
-            draw.text((10, 219), state.get("hint", "K1 fit K2 src K3 quit"),
-                      font=small, fill=(130, 140, 155))
+            draw.text((8, 207), "PRESS MENU  K1 HUD", font=tiny,
+                      fill=(130, 140, 156))
+            draw.text((8, 220), notice or "K2 TEST  K3 QUIT", font=tiny,
+                      fill=(190, 160, 90) if notice else (130, 140, 156))
         self.last_state = state
         return image
+
+    def menu(self, state: dict, index: int, edit, notice: str = ""):
+        image = Image.new("RGB", (LCD_W, LCD_H), (10, 15, 24))
+        draw = ImageDraw.Draw(image)
+        title = self._font(15, bold=True)
+        font = self._font(12)
+        small = self._font(9)
+
+        draw.rectangle((0, 0, LCD_W, 30), fill=(24, 92, 156))
+        draw.text((10, 5), "MENU", font=title, fill=(255, 255, 255))
+        self._right(draw, LCD_W - 10, 8, "%d/%d" % (index + 1, len(MENU_ITEMS)),
+                    small, (210, 228, 245))
+
+        for i, (key, label) in enumerate(MENU_ITEMS):
+            y = 38 + i * 26
+            selected = i == index
+            if selected:
+                draw.rounded_rectangle((5, y - 3, LCD_W - 5, y + 20), radius=5,
+                                       fill=(28, 62, 98))
+            color = (255, 255, 255) if selected else (180, 192, 206)
+            draw.text((12, y), label, font=font, fill=color)
+            # edit 只属于当前选中项；其它项始终显示主进程的真实状态。
+            value = self._menu_value(key, state, edit if selected else None)
+            self._right(draw, LCD_W - 12, y, value, font,
+                        (255, 208, 120) if selected else (200, 210, 222))
+
+        draw.line((8, 198, LCD_W - 8, 198), fill=(44, 62, 82), width=1)
+        if notice:
+            draw.text((8, 202), notice[:36], font=small, fill=(255, 208, 120))
+            draw.text((8, 218), "K3 BACK", font=small, fill=(130, 140, 156))
+        else:
+            draw.text((8, 202), "UD SEL   LR ADJ", font=small,
+                      fill=(130, 140, 156))
+            draw.text((8, 218), "PRESS OK   K3 BACK", font=small,
+                      fill=(130, 140, 156))
+        return image
+
+    @staticmethod
+    def _menu_value(key: str, state: dict, edit) -> str:
+        if key == "brightness":
+            return str(edit if edit is not None else state.get("brightness", "-"))
+        if key == "mode":
+            mode = edit if edit is not None else state.get("mode", 2)
+            return "CAST" if mode == 2 else "STANDBY"
+        if key == "screen":
+            value = edit if edit is not None else state.get("screen", True)
+            return "ON" if value else "OFF"
+        if key == "hud":
+            value = edit if edit is not None else state.get("hud", True)
+            return "ON" if value else "PAUSED"
+        if key == "test":
+            return "SEND"
+        return "QUIT"
+
+
+# ---------------------------------------------------------------------------
+# 主进程客户端（Unix socket）
+# ---------------------------------------------------------------------------
+class Daemon:
+    """连接 `glxss hud --listen`；必要时拉起一个子进程。"""
+
+    def __init__(self, path: str, spawn: bool, fps: float, brightness: int,
+                 detach: bool, timeout: int, verbose: bool = False):
+        self.path = os.path.abspath(path)
+        self.client = ControlClient(self.path, timeout=1.2)
+        self.spawn = spawn
+        self.fps = fps
+        self.brightness = brightness
+        self.detach = detach
+        self.timeout = timeout
+        self.verbose = verbose
+        self.child: Optional[subprocess.Popen] = None
+        self.error = ""
+        self._last_spawn = 0.0
+
+    def ensure(self) -> bool:
+        if self._ping():
+            return True
+        if not self.spawn:
+            return False
+        child = self.child
+        if child is not None and child.poll() is None:
+            # 子进程已在跑，只做短等待，别把 HAT 的按键循环卡住。
+            return self._wait_ready(0.5)
+        if time.monotonic() - self._last_spawn < 5.0:
+            return False
+        self._last_spawn = time.monotonic()
+        self._spawn()
+        return self._wait_ready(6.0)
+
+    def _ping(self) -> bool:
+        try:
+            self.client.request("ping")
+            self.error = ""
+            return True
+        except GlxssError as exc:
+            self.error = str(exc).splitlines()[0]
+            return False
+
+    def _wait_ready(self, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._ping():
+                return True
+            child = self.child
+            if child is not None and child.poll() is not None:
+                self.error = "HUD 子进程退出（code=%s）" % child.returncode
+                return False
+            time.sleep(0.25)
+        return False
+
+    def _spawn(self) -> None:
+        cmd = [sys.executable, "-m", "glxss", "hud", "--listen",
+               "--socket", self.path,
+               "--fps", str(self.fps),
+               "--brightness", str(self.brightness)]
+        if self.detach:
+            cmd.append("--detach")
+        if self.timeout:
+            cmd += ["--timeout", str(self.timeout)]
+        env = os.environ.copy()
+        env["GLXSS_SOCK"] = self.path
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        print("启动 HUD 主进程: " + " ".join(cmd))
+        try:
+            self.child = subprocess.Popen(cmd, cwd=ROOT, env=env)
+        except OSError as exc:
+            self.error = "无法启动 HUD 主进程: %s" % exc
+            self.child = None
+
+    def request(self, cmd: str, **payload):
+        try:
+            response = self.client.request(cmd, **payload)
+        except GlxssError as exc:
+            self.error = str(exc).splitlines()[0]
+            return None
+        if not response.get("ok"):
+            self.error = str(response.get("error", "命令失败"))
+            return None
+        self.error = ""
+        return response
+
+    def status(self) -> Optional[dict]:
+        response = self.request("status")
+        if response is None:
+            return None
+        status = response.get("status")
+        return status if isinstance(status, dict) else None
+
+    def close(self) -> None:
+        child = self.child
+        if child is None:
+            return
+        if child.poll() is not None:
+            self.child = None
+            return
+        try:
+            self.client.request("quit")
+        except GlxssError:
+            pass
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and child.poll() is None:
+            time.sleep(0.1)
+        if child.poll() is None:
+            try:
+                child.terminate()
+                child.wait(timeout=2.0)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        self.child = None
 
 
 # ---------------------------------------------------------------------------
@@ -426,192 +646,44 @@ class LcdHatApp:
             dc=args.dc, rst=args.rst, bl=args.bl,
             x_offset=args.x_offset, y_offset=args.y_offset,
             rotation=args.rotation, verbose=args.verbose)
-        self.page = StatusPage()
+        self.pages = Pages()
+        self.daemon = Daemon(args.socket or default_socket_path(),
+                             spawn=not args.no_spawn, fps=args.fps,
+                             brightness=args.brightness, detach=args.detach,
+                             timeout=args.timeout, verbose=args.verbose)
         self.running = True
-        self.source = None
-        self.source_name = args.source
-        self.fit = args.fit
-        self.brightness = args.brightness
-        self.mode = 2
-        self.screen_on = True
-        self.fps_target = args.fps
-        self.dev = None
-        self.session = None
-        self.link = None
-        self.error = ""
-        self.frames = 0
-        self.stats_started = time.monotonic()
-        self.last_frame_at = 0.0
+        self.menu_open = False
+        self.index = 0
+        self.edit = None
+        self.notice = ""
+        self.notice_until = 0.0
+        self.status: dict = {}
         self.last_status_at = 0.0
-        self.last_connect_try = 0.0
-        self.fps = 0.0
-        self.mbps = 0.0
-        self._open_source(args.source)
+        self.last_poll_at = 0.0
+        self.last_render_at = 0.0
 
-    # -- 采集源 ------------------------------------------------------------
-    def _open_source(self, name: str) -> None:
-        try:
-            if self.source is not None:
-                self.source.close()
-            self.source = capture.create_source(
-                name, monitor=self.args.monitor, test_pattern=self.args.test_pattern)
-            self.source_name = name
-            self.error = ""
-        except GlxssError as exc:
-            if name != "test":
-                print("[警告] 屏幕采集失败，回退 test 图案: %s" % exc, file=sys.stderr)
-                self._open_source("test")
-                self.error = str(exc).splitlines()[0]
-            else:
-                self.error = str(exc).splitlines()[0]
-                raise
-
-    # -- USB ---------------------------------------------------------------
-    def _connect(self) -> bool:
-        now = time.monotonic()
-        if self.link is not None:
-            return True
-        if now - self.last_connect_try < 2.0:
-            return False
-        self.last_connect_try = now
-        session = None
-        try:
-            dev = usb.find_normal()
-            session = usb.DeviceSession(dev, detach=self.args.detach,
-                                        verbose=self.args.verbose)
-            intf, ep = usb.pick_bulk_out(dev)
-            session.claim_interface(intf, label="LCD")
-            link = lcd.LcdLink(dev, ep.bEndpointAddress, timeout=self.args.timeout)
-            link.initialize(self.args.timeout)
-            self.dev, self.session, self.link = dev, session, link
-            self.error = ""
-            print("眼镜已连接: " + usb.device_label(dev))
-            return True
-        except GlxssError as exc:
-            if session is not None:
-                session.close()
-            self.error = str(exc).splitlines()[0]
-            return False
-
-    def _disconnect(self, reason: str = "") -> None:
-        self.error = reason or "USB disconnected"
-        if self.session is not None:
-            self.session.close()
-        self.dev = self.session = self.link = None
-        self.fps = self.mbps = 0.0
-        if reason:
-            print("[警告] " + reason, file=sys.stderr)
-
-    # -- 控制 ---------------------------------------------------------------
-    def _run_control(self, action: str, value=None) -> None:
-        if self.link is None:
-            self.error = "glasses offline"
-            return
-        try:
-            if action == "brightness":
-                self.brightness = int(value)
-                self.link.brightness(self.brightness, self.args.timeout)
-            elif action == "screen":
-                self.screen_on = bool(value)
-                self.link.screen(self.screen_on, self.args.timeout)
-                if self.screen_on:
-                    self.link.mode(2, self.args.timeout)
-            elif action == "mode":
-                self.mode = int(value)
-                self.link.mode(self.mode, self.args.timeout)
-            self.error = ""
-        except GlxssError as exc:
-            self._disconnect("控制命令失败: %s" % exc)
-
-    def _handle_key(self, name: str) -> None:
-        print("按键: " + name)
-        if name == "left":
-            self._run_control("mode", 1)
-        elif name == "right":
-            self._run_control("mode", 2)
-        elif name == "press":
-            self._run_control("screen", not self.screen_on)
-        elif name == "up":
-            self._run_control("brightness", min(254, self.brightness + 20))
-        elif name == "down":
-            self._run_control("brightness", max(100, self.brightness - 20))
-        elif name == "key1":
-            modes = ["fit", "cover", "stretch"]
-            self.fit = modes[(modes.index(self.fit) + 1) % len(modes)] if self.fit in modes else "fit"
-        elif name == "key2":
-            self._open_source("test" if self.source_name == "screen" else "screen")
-        elif name == "key3":
-            self.running = False
-        self._render_status(force=True)
-
-    # -- 状态页 ------------------------------------------------------------
-    def _status_state(self) -> dict:
-        return {
-            "connected": self.link is not None,
-            "fps": self.fps,
-            "mbps": self.mbps,
-            "brightness": self.brightness,
-            "mode": "CAST" if self.mode == 2 else "STANDBY",
-            "source": self.source_name,
-            "fit": self.fit,
-            "last_key": self.buttons.last_event or "-",
-            "error": self.error,
-            "hint": "K1 fit  K2 src  K3 quit",
-        }
-
-    def _render_status(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self.last_status_at < 1.0:
-            return
-        self.last_status_at = now
-        try:
-            self.panel.show(self.page.render(self._status_state()))
-        except Exception as exc:
-            print("[警告] 状态页刷新失败: %s" % exc, file=sys.stderr)
-
-    # -- 主循环 ------------------------------------------------------------
+    # -- 生命周期 ----------------------------------------------------------
     def run(self) -> int:
-        print("LCD HAT 启动：SPI%d.%d %dx%d，GPIO 后端=%s" % (
-            self.args.spi_bus, self.args.spi_device, LCD_W, LCD_H, self.gpio.backend))
-        self._render_status(force=True)
+        print("LCD HAT 启动：SPI%d.%d，GPIO=%s，socket=%s" % (
+            self.args.spi_bus, self.args.spi_device, self.gpio.backend,
+            self.daemon.path))
+        # 先画一帧，避免拉起 HUD 子进程的几秒里 HAT 全黑。
+        self._render(force=True)
+        if not self.daemon.ensure():
+            print("[警告] HUD 主进程未就绪: %s" % self.daemon.error,
+                  file=sys.stderr)
+        self._refresh_status(force=True)
+        self._render(force=True)
         try:
             while self.running:
                 for key in self.buttons.poll():
                     self._handle_key(key)
-                if self.link is None:
-                    self._connect()
-                if self.args.no_cast:
-                    time.sleep(0.05)
-                    self._render_status()
-                    continue
-                if self.link is None:
-                    time.sleep(0.05)
-                    self._render_status()
-                    continue
                 now = time.monotonic()
-                period = (1.0 / self.fps_target) if self.fps_target > 0 else 0.0
-                if now - self.last_frame_at < period:
-                    time.sleep(min(0.01, max(0.001, period - (now - self.last_frame_at))))
-                    self._render_status()
-                    continue
-                try:
-                    rgb = self.source.grab()
-                    rgba = capture.map_to_rgba(rgb, mode=self.fit)
-                    packet = lcd.build_frame(capture.rgba_bytes(rgba))
-                    self.link.send_packet(packet)
-                    self.frames += 1
-                    elapsed = max(1e-6, time.monotonic() - self.stats_started)
-                    self.fps = self.frames / elapsed
-                    self.mbps = self.frames * len(packet) / elapsed / 1e6
-                    self.error = ""
-                except GlxssError as exc:
-                    if "设备已断开" in str(exc) or "device" in str(exc).lower():
-                        self._disconnect("投屏断开: %s" % str(exc).splitlines()[0])
-                    else:
-                        self.error = str(exc).splitlines()[0]
-                        time.sleep(0.2)
-                self.last_frame_at = time.monotonic()
-                self._render_status()
+                if now - self.last_poll_at >= 1.0:
+                    self.last_poll_at = now
+                    self._refresh_status()
+                self._render()
+                time.sleep(0.02)
         except KeyboardInterrupt:
             print("\nCtrl-C 退出。")
         finally:
@@ -619,15 +691,169 @@ class LcdHatApp:
         return 0
 
     def close(self) -> None:
-        if self.session is not None:
-            self.session.close()
-        if self.source is not None:
-            self.source.close()
+        self.daemon.close()
         try:
             self.panel.close()
         except Exception:
             pass
         self.gpio.close()
+
+    # -- 状态 --------------------------------------------------------------
+    def _refresh_status(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_status_at < 0.8:
+            return
+        self.last_status_at = now
+        status = self.daemon.status()
+        if status is None:
+            # 服务掉线时状态页不要继续显示旧的 ONLINE/FPS。
+            offline = dict(self.status)
+            offline.update({"connected": False, "fps": 0.0})
+            self.status = offline
+            if self.daemon.child is None or self.daemon.child.poll() is not None:
+                self.daemon.ensure()
+            return
+        self.status = status
+
+    def _status_value(self, key: str):
+        if key == "brightness":
+            try:
+                return max(100, min(254, int(self.status.get("brightness", 180))))
+            except (TypeError, ValueError):
+                return 180
+        if key == "mode":
+            return 2 if self.status.get("mode") == 2 else 1
+        if key == "screen":
+            return bool(self.status.get("screen", True))
+        if key == "hud":
+            return bool(self.status.get("hud", True))
+        return None
+
+    # -- 菜单 --------------------------------------------------------------
+    def _enter_item(self, index: int) -> None:
+        self.index = index % len(MENU_ITEMS)
+        key = MENU_ITEMS[self.index][0]
+        self.edit = self._status_value(key)
+
+    def _adjust(self, direction: int) -> None:
+        key = MENU_ITEMS[self.index][0]
+        if key == "brightness":
+            current = self.edit if isinstance(self.edit, int) else 180
+            self.edit = max(100, min(254, current + 10 * direction))
+        elif key == "mode":
+            self.edit = 1 if self.edit == 2 else 2
+        elif key in ("screen", "hud"):
+            self.edit = not bool(self.edit)
+        else:
+            return
+        self._set_notice("%s = %s" % (MENU_ITEMS[self.index][1],
+                                      Pages._menu_value(key, self.status, self.edit)))
+
+    def _apply(self) -> None:
+        key = MENU_ITEMS[self.index][0]
+        if key == "brightness":
+            self._command("bright", value=self.edit)
+        elif key == "mode":
+            self._command("mode", value=self.edit)
+        elif key == "screen":
+            self._command("screen", value=bool(self.edit))
+        elif key == "hud":
+            self._command("hud", value=bool(self.edit))
+        elif key == "test":
+            self._command("test", seconds=3.0)
+            self._set_notice("TEST FRAME SENT")
+        elif key == "exit":
+            self.running = False
+
+    def _command(self, cmd: str, **payload) -> None:
+        response = self.daemon.request(cmd, **payload)
+        if response is None:
+            self._set_notice("FAILED: " + self.daemon.error[:28])
+            return
+        status = response.get("status")
+        if isinstance(status, dict):
+            self.status = status
+        self._set_notice("OK " + cmd.upper())
+
+    def _set_notice(self, text: str) -> None:
+        self.notice = text
+        self.notice_until = time.monotonic() + 2.0
+        self._render(force=True)
+
+    def _handle_key(self, name: str) -> None:
+        print("按键: " + name)
+        if self.menu_open:
+            if name == "up":
+                self._enter_item(self.index - 1)
+            elif name == "down":
+                self._enter_item(self.index + 1)
+            elif name == "left":
+                self._adjust(-1)
+            elif name == "right":
+                self._adjust(1)
+            elif name == "press":
+                self._apply()
+            elif name == "key3":
+                self.menu_open = False
+                self._set_notice("MENU CLOSED")
+        else:
+            if name == "press":
+                self.menu_open = True
+                self._enter_item(0)
+            elif name == "key1":
+                self._command("hud", value=not bool(self.status.get("hud", True)))
+            elif name == "key2":
+                self._command("test", seconds=3.0)
+                self._set_notice("TEST FRAME SENT")
+            elif name == "key3":
+                self.running = False
+        self._render(force=True)
+
+    # -- 渲染 --------------------------------------------------------------
+    def _render(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_render_at < 0.5:
+            return
+        self.last_render_at = now
+        if self.notice and now >= self.notice_until:
+            self.notice = ""
+        error = self.daemon.error
+        if self.menu_open:
+            image = self.pages.menu(self.status, self.index, self.edit, self.notice)
+        else:
+            image = self.pages.status(self.status, error=error, notice=self.notice)
+        try:
+            self.panel.show(image)
+        except Exception as exc:
+            print("[警告] 屏幕刷新失败: %s" % exc, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# 预览（没有 Pi 硬件时生成 PNG）
+# ---------------------------------------------------------------------------
+def preview(out_dir: str) -> int:
+    if Image is None:
+        raise GlxssError("预览需要 Pillow：python -m pip install Pillow")
+    os.makedirs(out_dir, exist_ok=True)
+    pages = Pages()
+    state = {
+        "connected": True, "fps": 2.0, "brightness": 185, "hud": True,
+        "lux": 321, "temperature": 36.5, "mode": 2, "screen": True,
+        "time": time.strftime("%H:%M:%S"),
+    }
+    status_path = os.path.join(out_dir, "hat-status.png")
+    menu_path = os.path.join(out_dir, "hat-menu.png")
+    paused_path = os.path.join(out_dir, "hat-status-offline.png")
+    pages.status(state).save(status_path)
+    pages.menu(state, 0, 185).save(menu_path)
+    offline = dict(state, connected=False, hud=False)
+    pages.status(offline, error="daemon offline: /run/glxss/glxssctl.sock").save(
+        paused_path)
+    print("已生成:")
+    print("  " + status_path)
+    print("  " + menu_path)
+    print("  " + paused_path)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -635,18 +861,19 @@ class LcdHatApp:
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="树莓派 Waveshare 1.3inch LCD HAT 状态页 + GLXSS 投屏/控制")
-    parser.add_argument("--fps", type=float, default=15.0, help="投屏目标帧率（默认 15）")
-    parser.add_argument("--fit", choices=("fit", "cover", "stretch"), default="fit",
-                        help="映射模式")
-    parser.add_argument("--source", choices=("screen", "test"), default="screen",
-                        help="初始采集源（默认 screen，失败回退 test）")
-    parser.add_argument("--monitor", type=int, default=1, help="mss 显示器编号")
-    parser.add_argument("--test-pattern", choices=("bars", "gradient"), default="bars")
-    parser.add_argument("--no-cast", action="store_true", help="只显示状态页，不投屏")
-    parser.add_argument("--brightness", type=int, default=180, help="初始亮度 100..254")
-    parser.add_argument("--detach", action="store_true", help="Linux detach 内核驱动")
-    parser.add_argument("--timeout", type=int, default=5000, help="USB 超时毫秒")
+        description="树莓派 Waveshare 1.3inch LCD HAT 状态/控制面板（通过 Unix socket 控制 glxss hud）")
+    parser.add_argument("--socket", default=None,
+                        help="控制 socket 路径（默认 $GLXSS_SOCK 或 /run/glxssctl.sock）")
+    parser.add_argument("--no-spawn", action="store_true",
+                        help="socket 不可用时不要自动拉起 glxss hud 子进程")
+    parser.add_argument("--fps", type=float, default=2.0,
+                        help="拉起的 HUD 主进程帧率（默认 2）")
+    parser.add_argument("--brightness", type=int, default=180,
+                        help="HUD 初始亮度（100..254）")
+    parser.add_argument("--detach", action="store_true",
+                        help="拉起的 HUD 主进程使用 --detach")
+    parser.add_argument("--timeout", type=int, default=5000,
+                        help="拉起的 HUD 主进程 USB 超时毫秒")
     parser.add_argument("--spi-bus", type=int, default=0)
     parser.add_argument("--spi-device", type=int, default=0, help="0=CE0，1=CE1")
     parser.add_argument("--spi-hz", type=int, default=40_000_000)
@@ -658,6 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dc", type=int, default=PIN_LCD_DC)
     parser.add_argument("--rst", type=int, default=PIN_LCD_RST)
     parser.add_argument("--bl", type=int, default=PIN_LCD_BL)
+    parser.add_argument("--preview", metavar="DIR",
+                        help="不开 SPI/GPIO，只生成状态页/菜单页 PNG")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -667,6 +896,12 @@ def main(argv=None) -> int:
     if not 0 <= args.brightness <= 255:
         print("[错误] 亮度必须在 0..255", file=sys.stderr)
         return 2
+    if args.preview:
+        try:
+            return preview(args.preview)
+        except GlxssError as exc:
+            print("[错误] " + str(exc), file=sys.stderr)
+            return 1
     try:
         return LcdHatApp(args).run()
     except GlxssError as exc:

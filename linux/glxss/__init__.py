@@ -5,7 +5,7 @@
 硬件访问统一走 pyusb；没有安装 pyusb 时，帮助、测试图案和 dry-run 仍然可用。
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .errors import DeviceNotFound, GlxssError, PermissionDenied, ProtocolError
 
