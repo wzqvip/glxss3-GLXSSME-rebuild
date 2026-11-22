@@ -62,6 +62,7 @@ import com.wzqvip.glxsscast.record.VideoRecorder
 import com.wzqvip.glxsscast.settings.HidAction
 import com.wzqvip.glxsscast.settings.Prefs
 import com.wzqvip.glxsscast.stress.CpuSampler
+import com.wzqvip.glxsscast.usb.Firmware
 import com.wzqvip.glxsscast.usb.HidSensor
 import com.wzqvip.glxsscast.usb.Peripherals
 import com.wzqvip.glxsscast.usb.UsbLink
@@ -161,6 +162,10 @@ class MainActivity : ComponentActivity() {
 
     /** 用户主动点「断开」后暂停自动重连（插拔/手动连接会恢复） */
     private var reconnectPaused = false
+
+    // ---- 固件（APK 内置 assets/firmware → filesDir/firmware 首次解包） ----
+    private var firmwareInfo by mutableStateOf("固件：检查中…")
+    private var firmwareBusy by mutableStateOf(false)
 
     // ---- EEPROM 产品信息 ----
     private var productInfo by mutableStateOf<ProductInfo?>(null)
@@ -302,6 +307,8 @@ class MainActivity : ComponentActivity() {
         volume = AudioEnh.volume(this)
         refreshAudioDevices()
         updateCrashInfo()
+        // 首次运行把 APK 内置的固件解包到 filesDir/firmware（1.5 MB / IO 线程；失败只提示，不崩）
+        prewarmFirmware()
 
         // UVC 设备需要 CAMERA 权限才会授予 USB 访问
         if (androidx.core.content.ContextCompat.checkSelfPermission(
@@ -394,6 +401,8 @@ class MainActivity : ComponentActivity() {
             val reason = Oplog.lastCrashReason
             if (reason != null) append(" · 上次现场: $reason")
             else append(" · 暂无 crash 现场")
+            // 工作线程异常原本会直接杀掉进程（闪退）；0.1.5 起被兜住并记在这里
+            Oplog.lastWorkerCrash?.let { append("\n工作线程异常已兜住: $it") }
         }
     }
 
@@ -447,14 +456,98 @@ class MainActivity : ComponentActivity() {
 
     private fun autoFlashBoot(dev: UsbDevice) {
         Oplog.logf("CONN", "autoFlashBoot dev=%s hasPerm=%b", dev.deviceName, usb.hasPermission(dev))
-        if (!usb.hasPermission(dev)) { status = "引导模式设备，请求权限…"; usb.requestPermission(dev); return }
-        val base = getExternalFilesDir(null)?.absolutePath ?: "/sdcard/Android/data/com.wzqvip.glxsscast/files"
-        val img = base + "/G25_MainFW_1.9.1.img"
-        if (!java.io.File(img).exists()) { status = "检测到引导模式，但缺少固件文件"; return }
-        status = "检测到引导模式，自动加载固件…"
-        com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(this, dev, img,
-            { p, m -> runOnUiThread { status = "$p% $m" } },
-            { ok, msg -> runOnUiThread { status = msg } })
+        if (!usb.hasPermission(dev)) {
+            status = "引导模式设备，请求 USB 权限…"
+            requestPermissionSafe(dev)
+            return
+        }
+        status = "检测到引导模式，准备固件…"
+        flashBootDevice(dev)
+    }
+
+    /**
+     * USB 权限请求的兜底：`PendingIntent` / 系统服务在部分 ROM 上会抛异常，
+     * 而这个函数是在 BroadcastReceiver（主线程）里被调的 —— 抛出去就是闪退。
+     */
+    private fun requestPermissionSafe(dev: UsbDevice) {
+        try {
+            usb.requestPermission(dev)
+        } catch (t: Throwable) {
+            Oplog.logf("CONN", "requestPermission failed %s: %s", t.javaClass.simpleName, t.message)
+            status = "USB 权限请求失败：${t.message}"
+        }
+    }
+
+    /**
+     * 灌固件前的「确保内置固件已解包」步骤。
+     *
+     * 把 APK 里 `assets/firmware/` 的两个文件复制到 `filesDir/firmware/`：
+     * 解包/校验都在 IO 线程，失败只把 [Firmware.Result.message] 写到状态栏，不往主线程抛。
+     */
+    private suspend fun ensureFirmware(): Firmware.Result = withContext(Dispatchers.IO) {
+        runCatching { Firmware.ensure(applicationContext) }.getOrElse {
+            Firmware.Result(
+                false, null,
+                "固件准备失败: ${it.javaClass.simpleName}: ${it.message}"
+            )
+        }
+    }
+
+    /** 启动时预热：新装用户第一次进来就把固件解包好，插上眼镜时不用等 */
+    private fun prewarmFirmware() {
+        lifecycleScope.launch {
+            val r = ensureFirmware()
+            firmwareInfo = if (r.ok) Firmware.describe(this@MainActivity) else "固件：不可用 —— ${r.message}"
+            Oplog.logf("BOOT", "firmware prewarm ok=%b: %s", r.ok, r.message)
+        }
+    }
+
+    /** 删掉 `filesDir/firmware` 缓存再重新解包（固件区被写坏/想强制校验时用） */
+    private fun rebuildFirmwareCache() {
+        if (firmwareBusy) return
+        firmwareBusy = true
+        status = "重新解包内置固件…"
+        lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) { Firmware.reset(applicationContext) }
+                val r = ensureFirmware()
+                firmwareInfo = if (r.ok) Firmware.describe(this@MainActivity) else "固件：不可用 —— ${r.message}"
+                status = r.message
+            } finally {
+                firmwareBusy = false
+            }
+        }
+    }
+
+    /**
+     * 给处于引导模式（03E7:2150）的眼镜灌内置固件。
+     *
+     * 旧实现只认 `getExternalFilesDir(null)/G25_MainFW_1.9.1.img`：普通用户装完 APK
+     * 根本没有这个文件 → 无法恢复；而且文件缺失/设备被拔时的异常路径没兜底。
+     * 现在统一走 APK 内置 + 私有目录，任何一步失败都给状态栏提示而不是崩。
+     */
+    private fun flashBootDevice(dev: UsbDevice) {
+        lifecycleScope.launch {
+            val r = ensureFirmware()
+            val img = r.file
+            if (!r.ok || img == null) {
+                firmwareInfo = "固件：不可用 —— ${r.message}"
+                status = "缺少固件：${r.message}"
+                return@launch
+            }
+            firmwareInfo = Firmware.describe(this@MainActivity)
+            // 再就地校验一次（目录可能刚被系统清理/写坏）
+            com.wzqvip.glxsscast.usb.MyriadBootLoader.validate(img)?.let {
+                status = "固件不可用：$it"
+                return@launch
+            }
+            status = "正在灌固件…"
+            com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(
+                this@MainActivity, dev, img,
+                { p, m -> runOnUiThread { status = "$p% $m" } },
+                { ok, msg -> runOnUiThread { status = if (ok) msg else "固件加载失败：$msg" } }
+            )
+        }
     }
 
     /** 手动连接：先看权限，再在 IO 线程打开 */
@@ -478,7 +571,7 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         if (now - lastPermissionRequestAt < 5000) return
         lastPermissionRequestAt = now
-        usb.requestPermission(dev)
+        requestPermissionSafe(dev)
     }
 
     /** 设过了自动亮度 / HID 的话，连接成功后恢复 */
@@ -1449,7 +1542,7 @@ class MainActivity : ComponentActivity() {
             }
 
             Scaffold(
-                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.4 Dev") }) }
+                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.5 Dev") }) }
             ) { pad ->
                 Column(
                     Modifier
@@ -2163,6 +2256,11 @@ class MainActivity : ComponentActivity() {
 
                     HorizontalDivider()
                     Text("固件", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        firmwareInfo,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
                     Button(
                         onClick = {
                             val usbMgr = getSystemService(android.content.Context.USB_SERVICE) as UsbManager
@@ -2171,31 +2269,25 @@ class MainActivity : ComponentActivity() {
                                 status = "未检测到引导模式设备(03E7:2150)"
                             } else if (!usb.hasPermission(bootDev)) {
                                 status = "请求引导设备权限…"
-                                usb.requestPermission(bootDev)
+                                requestPermissionSafe(bootDev)
                             } else {
-                                val base = getExternalFilesDir(null)?.absolutePath
-                                    ?: "/sdcard/Android/data/com.wzqvip.glxsscast/files"
-                                val img = base + "/G25_MainFW_1.9.1.img"
-                                if (!java.io.File(img).exists()) {
-                                    status = "缺少固件文件: " + img
-                                } else {
-                                    status = "正在加载固件…"
-                                    com.wzqvip.glxsscast.usb.MyriadBootLoader.flash(
-                                        this@MainActivity, bootDev, img,
-                                        { p, m -> runOnUiThread { status = "$p% $m" } },
-                                        { ok, msg -> runOnUiThread { status = msg } }
-                                    )
-                                }
+                                flashBootDevice(bootDev)
                             }
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("加载固件（引导模式 03E7:2150）") }
+                    OutlinedButton(
+                        onClick = { rebuildFirmwareCache() },
+                        enabled = !firmwareBusy,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("重新解包内置固件（sha256 校验）") }
 
                     Text(
                         "固件卡死（UVC 无帧 / 投屏和色条都没画面，但 USB 还能查状态）时：\n" +
                             "① 拔掉眼镜 USB 再插上 → 设备会以 03E7:2150 出现；\n" +
-                            "② App 会自动灌固件（约 2 秒），等它重新枚举成 2E09:0030；\n" +
+                            "② App 会自动灌内置固件（约 2 秒），等它重新枚举成 2E09:0030；\n" +
                             "③ 再点「连接眼镜」，然后开摄像头 / 发色条。\n" +
+                            "固件随 APK 分发、首次启动解包到应用私有目录，不需要 adb push。\n" +
                             "仓库与原理/证据: https://github.com/wzqvip/glxss3-GLXSSME-rebuild\n开发者 bilibili: 塔可Tacoin",
                         style = MaterialTheme.typography.bodySmall
                     )

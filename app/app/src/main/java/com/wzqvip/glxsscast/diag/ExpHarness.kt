@@ -7,6 +7,7 @@ import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.record.RecordSource
 import com.wzqvip.glxsscast.record.VideoRecorder
+import com.wzqvip.glxsscast.usb.Firmware
 import com.wzqvip.glxsscast.usb.HidSensor
 import com.wzqvip.glxsscast.usb.MyriadBootLoader
 import com.wzqvip.glxsscast.usb.UsbGate
@@ -96,7 +97,7 @@ object ExpHarness {
 
     /**
      * 手动给引导模式设备（03E7:2150）灌固件 —— 自动 attach 流程没触发/没权限时用。
-     * 固件默认取 app 外部目录的 `G25_MainFW_1.9.1.img`。
+     * 固件取 APK 内置的那份（`assets/firmware/` → `filesDir/firmware/`），不再读外部目录。
      */
     fun flashBoot(ctx: Context, imgPath: String? = null): String {
         val usb = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -106,13 +107,16 @@ object ExpHarness {
             UsbLink.get(ctx).requestPermission(dev)
             return "flash boot: requesting USB permission, retry in 2s"
         }
-        val path = imgPath ?: File(
-            ctx.getExternalFilesDir(null) ?: ctx.filesDir, "G25_MainFW_1.9.1.img"
-        ).absolutePath
-        if (!File(path).exists()) return "flash boot: missing $path"
+        val path = imgPath ?: run {
+            val r = Firmware.ensure(ctx)
+            if (!r.ok || r.file == null) return "flash boot: ${r.message}"
+            r.file.absolutePath
+        }
+        val missing = MyriadBootLoader.validate(File(path))
+        if (missing != null) return "flash boot: $missing"
         Oplog.logf("EXP", "flash boot start %s", path)
         MyriadBootLoader.flash(
-            ctx, dev, path,
+            ctx, dev, File(path),
             { p, m ->
                 if (p % 25 == 0 || p == 100) Oplog.logf("BOOT", "progress %d%% %s", p, m)
             },

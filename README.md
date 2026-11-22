@@ -6,7 +6,9 @@
 > A study of the LLVision GLXSS3 (G25) AR glasses, for interoperability and personal hardware
 > experimentation.
 
-**本仓库不包含 APK、固件或任何第三方专有文件**（仅含分析笔记、我们自己编写的代码与协议描述）。
+**源码仓库不含第三方专有文件**（仅含分析笔记、我们自己编写的代码与协议描述）。
+例外：`dist/` 里的自研 APK **内含原厂固件镜像** `G25_MainFW_1.9.1.img`（版权归亮亮视野所有，
+仅用于设备互操作性恢复，禁止商用，详见 [NOTICE.md](NOTICE.md)）。
 **本项目禁止商业使用** —— 见 [LICENSE](LICENSE)。
 
 注： 目前有民间高价转卖的开发资料等，目前我并未购买（如果有人可以分享可以联系我）。 本项目结果均为官方app进行协议分析后的重新实现，不包含原始代码。暂无开发眼镜固件的计划。
@@ -89,11 +91,14 @@ cd app && gradle assembleDebug
 # 安装
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 
-# 固件文件（自动恢复需要，不随仓库分发）
-adb push G25_MainFW_1.9.1.img /sdcard/Android/data/com.wzqvip.glxsscast/files/
+# 固件：0.1.5 起已随 APK 分发（assets/firmware/），首次启动会解包到
+# filesDir/firmware/ 并做 sha256 校验，不需要再 adb push
 ```
 
 打开 App：连接眼镜 → 开始投屏（选"分享整个屏幕"）→ 摄像头/亮度/测试图都在同一页。
+
+> 固件版权归亮亮视野（LLVision）所有：APK 内含镜像仅用于把自家处于 `03E7:2150`
+> 引导模式的眼镜恢复成 `2E09:0030`，**禁止商用**。详见 [NOTICE.md](NOTICE.md)。
 
 ## 仓库结构
 
