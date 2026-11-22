@@ -57,6 +57,10 @@ object Oplog {
     @Volatile var crashCount: Int = 0
         private set
 
+    /** 最近一次被吞掉的工作线程异常（线程未捕获异常原本会杀掉整个进程） */
+    @Volatile var lastWorkerCrash: String? = null
+        private set
+
     /** 幂等初始化；[appVersion] 只用于 crash 头，一般传 BuildConfig.VERSION_NAME */
     fun init(ctx: Context, appVersion: String = BuildConfig.VERSION_NAME) {
         if (installed) return
@@ -177,12 +181,30 @@ object Oplog {
 
     private fun installCrashHandler() {
         val prev = Thread.getDefaultUncaughtExceptionHandler()
+        val mainThread = android.os.Looper.getMainLooper()?.thread
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            val isMain = mainThread == null || t === mainThread
             try {
-                dumpCrash("app_crash:${e.javaClass.simpleName}:${e.message?.take(80)}")
+                if (!isMain) {
+                    lastWorkerCrash = "thread=${t?.name} ${e.javaClass.simpleName}: ${e.message?.take(160)}"
+                }
+                dumpCrash(
+                    if (isMain) {
+                        "app_crash:${e.javaClass.simpleName}:${e.message?.take(80)}"
+                    } else {
+                        "worker_crash(thread=${t?.name}):${e.javaClass.simpleName}:${e.message?.take(80)}"
+                    }
+                )
             } catch (ignored: Throwable) {
             }
-            prev?.uncaughtException(t, e)
+            if (isMain) {
+                prev?.uncaughtException(t, e)
+            } else {
+                // Android 默认：任意线程未捕获异常 = 整个进程被 kill（用户看到「闪退」）。
+                // 工作线程（UvcReader / HidSensor / MyriadFlash / CastService…）上的异常
+                // 已经 dump 过现场，这里吞掉，让 App 继续跑 —— 主线程崩溃仍然交给系统。
+                Log.e(TAG, "worker thread crash swallowed: thread=${t?.name}", e)
+            }
         }
     }
 }

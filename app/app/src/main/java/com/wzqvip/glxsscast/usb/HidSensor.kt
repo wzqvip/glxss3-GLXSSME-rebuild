@@ -275,9 +275,17 @@ class HidSensor(private val link: UsbLink) {
                 }
             } else if (n < 0) {
                 failCount++
-                Thread.sleep(50)
+                try {
+                    Thread.sleep(50)
+                } catch (ignored: InterruptedException) {
+                    break
+                }
             } else {
-                Thread.sleep(50)
+                try {
+                    Thread.sleep(50)
+                } catch (ignored: InterruptedException) {
+                    break
+                }
             }
         }
         Oplog.log("HID", "interrupt loop exit")

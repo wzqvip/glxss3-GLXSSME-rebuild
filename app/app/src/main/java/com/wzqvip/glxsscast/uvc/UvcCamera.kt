@@ -973,11 +973,11 @@ class UvcCamera(private val ctx: Context) {
                     Log.w(TAG, "bulk in timeout x$timeouts (no data) fastFails=$fastFails")
                     lastLog = now
                 }
-                if (fast) Thread.sleep(20)
+                if (fast) safeSleep(20)
                 continue
             }
             if (n == 0) {
-                Thread.sleep(10)
+                safeSleep(10)
                 continue
             }
             timeouts = 0
@@ -995,7 +995,7 @@ class UvcCamera(private val ctx: Context) {
                 // 之前无条件追加会让整帧永久错位 → 彩色噪点。
                 if (inSync) {
                     append(buf, 0, n)
-                    if (frameLen >= frameSize) { deliver(); inSync = false }
+                    if (frameLen >= frameSize) { deliverSafe(); inSync = false }
                 } else {
                     unalignedDrop++
                     onInvalidUrb(n, hdrLen, hdrInfo,
@@ -1010,11 +1010,11 @@ class UvcCamera(private val ctx: Context) {
             if (!inSync) { frameLen = 0; inSync = true }
             append(buf, hdrLen, n - hdrLen)
             if (eof) {
-                deliver()
+                deliverSafe()
                 inSync = false
             } else if (frameLen >= frameSize) {
                 // 设备没按 UVC 语义打 EOF：按长度兜底交帧（真机不会走到这里）
-                deliver()
+                deliverSafe()
             }
         }
         frameLen = 0
@@ -1057,7 +1057,32 @@ class UvcCamera(private val ctx: Context) {
             Log.e(TAG, msg)
             Oplog.logf("UVC", "invalid streak=%d (%s) n=%d hdr=0x%02x", invalidStreak, why, n, hdrInfo)
             Oplog.dumpCrash("uvc_invalid_stream(streak=$invalidStreak,n=$n)")
-            listener?.onError(msg)
+            try {
+                listener?.onError(msg)
+            } catch (t: Throwable) {
+                Log.w(TAG, "onError callback failed", t)
+            }
+        }
+    }
+
+    /**
+     * [deliver] 的兜底：解码/`listener`/`frameTap` 回调里的任何异常都不允许逃出
+     * `UvcReader` 线程 —— Android 上后台线程的未捕获异常会杀掉**整个进程**（表现为闪退）。
+     */
+    private fun deliverSafe() {
+        try {
+            deliver()
+        } catch (t: Throwable) {
+            Oplog.logf("UVC", "deliver threw %s: %s", t.javaClass.simpleName, t.message)
+            Log.e(TAG, "deliver threw", t)
+        }
+    }
+
+    /** 读线程里的 sleep 不允许把 InterruptedException 抛出去（同样会杀进程） */
+    private fun safeSleep(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (ignored: InterruptedException) {
         }
     }
 
@@ -1186,7 +1211,11 @@ class UvcCamera(private val ctx: Context) {
         } catch (t: Throwable) {
             Log.w(TAG, "frameTap failed", t)
         }
-        listener?.onFrame(bmp, len, fps)
+        try {
+            listener?.onFrame(bmp, len, fps)
+        } catch (t: Throwable) {
+            Log.w(TAG, "onFrame callback failed", t)
+        }
     }
 
     // ---- YUV → Bitmap ----
