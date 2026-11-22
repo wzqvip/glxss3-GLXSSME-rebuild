@@ -60,6 +60,71 @@ class StatusAndHidTests(unittest.TestCase):
         self.assertAlmostEqual(report.temperature, 60.527, places=2)
 
 
+class FnWatcherTests(unittest.TestCase):
+    """Fn 单击/长按解析（不碰硬件）。"""
+
+    @staticmethod
+    def _report(status=1, code=hid.KEY_CODE_FN):
+        raw = struct.pack("<BBH9hBBf", status, code, 0,
+                          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+        return hid.parse_report(raw)
+
+    def test_short_click_at_100ms(self):
+        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+        self.assertEqual([e.kind for e in watcher.feed(self._report(1), 0.0)],
+                         ["press"])
+        self.assertEqual(watcher.feed(self._report(1), 0.1), [])
+        events = watcher.feed(self._report(0, 0), 0.15)
+        self.assertEqual([e.kind for e in events], ["release", "click"])
+        self.assertAlmostEqual(events[-1].duration, 0.15, places=3)
+
+    def test_long_press_4_packets_at_300ms(self):
+        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+        watcher.feed(self._report(1), 0.0)
+        self.assertEqual(watcher.feed(self._report(1), 0.3), [])
+        self.assertEqual(watcher.feed(self._report(1), 0.6), [])
+        events = watcher.feed(self._report(1), 0.9)
+        self.assertEqual([e.kind for e in events], ["long"])
+        events = watcher.feed(self._report(0, 0), 1.2)
+        self.assertEqual([e.kind for e in events], ["release"])
+        self.assertEqual(watcher.feed(self._report(0, 0), 1.4), [])
+
+    def test_fast_poll_does_not_fire_long_early(self):
+        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+        watcher.feed(self._report(1), 0.0)
+        for step in range(1, 9):          # 0.1..0.8 s，第 9 个包仍不到 0.9 s
+            self.assertEqual(watcher.feed(self._report(1), step * 0.1), [])
+        events = watcher.feed(self._report(1), 0.9)
+        self.assertEqual([e.kind for e in events], ["long"])
+
+    def test_held_without_enough_packets_is_click(self):
+        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+        watcher.feed(self._report(1), 0.0)
+        events = watcher.feed(self._report(0, 0), 1.5)
+        self.assertEqual([e.kind for e in events], ["release", "click"])
+
+    def test_other_key_does_not_count_as_fn(self):
+        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+        self.assertEqual(watcher.feed(self._report(1, 0x70), 0.0), [])
+        self.assertEqual(watcher.feed(self._report(0, 0), 0.1), [])
+
+
+class StreamConfigTests(unittest.TestCase):
+    def test_async_urb_bounds(self):
+        for value in (0, 1, 8, 32):
+            cfg = stream.StreamConfig(async_urb=value)
+            cfg.validate()
+        for value in (-1, 33):
+            cfg = stream.StreamConfig(async_urb=value)
+            with self.assertRaises(GlxssError):
+                cfg.validate()
+
+    def test_fn_long_press_floor(self):
+        cfg = stream.StreamConfig(fn_long_press=0.1)
+        with self.assertRaises(GlxssError):
+            cfg.validate()
+
+
 class CaptureTests(unittest.TestCase):
     def test_test_pattern_and_rgba(self):
         source = capture.TestPatternSource(animate=False)
@@ -560,6 +625,38 @@ class UvcChunkFramingTests(unittest.TestCase):
         second = stream.read_frame()
         self.assertEqual(len(second.data), 1382400)
         self.assertEqual(stream.synced_frames, 2)
+
+    def test_async_reader_delegation_and_framing(self):
+        """async_reader 提供字节块时，read_frame 走同一条组帧路径。"""
+        header, payload = self._frame(1280, 720)
+        blob = header + payload
+
+        class FakeAsync:
+            def __init__(self, data, chunk=uvc.BULK_CHUNK):
+                self.data = data
+                self.pos = 0
+                self.chunk = chunk
+                self.calls = 0
+
+            def read_chunk(self, timeout=None):
+                self.calls += 1
+                take = min(self.chunk, len(self.data) - self.pos)
+                if take <= 0:
+                    return b""
+                chunk = self.data[self.pos:self.pos + take]
+                self.pos += len(chunk)
+                return chunk
+
+        reader = FakeAsync(blob)
+        stream = uvc.UvcStream(None, SimpleNamespace(bInterfaceNumber=1),
+                               SimpleNamespace(bEndpointAddress=0x81),
+                               timeout=1000, async_reader=reader)
+        stream.set_dimensions(1280, 720)
+        frame = stream.read_frame()
+        self.assertEqual(frame.data, payload)
+        self.assertGreater(reader.calls, 80)
+        # 同步回退时才会碰 dev；这里 dev=None 必须完全走 reader。
+        self.assertIsNone(stream.dev)
 
     def test_header_split_across_chunks(self):
         header, payload = self._frame(8, 8)

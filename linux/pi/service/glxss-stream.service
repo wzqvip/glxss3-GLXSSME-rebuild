@@ -1,5 +1,5 @@
 [Unit]
-Description=GLXSS G25 UVC → RTSP 直播
+Description=GLXSS G25 UVC → RTSP 直播（720p30，Fn 可切眼镜预览）
 Documentation=file:/home/taco/glxss3-linux/pi/STREAM.md
 After=network-online.target mediamtx.service
 Wants=network-online.target
@@ -14,14 +14,22 @@ SupplementaryGroups=video
 WorkingDirectory=/home/taco/glxss3-linux
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/home/taco/glxss3-linux
-# 640×480@20 + 1.5 Mbps + Pi 硬编码：约 0.2–0.3 核、~150 MB 内存
-# （ffmpeg 占 90 MB 左右；416 MB 的 Zero 2 W 上别同时再跑重负载）
-# 需要更高码率/分辨率时改这里的参数（见 STREAM.md「参数」一节）
+# 控制 socket 固定到 /run/glxss；glxss ctl --socket /run/glxss/glxssctl.sock 连
+Environment=GLXSS_SOCK=/run/glxss/glxssctl.sock
+RuntimeDirectory=glxss
+RuntimeDirectoryMode=0755
+# 1280×720@30 + 2 Mbps：异步 16 URB，单路约 1.3 核 python + 0.3 核 ffmpeg；
+# Fn 单击切眼镜预览（10 fps，双路约 1.1 + 0.23 核），长按停/恢复 RTSP。
+# 需要 640×480 时改 --size 640x480（并删掉 --async-urb/frame-index 相关参数）。
 ExecStart=/usr/bin/python3 /home/taco/glxss3-linux/pi/stream.py \
     --rtsp rtsp://127.0.0.1:8554/glxss \
-    --size 640x480 \
-    --fps 20 \
-    --bitrate 1500k \
+    --size 1280x720 \
+    --fps 30 \
+    --bitrate 2M \
+    --async-urb 16 \
+    --mirror-fps 10 \
+    --mirror-rotate 180 \
+    --preview-fps 10 \
     --codec h264_v4l2m2m \
     --transport tcp
 Restart=always

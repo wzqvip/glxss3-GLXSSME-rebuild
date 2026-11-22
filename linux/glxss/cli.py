@@ -241,14 +241,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ctl", help="通过 Unix socket 控制正在运行的 HUD 主进程")
     p.add_argument("action",
                    choices=("status", "ping", "bright", "screen", "mode",
-                            "view", "rec", "hud", "test", "nav", "nav-clear",
-                            "quit"),
-                   help="要发送的命令（view/mode 可切 hud|monitor）")
+                            "view", "display", "rtsp", "stream", "button",
+                            "rec", "hud", "test", "nav", "nav-clear", "quit"),
+                   help="要发送的命令（view/mode 切 hud|monitor；"
+                        "display 切 preview|hud；rtsp 切 on|off；"
+                        "button 注入 click|long 便于无硬件测试）")
     p.add_argument("value", nargs="?", help="命令参数（brightness/on/off/度数等）")
     p.add_argument("--distance", type=float, default=0.0, help="nav 的距离（米）")
     p.add_argument("--label", default="", help="nav 的文字标签")
     p.add_argument("--socket", default=None, help="控制 socket 路径")
-    p.add_argument("--timeout", type=int, default=2000, help="socket 超时毫秒")
+    p.add_argument("--timeout", type=int, default=5000,
+                   help="socket 超时毫秒（预览启停可能等 LCD 线程退出）")
     p.add_argument("--json", action="store_true", help="原样输出 JSON")
     p.set_defaults(func=cmd_ctl)
 
@@ -1160,9 +1163,24 @@ def _locked_send(lock, link, packet: bytes) -> int:
 def _print_ctl_status(status) -> None:
     print("  眼镜    : %s" % ("ONLINE" if status.get("connected") else "OFFLINE"))
     print("  fps     : %.1f" % float(status.get("fps", 0.0)))
-    print("  亮度    : %s" % status.get("brightness"))
+    if status.get("brightness") is not None:
+        print("  亮度    : %s" % status.get("brightness"))
     print("  视图    : %s" % (status.get("view") or "hud"))
     print("  显示模式: %s" % status.get("mode"))
+    if "display" in status:
+        last = status.get("last_button") or ""
+        print("  显示    : %s%s" % (
+            "camera preview" if status.get("display") == "preview" else "HUD/不占屏",
+            ("（最近按键 %s）" % last) if last else "（按 Fn 单击切换）"))
+    if "rtsp" in status:
+        print("  RTSP    : %s（长按 Fn 切换）" % (
+            "ON" if status.get("rtsp") else "OFF"))
+    if isinstance(status.get("async"), dict) and status["async"]:
+        a = status["async"]
+        print("  UVC 读   : 异步 %d URB，在途 %d，队列 %d，暂停 %d 次/%.0f ms" % (
+            int(a.get("urbs", 0)), int(a.get("inflight", 0)),
+            int(a.get("queued", 0)), int(a.get("pauses", 0)),
+            float(a.get("pause_ms", 0.0))))
     print("  屏      : %s" % ("开" if status.get("screen") else "关"))
     print("  HUD     : %s" % ("ON" if status.get("hud") else "PAUSED"))
     print("  录制红点: %s" % ("ON" if status.get("rec") else "OFF"))
@@ -1223,6 +1241,31 @@ def cmd_ctl(args) -> int:
         if text not in ("hud", "monitor", "uvc"):
             raise GlxssError("view 需要 hud 或 monitor，收到 %r" % value)
         payload["value"] = "monitor" if text == "uvc" else text
+    elif action == "display":
+        text = str(value).strip().lower() if value is not None else "toggle"
+        if text in ("", "toggle"):
+            payload["value"] = "toggle"
+        elif text in ("preview", "camera", "uvc", "on", "1", "monitor"):
+            payload["value"] = "preview"
+        elif text in ("hud", "off", "0"):
+            payload["value"] = "hud"
+        else:
+            raise GlxssError("display 需要 preview/hud/toggle，收到 %r" % value)
+    elif action == "button":
+        text = str(value).strip().lower() if value is not None else "click"
+        if text not in ("click", "long"):
+            raise GlxssError("button 需要 click 或 long，收到 %r" % value)
+        payload["value"] = text
+    elif action in ("rtsp", "stream"):
+        text = str(value).strip().lower() if value is not None else "toggle"
+        if text in ("", "toggle"):
+            payload["value"] = "toggle"
+        elif text in ("on", "start", "1", "true"):
+            payload["value"] = "on"
+        elif text in ("off", "stop", "0", "false"):
+            payload["value"] = "off"
+        else:
+            raise GlxssError("rtsp 需要 on/off/toggle，收到 %r" % value)
     elif action == "rec":
         if value is None:
             raise GlxssError("rec 需要 on/off")

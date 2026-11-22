@@ -25,6 +25,10 @@ HID_REPORT_LEN = 28
 HID_PRODUCT_LEN = 24
 SENSOR_POLL_INTERVAL = 0.3
 KEY_CODE_FN = 0x71
+# 长按判定：至少 4 个连续“按下”报告（300 ms 轮询时≈0.9 s）+ 0.9 s 时间阈值。
+# 100 ms 轮询时第 10 个包才到 0.9 s，所以两个条件必须同时满足，不能只看包数。
+FN_LONG_PRESS_SECONDS = 0.9
+FN_LONG_PRESS_PACKETS = 4
 
 
 @dataclass
@@ -69,6 +73,92 @@ class HidReport:
                 self.af_result, self.caf_flag, self.temperature,
             )
         )
+
+
+@dataclass
+class FnEvent:
+    """Fn 按键事件（由 `FnWatcher.feed()` 产生）。"""
+
+    kind: str                  # press / release / click / long
+    at: float                  # time.monotonic() 时间戳
+    duration: float = 0.0      # 按下到当前/松开的时间
+    packets: int = 0           # 连续“按下”报告数
+
+    def format(self) -> str:
+        if self.kind == "click":
+            return "单击（%.2f s，%d 包）" % (self.duration, self.packets)
+        if self.kind == "long":
+            return "长按（%.2f s，%d 包）" % (self.duration, self.packets)
+        if self.kind == "release":
+            return "松开（%.2f s）" % (self.duration,)
+        return "按下"
+
+
+class FnWatcher:
+    """把 28 B HID 报告流解析成 Fn 单击/长按事件（纯逻辑，便于离线单测）。
+
+    设备在按住 Fn 时每个轮询包都是 ``keyStatus=1, keyCode=0x71``；松开后是
+    ``keyStatus=0``。长按必须同时满足：
+
+      * 连续按下包数 ≥ ``long_packets``（默认 4）；
+      * 按住时长 ≥ ``long_seconds``（默认 0.9 s）。
+
+    300 ms 轮询时第 4 个包正好 ≈0.9 s；100 ms 轮询时第 4 个包只有 0.3 s，
+    所以还要等时间阈值，否则“快速点一下”会被误判成长按。
+    """
+
+    def __init__(self, long_seconds: float = FN_LONG_PRESS_SECONDS,
+                 long_packets: int = FN_LONG_PRESS_PACKETS):
+        self.long_seconds = max(0.2, float(long_seconds))
+        self.long_packets = max(2, int(long_packets))
+        self._down = False
+        self._down_at = 0.0
+        self._packets = 0
+        self._long_fired = False
+
+    @property
+    def down(self) -> bool:
+        return self._down
+
+    def reset(self) -> None:
+        self._down = False
+        self._down_at = 0.0
+        self._packets = 0
+        self._long_fired = False
+
+    def feed(self, report: HidReport, now: Optional[float] = None) -> List[FnEvent]:
+        """喂一个报告，返回本次产生的事件（0..2 个）。"""
+        at = time.monotonic() if now is None else float(now)
+        down = bool(report.is_fn_key and report.pressed)
+        events: List[FnEvent] = []
+        if down:
+            if not self._down:
+                self._down = True
+                self._down_at = at
+                self._packets = 1
+                self._long_fired = False
+                events.append(FnEvent("press", at, 0.0, 1))
+            else:
+                self._packets += 1
+                elapsed = at - self._down_at
+                if (not self._long_fired
+                        and self._packets >= self.long_packets
+                        and elapsed >= self.long_seconds):
+                    self._long_fired = True
+                    events.append(FnEvent("long", at, elapsed, self._packets))
+            return events
+        if not self._down:
+            return events
+        duration = at - self._down_at
+        packets = self._packets
+        self._down = False
+        self._down_at = 0.0
+        self._packets = 0
+        events.append(FnEvent("release", at, duration, packets))
+        if not self._long_fired:
+            events.append(FnEvent("click", at, duration, packets))
+        self._long_fired = False
+        return events
 
 
 @dataclass

@@ -75,7 +75,12 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -e ".[dev]"     # pyusb + numpy + mss + Pillow
+python -m pip install libusb1         # 可选：720p30 异步多 URB（模块名 usb1）
 ```
+
+> 不用 venv、直接用系统 Python 时：`sudo apt install -y python3-usb1`。
+> `usb1` 缺失或 claim 失败会自动回退同步 16 KiB 读（720p 18–19 fps），
+> 不影响推流；`--async-urb 0` 可强制同步。
 
 没有桌面、只投 HUD/测试图案时，最少只需要 `pyusb` + `numpy` + `Pillow`：
 
@@ -382,10 +387,11 @@ Pi Zero 2 W 实测（合成 YV12 640×480，CPU 1 GHz，performance governor；
 
 | 项 | 实测（720p，默认） |
 |---|---|
-| `pi/stream.py --check --fps 30` | **1280×720，18.6–19.0 fps / 25.7–26.2 MB/s**（预热 2 帧后） |
-| 稳态读帧 | **19.0 fps**，0 丢弃字节；`/tmp/full720_steady.png` 1280×720 |
-| RTSP `--fps 25` | 采集 16.9–17.2 fps、编码同采集、0 重启；ffprobe `h264 1280x720 25/1`；CPU python+ffmpeg **~61–64%** |
-| RTSP + 投屏（`--fps 25 --mirror-fps 10`） | 采集 13.0–13.2 fps、编码 13.2、眼镜 **10.0 fps / 46–56 ms**；CPU **~79%**，45°C 无降频 |
+| `pi/stream.py --check --fps 30`（异步 16 URB） | **1280×720，30.7 fps / 42.38 MB/s**（预热 2 帧后） |
+| 同步回退 `--async-urb 0` | 18.6–19.0 fps / 25.7–26.2 MB/s |
+| 稳态读帧（异步） | **29.7–30.7 fps**，0–5 帧丢弃/45 s；`/tmp/full720_steady.png` 1280×720 |
+| RTSP `--fps 30 --async-urb 16` | 采集 30.0 fps、编码 30.0 fps、0 重启；ffprobe `h264 1280x720 30/1`；CPU python ~128% + ffmpeg ~31% |
+| RTSP + 投屏（`--fps 30 --async-urb 16 --mirror-fps 10`） | 采集 17.5–18.4 fps、编码同采集、眼镜 **10.0 fps**（渲染 22–28 ms + 发送 **29–39 ms**）；CPU python ~108% + ffmpeg ~23% |
 
 640×480 回退档（历史，2026-11-22 早些时候）：
 
@@ -401,33 +407,44 @@ Pi Zero 2 W 实测（合成 YV12 640×480，CPU 1 GHz，performance governor；
 `pi/stream.py --mirror-fps N` 不再是「再读一次 UVC、再解一次码」，而是：
 
 ```text
-UVC 读线程（16 KiB 分块组帧，720p 实测 ~17–19 fps）
+UVC 读线程（异步 16 URB / 16 KiB 分块组帧；单路 29.7–30.7 fps）
   → LatestFrame.publish()                  # 一个槽，旧的直接丢，不排队
        ├─ EncoderSink 线程 → ffmpeg stdin（YV12→yuv420p 只换写入顺序，零拷贝）
        └─ LcdSink 线程   → 4×4 抽样 288×180/320×180 → YUV→RGB(C) → 640×400
-                          → OSD → bulk OUT
+                          → OSD → 暂停 UVC → 1 MB bulk OUT → 恢复 UVC
 ```
 
 * 读线程只「读 + 发布」，**任何消费者慢都不会拖慢采集**；
-* LCD 线程按 `--mirror-fps` 睡到截止时间再取当时最新帧（10 fps 时丢掉 3 帧里的
-  2 帧），叠加三分线 + 水平仪（`--no-mirror-level` 可关水平仪）；
-* 眼镜这一路的额外成本：~13 ms 渲染 + 1 MB bulk OUT（4 ms CPU），10 fps 合计
-  约 0.13 个 A53 核。
+* 异步 reader（`uvc_async.AsyncBulkReader`）用独立 libusb handle claim VS，
+  保持 16 个 16 KiB URB 在途；`usb1` 缺失/claim 失败自动回退同步读；
+* LCD 线程按 `--mirror-fps` 睡到截止时间再取当时最新帧，叠加三分线 + 水平仪；
+* Fn 按键在独立 HID 线程轮询（100 ms）：**单击**切 HUD ↔ 相机预览，**长按 ≥0.9 s**
+  停/恢复 RTSP；动作再交给独立 worker，**UVC 读线程只取事件、不执行启停**；
+  `glxss ctl display/rtsp/status` 同效，事件写日志；
+* 眼镜这一路的额外成本：渲染 22–28 ms 墙钟 + 1 MB bulk OUT 29–39 ms（发送期间
+  UVC 暂停，10 fps 时总暂停约 0.3 s/s）。
 
-Pi Zero 2 W 真机（同一台设备，20 s 以上稳态）。640×480 是 2026-11-22 早些时候的
-历史数据；720p 是切到全画幅后的当前数据：
+Pi Zero 2 W 真机（同一台设备，20 s 以上稳态）：
 
-| 指标 | 640×480 优化前 | 640×480 优化后 | **1280×720 默认** |
+| 指标 | 720p 同步（旧） | **720p30 异步，单路** | **720p30 异步 + 眼镜 10 fps** |
 |---|---|---|---|
-| 采集 / 编码 / 眼镜 fps | 4.6 / 4.6 / 4.6 | **30.0 / 25.0 / 10.0** | **13.0 / 13.2 / 10.0** |
-| CPU（python + ffmpeg） | 87.8% | **65–69%** | **~79%** |
+| 采集 / 编码 / 眼镜 fps | 13.0 / 13.2 / 10.0（同步双路） | **29.7–30.7 / 30.0 / —** | **17.5–18.4 / 17.5–18.4 / 10.0** |
+| 1 MB 发送窗口 | 40–56 ms | — | **32–39 ms**（暂停 UVC；无暂停 37–43 ms） |
+| CPU（python + ffmpeg） | ~79% | ~128% + ~31% | ~108% + ~23% |
 
-> 720p 的采集上限是 USB 同步读（~26 MB/s），不是 CPU；眼镜侧仍是 10 fps /
-> 46–56 ms（渲染 ~10 ms + 1 MB bulk OUT ~40 ms）。
+> 720p30 的瓶颈已从 USB（单 URB）转为 **CPython GIL**：双路 10 fps 时 4 个
+> A53 核没跑满，但读线程/异步拷贝/编码/LCD 四个线程抢 GIL，所以采集 17–18
+> 而不是 30。单路 30 fps 已达成；双路想要更顺的相机画面用 `--mirror-fps 5`
+> （采集 23.7 fps）。
 
-> 为什么不用 `-vf shuffleplanes`（它会插入 yuva420p 转换，不是零成本）、
-> 为什么半分辨率 + PIL `NEAREST` 而不是 `BILINEAR`、怎么把渲染压到 ~13 ms，
-> 见 [`pi/STREAM.md` §8.5](pi/STREAM.md#85-一次采集多消费者分发2026-11-22-优化)。
+> 撕裂：主机侧已确认整帧一次 bulk OUT、`UsbGate` 不让控制请求插帧、LcdSink
+> 发送完才取下一帧；剩余是设备端把 payload 直接当帧缓冲、无 vsync 的固有限制。
+> 发送时暂停 UVC 把窗口从 40–56 ms 压到 32–39 ms（无暂停 37–43 ms），
+> 已接近原厂 App 的 ~30 ms。
+> 详见 [`docs/ch-uvc.md` §7.6](../docs/ch-uvc.md#76-眼镜预览撕裂排查与修法2026-11-22-晚)。
+
+> 为什么不用 `-vf shuffleplanes`、为什么半分辨率 + PIL `NEAREST`、怎么把渲染
+> 压到 ~10 ms CPU，见 [`pi/STREAM.md` §8.5](pi/STREAM.md#85-一次采集多消费者分发2026-11-22-优化)。
 
 ---
 

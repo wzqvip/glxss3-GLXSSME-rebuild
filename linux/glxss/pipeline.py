@@ -437,38 +437,56 @@ class LcdRenderer:
 # 水平仪数据源
 # ---------------------------------------------------------------------------
 class LevelPoller:
-    """HID 加速度计 → ``(pitch, roll)``；拿不到就返回 None（只画准星）。
+    """HID 轮询：加速度计 → ``(pitch, roll)``，同时解析 Fn 单击/长按。
 
     只发一条 ``0xA1/0x12 = 1`` 使能加速度，之后每 ``interval`` 秒读一次 28 B
     报告。控制请求和 LCD 帧走同一个 ``UsbGate``，不会插进 1 MB 帧中间。
+
+    为什么放在后台线程而不是 UVC 读主循环里：UVC 读线程一旦为了等 ``UsbGate``
+    （LCD 正在发 1 MB 帧）而停顿，就会丢 USB 数据；HID 轮询必须能独立等待闸门。
+    主循环只调用 ``drain_events()`` 取按键事件，永不阻塞。
+
+    ``watcher`` 可注入（默认 ``hid.FnWatcher()``）；``enable_accel=False`` 时只
+    读按键、不发使能请求。
     """
 
-    def __init__(self, dev, *, interval: float = 0.15, timeout: int = 1500,
-                 gate=None, verbose: bool = False):
+    def __init__(self, dev, *, interval: float = 0.1, timeout: int = 1500,
+                 gate=None, verbose: bool = False, watcher=None,
+                 enable_accel: bool = True):
         self.dev = dev
         self.interval = max(0.05, float(interval))
         self.timeout = max(100, int(timeout))
         self.gate = gate
         self.verbose = verbose
+        self.watcher = watcher if watcher is not None else hid.FnWatcher()
+        self.enable_accel = enable_accel
         self.error = ""
         self._angles: Optional[Tuple[float, float]] = None
+        self._events: list = []
+        self._event_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> bool:
-        try:
-            ctx = self.gate if self.gate is not None else nullcontext()
-            with ctx:
-                hid.set_sensor(self.dev, 0x12, True, self.timeout)
-        except GlxssError as exc:
-            self.error = str(exc).splitlines()[0] if str(exc) else "加速度计不可用"
-            if self.verbose:
-                print("[stream] 水平仪不可用（只画准星）：%s" % self.error)
-            return False
+        self._stop.clear()
+        if self.enable_accel:
+            try:
+                ctx = self.gate if self.gate is not None else nullcontext()
+                with ctx:
+                    hid.set_sensor(self.dev, 0x12, True, self.timeout)
+            except GlxssError as exc:
+                # 使能失败不影响读按键：设备可能只是拒绝这条请求。
+                self.error = str(exc).splitlines()[0] if str(exc) else "加速度计不可用"
+                if self.verbose:
+                    print("[stream] 水平仪不可用（仍读 Fn 键）：%s" % self.error)
         self._thread = threading.Thread(
-            target=self._loop, name="lcd-level", daemon=True)
+            target=self._loop, name="hid-poll", daemon=True)
         self._thread.start()
         return True
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
     def _loop(self) -> None:
         failures = 0
@@ -477,17 +495,42 @@ class LevelPoller:
                 ctx = self.gate if self.gate is not None else nullcontext()
                 with ctx:
                     report = hid.read_report(self.dev, self.timeout)
-                if any(report.acc):
-                    self._angles = pitch_roll_from_acc(*report.acc)
+                acc = (report.acc_x, report.acc_y, report.acc_z)
+                if any(acc):
+                    self._angles = pitch_roll_from_acc(*acc)
+                if self.watcher is not None:
+                    events = self.watcher.feed(report)
+                    if events:
+                        with self._event_lock:
+                            self._events.extend(events)
                 failures = 0
+                self.error = ""
             except GlxssError as exc:
                 failures += 1
                 self.error = str(exc).splitlines()[0] if str(exc) else "HID 读取失败"
+                if self.verbose and failures <= 3:
+                    print("[stream] HID 读取失败 #%d：%s" % (failures, self.error))
                 if failures >= 3:
+                    if self.verbose:
+                        print("[stream] HID 轮询停止：%s" % self.error)
                     return
-            except Exception:
+            except Exception as exc:
+                if self.verbose:
+                    print("[stream] HID 轮询异常：%r" % (exc,))
                 return
             self._stop.wait(self.interval)
+
+    def drain_events(self) -> list:
+        """取走目前已产生的按键事件（非阻塞）。"""
+        with self._event_lock:
+            events = self._events
+            self._events = []
+        return events
+
+    def inject_event(self, event) -> None:
+        """调试/自动化用：把事件直接塞进队列，不经过硬件。"""
+        with self._event_lock:
+            self._events.append(event)
 
     def __call__(self):
         return self._angles
@@ -529,7 +572,9 @@ class LcdSink:
     """LCD 线程：从最新帧槽取帧 → 渲染 → bulk OUT（按 fps 限速，丢旧帧）。"""
 
     def __init__(self, dev, ep_addr: int, config, hub: LatestFrame, *,
-                 link=None, level=None, level_poller=None, gate=None):
+                 link=None, level=None, level_poller=None, gate=None,
+                 session=None, intf=None, pause_reader=None,
+                 resume_reader=None, owns_level_poller=None):
         self.dev = dev
         self.hub = hub
         self.gate = gate
@@ -541,8 +586,19 @@ class LcdSink:
                                     level=level,
                                     rotate=getattr(config, "mirror_rotate", 0))
         self._level_poller = level_poller
+        self.session = session
+        self.intf = intf
+        self.pause_reader = pause_reader
+        self.resume_reader = resume_reader
+        self._owns_level_poller = (level_poller is None
+                                   if owns_level_poller is None
+                                   else bool(owns_level_poller))
         self.stats = LcdStats()
         self._lock = threading.Lock()
+        # 1 MB bulk OUT 必须串行：同一时刻只允许一个线程在写帧，否则设备端
+        # 会看到两帧交错（撕裂/花屏）。LcdSink 自己只有一个发送线程，这把锁
+        # 是给“外部也调 send”时的保险。
+        self._send_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._count_at = time.monotonic()
@@ -567,9 +623,18 @@ class LcdSink:
             thread.join(timeout=2.0)
         self._thread = None
         poller = self._level_poller
-        if poller is not None:
+        if poller is not None and self._owns_level_poller:
             poller.stop()
             self._level_poller = None
+
+    def release(self) -> None:
+        """停线程 + 释放 LCD 接口，让 HUD 主进程可以接管眼镜屏。"""
+        self.stop()
+        session, intf = self.session, self.intf
+        self.session = None
+        self.intf = None
+        if session is not None and intf is not None:
+            session.release_interface(intf)
 
     @property
     def alive(self) -> bool:
@@ -611,12 +676,26 @@ class LcdSink:
                         str(exc).splitlines()[0] if str(exc) else exc)
                 continue
             rendered = time.monotonic()
+            paused = False
             try:
+                # 整帧 1 MB 发送前先让 UVC 异步读暂停（在途 URB 排空），发完再恢复：
+                # 否则 1 MB OUT 和 30 fps 的 bulk IN 抢总线，单帧要 45–150 ms，
+                # 面板刷新期间跨更多帧 → 撕裂更明显。实测暂停后 1 MB 帧只要 ~25 ms。
+                if callable(self.pause_reader):
+                    try:
+                        self.pause_reader()
+                        paused = True
+                    except Exception:
+                        paused = False
                 # LCD 的 1 MB bulk OUT 和 HID/亮度等控制请求走同一个闸门：
                 # 控制请求插进一帧中间最容易触发固件异常（见 usb.UsbGate）。
                 ctx = self.gate if self.gate is not None else nullcontext()
-                with ctx:
-                    self.link.send_packet(packet)
+                with self._send_lock:
+                    with ctx:
+                        written = self.link.send_packet(packet)
+                if written != lcd.FRAME_TOTAL:
+                    raise GlxssError("LCD 帧短写：%d/%d B（可能被控制请求打断）"
+                                     % (written, lcd.FRAME_TOTAL))
             except Exception as exc:
                 message = "发送失败: %s" % (
                     str(exc).splitlines()[0] if str(exc) else exc)
@@ -629,6 +708,12 @@ class LcdSink:
                     print("[stream] 眼镜投屏连续失败，LCD 线程退出：%s" % message)
                     return
                 continue
+            finally:
+                if paused and callable(self.resume_reader):
+                    try:
+                        self.resume_reader()
+                    except Exception:
+                        pass
             sent = time.monotonic()
             with self._lock:
                 self.stats.frames += 1
@@ -651,17 +736,28 @@ class LcdSink:
 # 便捷构造
 # ---------------------------------------------------------------------------
 def open_lcd_sink(dev, session, config, hub: LatestFrame, *, gate=None,
-                  claim: bool = True) -> LcdSink:
-    """claim LCD 接口（必要时）+ 建 LcdSink；水平仪按需启动。"""
+                  claim: bool = True, level_poller=None,
+                  pause_reader=None, resume_reader=None) -> LcdSink:
+    """claim LCD 接口（必要时）+ 建 LcdSink；水平仪按需启动。
+
+    ``level_poller`` 传入时由调用方（stream.Streamer）持有生命周期，LcdSink
+    停止时不会把它一起停掉——Fn 按键在眼镜预览关闭时仍要持续轮询。
+    ``pause_reader/resume_reader`` 用于在整帧 1 MB 发送前后暂停/恢复 UVC 异步读。
+    """
     intf, ep = usb.pick_bulk_out(dev)
-    if claim:
-        session.claim_interface(intf, label="LCD(眼镜预览)")
-    poller = None
-    if getattr(config, "mirror_level", True):
-        poller = LevelPoller(dev, interval=0.15,
+    if claim and not session.claim_interface(intf, label="LCD(眼镜预览)"):
+        raise GlxssError("LCD 接口 claim 失败（可能被 HUD/其它进程占用）")
+    poller = level_poller
+    owns = False
+    if poller is None and getattr(config, "mirror_level", True):
+        poller = LevelPoller(dev, interval=0.1,
                              timeout=min(1500, max(200, config.timeout_ms)),
-                             gate=gate, verbose=config.verbose)
-        if not poller.start():
-            poller = None
+                             gate=gate, verbose=config.verbose,
+                             enable_accel=True)
+        poller.start()
+        owns = True
     return LcdSink(dev, ep.bEndpointAddress, config, hub,
-                   level=poller, level_poller=poller, gate=gate)
+                   level=poller, level_poller=poller, gate=gate,
+                   session=session, intf=intf,
+                   pause_reader=pause_reader, resume_reader=resume_reader,
+                   owns_level_poller=owns)

@@ -16,19 +16,21 @@
 | 推荐拓扑 | **A**：mediamtx 跑在 Pi 上（`rtsp://<pi>:8554/glxss`），OBS 直接拉 |
 | 备选 | Pi 上 mediamtx 换成 PC 上（Pi 直推到 PC，省 Pi 内存） |
 | 兜底 | **MJPEG HTTP**：`http://<pi>:8080/stream`，不需要 mediamtx/ffmpeg |
-| 眼镜预览 | `--mirror-fps N`：**同一帧共享**给编码线程和 LCD 线程，不额外读 UVC |
+| 眼镜预览 | `--mirror-fps N`：**同一帧共享**给编码线程和 LCD 线程；**Fn 单击**可随时在 HUD ↔ preview 间切换 |
+| Fn 按键 | 单击 = 显示 HUD/相机预览切换；长按 ≥0.9 s = 停止/恢复 RTSP；见 §8.6 |
 | 延迟（估） | 0.3–0.6 s（局域网、OBS 网络缓冲 1–2 MB） |
-| Pi 负载（实测） | 720p 只推流 **~0.61–0.64 核**；再同时投眼镜 10 fps **~0.79 核**（见 §8.5 / §7.2） |
-| 带宽 | USB 侧 720p ~17–26 MB/s（YUV 原始帧）；局域网 H.264 ~0.9–3 Mbps |
+| Pi 负载（实测） | 720p30 只推流 **python ~1.28 核 + ffmpeg ~0.31 核**；再加 10 fps 眼镜预览 **python ~1.08 核 + ffmpeg ~0.23 核**（GIL 是双路瓶颈，见 §7.2） |
+| 带宽 | USB 侧 720p30 **~40–42 MB/s**（YUV 原始帧）；局域网 H.264 ~0.9–3 Mbps |
 | 分辨率 | **1280×720 全画幅**（`bFrameIndex=3`）；640×480 用 `--size 640x480` |
 
 最短路径（Pi 上）：
 
 ```bash
-sudo apt install -y ffmpeg
-python3 pi/stream.py --check                    # 先确认 UVC 能读（默认 1280×720）
-python3 pi/stream.py                            # 推 rtsp://127.0.0.1:8554/glxss
+sudo apt install -y ffmpeg python3-usb1
+python3 pi/stream.py --check                    # 先确认 UVC 能读（异步 16 URB，实测 30.7 fps）
+python3 pi/stream.py --fps 30 --bitrate 2M      # 推 rtsp://127.0.0.1:8554/glxss
 # PC OBS：来源 → 媒体源 → 取消“本地文件” → 输入 rtsp://<pi-ip>:8554/glxss
+# 眼镜预览：Fn 单击（或 python3 -m glxss ctl display preview）
 ```
 
 ---
@@ -113,10 +115,10 @@ OBS: 媒体源 rtsp://127.0.0.1:8554/glxss
 
 | 阶段 | 实测/估算 | 说明 |
 |---|---|---|
-| UVC 采集 | 50–60 ms | 1280×720 YV12 @17–19fps（16 KiB 分块组帧；480p 历史 30–40 ms） |
+| UVC 采集 | **33 ms**（30fps） | 1280×720 YV12 异步 16 URB；同步回退 50–60 ms（17–19fps） |
 | YV12→yuv420p | 0 拷贝 | 只换 U/V 的**写入顺序**，分三次写 ffmpeg stdin（见 §8.5） |
-| H.264 硬编 | 20–40 ms | `h264_v4l2m2m`，`-g 40 -bf 0` |
-| 眼镜预览（旁路） | ~10 ms 渲染 + 40–46 ms USB | 独立线程，10 fps，不阻塞推流 |
+| H.264 硬编 | 20–40 ms | `h264_v4l2m2m`，`-g 60 -bf 0` |
+| 眼镜预览（旁路） | 渲染 22–28 ms + 发送 29–39 ms | 独立线程，10 fps；发送时暂停 UVC，不阻塞推流 |
 | mediamtx 转发 | <10 ms | 本机回环 + 局域网 |
 | OBS 解复用/解码/缓冲 | 100–400 ms | 「网络缓冲」1–2 MB；调小更低但更怕抖动 |
 | **合计（估）** | **0.3–0.6 s** | 没有做端到端打点，属估算 |
@@ -125,8 +127,9 @@ OBS: 媒体源 rtsp://127.0.0.1:8554/glxss
 
 1. OBS 媒体源「网络缓冲」调到 **1 MB**（默认 2 MB），有线局域网可试 0.5 MB；
 2. 保持 `--transport tcp`（UDP 在 Wi-Fi 上丢包会触发重传/花屏，反而更慢）；
-3. `--fps 15` 而不是 25/30：720p 实测 17–19fps，Pi Zero 2 W 的 USB 同步读
-   已经到上限；按实测值编码，OBS 不会因为时间戳补帧而增加缓冲；
+3. `--fps` 按实测值填：异步 16 URB 下 720p 实测 30 fps，用 `--fps 30`；
+   同步回退只有 17–19 fps，用 `--fps 15`。按实测值编码，OBS 不会因为时间戳
+   补帧而增加缓冲；
 4. 不要用 OBS「VLC 视频源」拉 RTSP（libVLC 默认缓存更大），用「媒体源」。
 
 ---
@@ -137,8 +140,12 @@ OBS: 媒体源 rtsp://127.0.0.1:8554/glxss
 
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg python3-numpy python3-pil
+sudo apt install -y ffmpeg python3-numpy python3-pil python3-usb1
 ```
+
+> `python3-usb1` 提供 `usb1`（python-libusb1），是 720p30 异步多 URB 需要的；
+> 不装也能跑，会自动回退同步 16 KiB 读（720p ~18–19 fps）。
+> 卸载/禁用异步：`--async-urb 0`。
 
 验证硬件编码器：
 
@@ -187,6 +194,17 @@ journalctl -u glxss-stream.service -f
 ```
 
 `glxss-stream.service` 每 5 s 重启、设备没插时会自动重试（`StartLimitIntervalSec=0`）。
+服务里 `GLXSS_SOCK=/run/glxss/glxssctl.sock`，从 SSH 控制时：
+
+```bash
+GLXSS_SOCK=/run/glxss/glxssctl.sock python3 -m glxss ctl status
+GLXSS_SOCK=/run/glxss/glxssctl.sock python3 -m glxss ctl display hud
+GLXSS_SOCK=/run/glxss/glxssctl.sock python3 -m glxss ctl rtsp off
+```
+
+> `glxss ctl` 也支持 `--socket /run/glxss/glxssctl.sock`，两者等价。
+> 如果同时跑 `glxss hud --listen`，两个进程都用这个 socket 会冲突；HUD 用
+> 默认路径或 `--socket` 换一个。
 
 ---
 
@@ -204,7 +222,8 @@ python3 pi/stream.py --check
 
 > commit 后设备会重启数据面，第 2 帧实测约 **466 ms**；预热正是为了不让这一下把
 > 10 帧均值拖到 ~13 fps。预热后 Pi 实测：640×480 **29.9 fps / 13.80 MB/s**；
-> **1280×720（默认）18.6–19.0 fps / 25.7–26.2 MB/s**（2026-11-22）。
+> **1280×720（默认）同步读 18.6–19.0 fps / 25.7–26.2 MB/s；异步 16 URB
+> 30.7 fps / 42.4 MB/s**（2026-11-22 晚，见 §8.6）。
 
 无眼镜时可先验证整条编码链路：
 
@@ -216,11 +235,14 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/test
 ### 4.2 常用命令
 
 ```bash
-# 默认：1280x720@15，3 Mbps，推本机 mediamtx
+# 默认：1280x720@15，1500k，推本机 mediamtx（异步 16 URB，采集可到 30）
 python3 pi/stream.py
 
-# 更顺/更清晰（Pi 会热一点；720p 采集上限 ~17–19fps）
-python3 pi/stream.py --fps 25 --bitrate 3M
+# 720p30：采集/编码都跑到 30 fps（Pi 会热一点）
+python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16
+
+# 强制同步读（对照/没有 python3-usb1 时）
+python3 pi/stream.py --async-urb 0
 
 # 只开 MJPEG（不启动 ffmpeg）
 python3 pi/stream.py --no-rtsp --mjpeg-port 8080
@@ -229,11 +251,17 @@ python3 pi/stream.py --no-rtsp --mjpeg-port 8080
 python3 pi/stream.py --mjpeg-port 8080
 
 # 同时把画面投到眼镜（会占用 LCD 接口，和 HUD 冲突）
-# 同一帧共享给编码线程 + LCD 线程，不额外读 UVC；10 fps 时总 CPU 约 0.79 核
-python3 pi/stream.py --fps 25 --mirror-fps 10
-python3 pi/stream.py --mirror-fps 3              # 只想对准时 3 fps 就够
+# 同一帧共享给编码线程 + LCD 线程；LCD 发送时暂停 UVC，单帧 29–39 ms
+python3 pi/stream.py --fps 30 --async-urb 16 --mirror-fps 10
+python3 pi/stream.py --mirror-fps 5              # 5 fps 预览换 23.7 fps 采集
 python3 pi/stream.py --mirror-fps 10 --mirror-fit cover --no-mirror-level
 python3 pi/stream.py --mirror-fps 10 --mirror-rotate 180   # 画面上下颠倒时
+
+# Fn 按键 / 状态：默认启动控制 socket；单击切 HUD↔preview，长按切 RTSP
+python3 -m glxss ctl status
+python3 -m glxss ctl display preview     # 也可 hud/toggle
+python3 -m glxss ctl rtsp off            # 也可 on/toggle
+python3 -m glxss ctl button click        # 无硬件时注入 click/long（调试）
 
 # 旧的 640×480 裁切视角（回退/对比用）
 python3 pi/stream.py --size 640x480 --bitrate 1500k
@@ -248,7 +276,14 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 |---|---|---|
 | `--rtsp` | `rtsp://127.0.0.1:8554/glxss` | 推流地址；`--no-rtsp` 关闭 |
 | `--size` | `1280x720` | 720p 是**全画幅**（frame 3）；`640x480` 是旧的裁切档（frame 4） |
-| `--fps` | `15` | 720p 实测 ~17–19 fps（USB 同步读上限）；15 与实测匹配，30 也能协商但发送会被节流 |
+| `--fps` | `15` | 编码帧率，同时作为 UVC interval；异步 16 URB 下单路实测 30 fps，双路 10fps 预览约 17.5–18.4 fps |
+| `--async-urb` | `16` | libusb1 异步 URB 数；0=同步 16 KiB 读；实测 2 个就够纯读 40 MB/s，16 个在 HID/ffmpeg 并发下更稳 |
+| `--async-timeout` | `1000` | 单个异步 URB 超时毫秒 |
+| `--hid-poll` | `0.1` | HID/Fn 轮询间隔（设备报告周期 300 ms） |
+| `--no-fn` | 关 | 禁用 Fn 按键（仍可用 `ctl display/rtsp`） |
+| `--fn-long-press` / `--fn-long-packets` | `0.9` / `4` | 长按阈值：时间 + 连续按下包数同时满足（100 ms 轮询时约第 10 包） |
+| `--ctl-socket` / `--no-ctl` | 自动 | 控制 socket 路径；`--no-ctl` 关闭（只靠状态行/日志） |
+| `--preview-fps` | 0 | Fn 打开预览时的帧率；0=使用 `--mirror-fps` 或 10 |
 | `--bitrate` | `1500k` | 代码默认 1500k；720p 运动画面建议 2–3M |
 | `--codec` | `h264_v4l2m2m` | 备选 `libx264`（CPU 高，但兼容性最好） |
 | `--transport` | `tcp` | 局域网稳定优先 |
@@ -256,10 +291,11 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 | `--frame-index` | 自动 | 按 VS 描述符选；720p=**3**，480p=4（`glxss uvc --list-modes` 可列） |
 | `--detach` / `--no-detach` | detach | 摘 `uvcvideo`；纯直播用 v4l2 时可关 |
 | `--mjpeg-port` | 0（关） | 同时开 MJPEG HTTP |
-| `--mirror-fps` | 0（关） | 投眼镜的帧率，建议 3–10；**共享帧，不影响采集/编码** |
+| `--mirror-fps` | 0（关） | 启动即投眼镜的帧率；0=不投，Fn 单击打开（默认 10 fps）。共享帧，不额外读 UVC |
 | `--mirror-fit` | `fit` | `cover`（居中裁满、无黑边）/ `fit`（等比、上下黑边）/ `stretch` |
 | `--mirror-rotate` | `0` | `180` = 画面上下颠倒时翻转（叠加层保持正立） |
 | `--mirror-level` | 开 | 读 HID 加速度计画水平仪；`--no-mirror-level` 只画三分线 + 准星 |
+| `--no-lcd-pause` | 关 | LCD 发送时不暂停 UVC（对照用：发送窗口 37–43 ms、采集 19.9–21.9 fps；默认暂停 32–39 ms） |
 | `--api-url` | 自动 | 推本机时用 `http://127.0.0.1:9997` 读实测码率；`--api-url ""` 可关 |
 | `--duration` / `--frames` | 0（不限） | 定时/定量跑，方便测 CPU |
 
@@ -380,15 +416,18 @@ sudo systemctl start glxss-stream.service
 
 | 链路 | 带宽 | 说明 |
 |---|---|---|
-| USB（Pi ← 眼镜，720p 默认） | **17–26 MB/s** | 1280×720 YV12：17 fps ≈ 23.5 MB/s，19 fps ≈ 26.3 MB/s（`--check` 实测） |
+| USB（Pi ← 眼镜，720p30 异步） | **40–42 MB/s** | 1280×720 YV12 ×30 fps = 41.5 MB/s；`--check` 实测 42.4 MB/s |
+| USB（Pi ← 眼镜，720p 同步回退） | **23–29 MB/s** | 同步单 URB 上限，对应 17–21 fps |
 | USB（480p 回退） | **13.8 MB/s** | 640×480 YV12 ×30fps（历史） |
-| Pi 内 ffmpeg stdin | 14–23 MB/s | 按 `--fps` 节流；720p `--fps 15` 时 ~20.7 MB/s |
+| Pi 内 ffmpeg stdin | 14–41 MB/s | 按 `--fps` 节流；720p `--fps 30` 时 ~41.5 MB/s |
 | Pi → PC（RTSP H.264） | **0.8–3 Mbps ≈ 0.1–0.4 MB/s** | 目标码率 3M；静态场景实测 ~0.65–0.9 Mbps |
 | MJPEG（备选） | 1–4 Mbps | 720p 的 PIL 编码更慢，只作调试 |
 | 每多一个 OBS/观众 | +1–3 Mbps | mediamtx 按需转发，不重新编码 |
 
-> 720p 的瓶颈是 **USB 同步 bulk 读**（单 URB 16 KiB，实测上限 ~26 MB/s），
-> 不是 H.264 硬编；想跑满 720p30（41.5 MB/s）需要多 URB 异步/内核 uvcvideo。
+> 720p30 需要 41.5 MB/s。2026-11-22 晚的异步多 URB 实测单路 **29.7–30.7 fps /
+> 40.6–42.4 MB/s**，说明 Pi 的 dwc_otg 和眼镜都能跑满；同步读的 ~26–29 MB/s
+> 只是单 URB 往返开销。1080p 异步实测 43.64 MB/s / 14 fps，可作为管道上限的
+> 交叉验证。详见 [`docs/ch-uvc.md` §7.5](../../docs/ch-uvc.md#75-720p30异步多-urb2026-11-22-晚)。
 
 ### 7.2 Pi Zero 2 W（4×Cortex-A53 1 GHz，416 MB RAM）实测
 
@@ -399,11 +438,20 @@ CPU 为 `/proc/<pid>/stat` 的 utime+stime 增量，单位 = 1 个 A53 核）。
 
 | 场景（`pi/stream.py`） | 采集 | 编码 | 眼镜 | python | ffmpeg | 合计 |
 |---|---|---|---|---|---|---|
-| `--fps 25`（只推流） | 16.9–17.2 fps | 16.9–17.2 fps | — | ~53–55% | ~6–9% | **~61–64%** |
-| `--fps 25 --mirror-fps 10 --mirror-rotate 180` | 13.0–13.2 fps | 13.2 fps | **10.0 fps** | ~73% | ~6% | **~79%** |
+| `--fps 30 --async-urb 16`（只推流） | **29.7–30.7 fps** | 30.0 fps | — | ~128% | ~31% | ~1.59 核 |
+| `--fps 30 --async-urb 16 --mirror-fps 10`（暂停） | **17.5–18.4 fps** | 17.5–18.4 fps | **10.0 fps** | ~108% | ~23% | ~1.31 核 |
+| `--fps 30 --async-urb 16 --mirror-fps 10 --no-lcd-pause` | **19.9–21.9 fps** | 同采集 | 10.0 fps | — | — | — |
+| `--fps 30 --async-urb 16 --mirror-fps 5` | **23.7 fps** | 23.7 fps | 5.0 fps | — | — | — |
+| `--fps 30 --async-urb 16 --mirror-fps 15` | 14.1 fps | 14.1 fps | 15.0 fps | — | — | — |
+| `--fps 30 --async-urb 16 --mirror-fps 20` | 12.4 fps | 12.4 fps | 17.1–17.5 fps | — | — | — |
+| 旧：同步 `--fps 25`（只推流） | 16.9–17.2 fps | 16.9–17.2 fps | — | ~53–55% | ~6–9% | ~61–64% |
+| 旧：同步 `--fps 25 --mirror-fps 10` | 13.0–13.2 fps | 13.2 fps | 10.0 fps | ~73% | ~6% | ~79% |
 
-`ffprobe` 同步校验：`codec_name=h264 width=1280 height=720 avg_frame_rate=25/1`；
-`--check`：**1280×720，18.6–19.0 fps / 25.7–26.2 MB/s**。温度 45.1°C、`throttled=0x0`。
+> 双路 10 fps 时 4 个 A53 核没跑满（合计 ~1.3 核），但 **CPython GIL** 让
+> LCD 线程的墙钟被拉长（渲染 22–28 ms、发送 29–39 ms），所以采集是 17.5–18.4
+> 而不是 30。单路 30 fps 时 `--check` 实测 **42.4 MB/s / 30.7 fps**；
+> `ffprobe` 同步校验 `codec_name=h264 width=1280 height=720 avg_frame_rate=30/1`。
+> 温度 45–52°C、`throttled=0x0`。
 
 640×480 回退档（历史，2026-11-22 早些时候，同一套多消费者实现）：
 
@@ -420,13 +468,14 @@ CPU 为 `/proc/<pid>/stat` 的 utime+stime 增量，单位 = 1 个 A53 核）。
 
 | 阶段 | 耗时 | 说明 |
 |---|---|---|
-| YV12 → 4×4 抽样 YCbCr | ~10 ms | 720p cover 裁 1152×720 → 288×180；`Image.frombuffer` + PIL LUT/merge/convert（全在 C） |
+| YV12 → 4×4 抽样 YCbCr | ~10 ms CPU（墙钟 22–28 ms） | 720p cover 裁 1152×720 → 288×180；`Image.frombuffer` + PIL LUT/merge/convert（全在 C）。与 UVC/编码线程抢 GIL 后墙钟变长 |
 | 三分线 / 水平仪 | 0.4 ms | 在 320×200 上画；2× 放大后线宽正好 2 px |
 | 2× 放大 + 写帧包 | 3.8 ms | numpy 四象限 uint32 赋值（见 §8.5） |
-| 1 MB bulk OUT | ~40 ms 墙钟 | 和 UVC bulk IN 并发时墙钟 ~46–56 ms（实测总耗时） |
+| 1 MB bulk OUT | **29–39 ms** | 发送前 `pause_reader()` 暂停 UVC 异步读、等在途 URB 排空；旧同步实现 40–56 ms，异步无暂停 37–43 ms |
 
-> 实测 `--mirror-fps 10` 稳定 10.0 fps / 46–56 ms；720p 比 480p 只多了抽样前的
-> 切片（52 KB 小块），没有整幅 1.38 MB 的 RGBA 分配。
+> 实测 `--mirror-fps 10` 稳定 10.0 fps；暂停总时长约 30 ms/帧（异步 reader 的
+> `pauses`/`pause_ms` 可在 `glxss ctl status` 看）。1 MB 帧始终一次 bulk OUT，
+> 不分块、不与控制请求交错（见 §8.6）。
 
 测试图案（无 UVC，完整编码+RTSP 链路，20 fps / 1.5 Mbps）：
 
@@ -471,10 +520,11 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 | 枚举 | `2e09:0030`，UVC 1.10，VS `if=1 alt=0 ep=0x81` bulk IN |
 | 支持的格式 | `YV12`：1920×1080、1280×960、1280×720（frame 3）、640×480（frame 4）、4128×3104 等 |
 | probe/commit | 可读写 34 B probe；720p 默认 `frame=3 interval=333333 maxFrame=1382400`；480p 回退 `frame=4 interval=333333 maxFrame=460800`；`maxPayload=16384` |
-| 帧读取 | **720p：17–19 fps / 25–26 MB/s**（0 丢弃）；480p 历史：30.0 fps / 13.80 MB/s |
+| 帧读取（同步回退） | 720p：17–19 fps / 25–26 MB/s（0 丢弃）；480p 历史：30.0 fps / 13.80 MB/s |
+| 帧读取（异步 16 URB） | **720p：29.7–30.7 fps / 40.6–42.4 MB/s**（0–5 丢弃/45 s）；`--check` 30.7 fps |
 | 自检耗时 | commit 后第 2 帧约 466 ms（设备重启数据面），预热 2 帧后稳定 |
-| 推流实测 | 720p `--fps 25`：采集 16.9–17.2 fps、发送同采集、0 重启；`ffprobe` → `h264 1280x720 avg_frame_rate=25/1`；480p 历史 `--fps 20` → 30.0/20.0 fps、`h264 640x480 20/1` |
-| 监看实测 | 720p `--mirror-fps 10`：眼镜 10.0 fps / 46–56 ms；480p 历史 `cast --source uvc --fps 10`：10.0 fps / 10.21 MB/s |
+| 推流实测 | 720p30 异步：采集 30.0 fps、编码 30.0 fps、0 重启；`ffprobe` → `h264 1280x720 avg_frame_rate=30/1`；同步 720p `--fps 25` 历史：16.9–17.2 fps |
+| 监看实测 | 720p30 异步 + `--mirror-fps 10`：眼镜 10.0 fps（渲染 22–28 + 发送 29–39 ms），采集 17.5–18.4 fps；480p 历史 `cast --source uvc --fps 10`：10.0 fps / 10.21 MB/s |
 
 > 2026-11-21 复测时曾出现 `bulk IN 0x81` 超时并掉线，那是设备固件媒体流水线卡死
 > （状态 B，需重灌/拔插），不是主机侧问题。2026-11-22 起读路径改为 **16 KiB
@@ -508,7 +558,8 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 **架构**（对齐原厂 `:llvision_G25`：单线程读、共享一帧、各消费者取最新）：
 
 ```text
-读线程（主循环，16 KiB 分块组帧，720p 实测 ~17–19 fps）
+读线程（主循环；异步 16 URB / 16 KiB 分块组帧，720p30 实测 ~30 fps；
+同步回退 ~17–19 fps）
   → 发布：只把 bytes 引用放进「最新帧槽」LatestFrame（旧的直接丢，不排队）
        ├─ 编码线程 EncoderSink：取最新帧 → YV12→yuv420p 零拷贝 → ffmpeg stdin
        │                        （令牌桶按 --fps 节流，跟不上就丢旧帧）
@@ -523,7 +574,7 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 实测（同一台 Pi、同一条命令 `--fps 25 --mirror-fps 10`，各 20–30 s 稳态）。
 640×480 是历史数据；720p 是 2026-11-22 切到全画幅后的当前数据：
 
-| 指标 | 480p 优化前 | 480p 优化后 | **720p 默认** |
+| 指标 | 480p 优化前 | 480p 优化后 | **720p 同步（当时）** |
 |---|---|---|---|
 | 采集 fps | 4.6 | **30.0** | **13.0–13.2** |
 | 编码 fps（ffprobe 25/1） | 4.6 | **25.0** | **13.2** |
@@ -531,9 +582,9 @@ python3 pi/stream.py --test-source --rtsp rtsp://127.0.0.1:8554/glxss --fps 20 -
 | CPU（python + ffmpeg） | 87.8% | **65.7%**（三次 64.4–68.5%） | **~79%** |
 | 眼镜路径单帧 | ~150 ms | **~13 ms**（渲染）+ 24–37 ms（发送） | **~10 ms**（渲染）+ 40 ms（发送） |
 
-> 720p 的采集从 30 fps 掉到 ~17 fps，是 **USB 同步读上限**（~26 MB/s）而不是
-> CPU：单推流 python 只占 ~53–55%、ffmpeg ~6–9%；双路再叠 10 fps 眼镜才到 ~79%。
-> 眼镜路径的 4×4 抽样只解码 288×180，渲染成本没有随 720p 线性增长。
+> 上表是**同步读时代**的历史数据。720p 的采集从 30 掉到 ~17 fps 是单 URB
+> USB 读上限（~26 MB/s），不是 CPU。2026-11-22 晚的异步 16 URB 把单路拉到
+> 29.7–30.7 fps；双路 10 fps 受 GIL 限制为 17.5–18.4 fps，见 §8.6。
 
 **发现 1：`-vf shuffleplanes` 不是零转换。** ffmpeg 5.1 的 `shuffleplanes`
 只接受带 alpha 的 `yuva420p`，会在它前后各自动插入一个 `auto_scale`
@@ -574,6 +625,100 @@ ffmpeg stdin**：YV12 = Y|V|U、yuv420p = Y|U|V，rawvideo 解复用按字节流
 | 运行中 `pkill ffmpeg` | 1 s 内报「编码器退出…重启」，新 pid 起来后编码恢复 25 fps，采集不受影响 |
 | `--check --fps 30` | 30.3 fps / 13.96 MB/s |
 | 只推流 40 s | 采集 30.0 / 编码 25.1 / 0 重启 / CPU 41% |
+
+### 8.6 720p30 异步 URB + Fn 按键 + 撕裂（2026-11-22 晚）
+
+#### 8.6.1 720p30 实测
+
+`tools/uvc_async_exp.py`（Pi Zero 2 W，720p frame 3，16 KiB URB）：
+
+| 读法 | 吞吐 | 720p 帧率 |
+|---|---|---|
+| 同步单读（旧） | 28.9 MB/s | 20.9 fps |
+| 2 线程同步读 | 40.2 MB/s | 29.1 fps |
+| 异步 2/4/8/16 URB | 40.25 MB/s | 29.1 fps |
+| 异步 8 URB + 组帧（跳过前 3 s） | 40.5 MB/s | **30.10 fps（中位 33.3 ms）** |
+
+接入 `pi/stream.py` 后（`--async-urb 16`）：
+
+```text
+[check] 实测 1280x720，30.7 fps，42.38 MB/s
+[stream] 帧=1888 编码=1548 ... 采集=29.7fps 编码=29.7fps YUV=38.00MB/s 显示=hud 异步=16URB 推流=ON 运行=00:01:08
+```
+
+* 单路 30 fps：**29.7–30.7 fps / 40.6–42.4 MB/s**，45–73 s 长时间运行 0–5 帧丢弃；
+* 双路 10 fps 预览：采集 **17.5–18.4 fps**、眼镜 **10.0 fps**（渲染 22–28 ms +
+  发送 29–39 ms）；双路 5 fps 预览：采集 **23.7 fps**；
+* 实现/回退细节、GIL 分析见 [`docs/ch-uvc.md` §7.5](../../docs/ch-uvc.md#75-720p30异步多-urb2026-11-22-晚)。
+
+#### 8.6.2 Fn 按键
+
+`pi/stream.py` 默认启动 HID 轮询（100 ms）和控制 socket：
+
+| 操作 | 行为 | 日志 |
+|---|---|---|
+| 单击 Fn（短按松开） | 显示模式 HUD ↔ camera preview；停止预览时释放 LCD 接口 | `Fn 按键：单击（0.12 s，2 包） → 切换显示模式（当前 hud）` |
+| 长按 Fn（≥0.9 s 且 ≥4 个按下包） | 停止/恢复 RTSP 推流（停 ffmpeg；恢复后下一轮启动） | `Fn 按键：长按（1.20 s，7 包） → 切换 RTSP 推流（当前 ON）` |
+| 状态 | 状态行追加 `显示=... 异步=... 推流=... 按键=...`；`glxss ctl status` 有 `显示/RTSP/UVC 读` | — |
+| 无硬件调试 | `glxss ctl button click` / `button long` 注入同一事件队列 | 同上 |
+
+实测（2026-11-22 晚，注入事件验证端到端）：
+
+```text
+=== click -> preview ===
+OK：button
+  显示模式: 2
+  显示    : camera preview（最近按键 click）
+  RTSP    : ON
+  UVC 读   : 异步 16 URB，在途 0，队列 0，暂停 58 次/352 ms
+  UVC     : 17.2 fps
+=== click -> hud ===
+OK：button
+  显示    : HUD/不占屏（最近按键 click）
+  UVC     : 29.9 fps
+=== long -> rtsp off / on ===
+OK：button
+  RTSP    : OFF / ON
+```
+
+> **真实按键**：设备 HID 报告里 `keyStatus/keyCode` 是唯一来源；本轮在没有人工
+> 按压的情况下，用 `ctl button` 注入和 `FnWatcher` 单测覆盖了同一代码路径。
+> 人工按下时日志会按上表格式出现；若需要硬件验收，请在运行 `pi/stream.py`
+> 时单击一次、长按 ≥1 s，各看一条 `Fn 按键：…`。
+
+#### 8.6.3 撕裂
+
+主机侧三项检查全部通过：LCD 整帧 1,024,016 B 一次 bulk OUT；`UsbGate` 保证
+HID/控制请求不插进 1 MB 帧；`LcdSink` 同步发送完才取下一帧（`_send_lock` +
+短写检查）。根因是设备把 payload 直接写面板帧缓冲、无 vsync/双缓冲
+（`docs/ch-display.md §2.2`），1 MB 写入窗口 ~30 ms 跨 1–2 次面板刷新。
+
+本轮修法：`LcdSink` 发送前 `pause_reader()`（等在途 URB 排空），发送后
+`resume_reader()`。10 fps 预览、异步 16 URB 下实测：
+
+| 条件 | 单帧发送 | 采集 | 眼镜 |
+|---|---|---|---|
+| 同步 + 无暂停（旧） | 40–56 ms | 13.0–13.2 fps | 10.0 fps |
+| 异步 + 无暂停（`--no-lcd-pause`） | 37–43 ms | **19.9–21.9 fps** | 10.0 fps |
+| 异步 + 暂停（默认） | **32–39 ms** | 16.8–18.4 fps | 10.0 fps |
+
+暂停把窗口再压 5–10 ms，代价 2–4 fps；30 ms 已接近原厂 App 抓包。把预览从
+10 提到 15/20 fps **不会缩短单帧窗口**（仍 30–39 ms），只会降低采集 fps
+（18→14→12），因此推荐 10 fps。详见
+[`docs/ch-uvc.md` §7.6](../../docs/ch-uvc.md#76-眼镜预览撕裂排查与修法2026-11-22-晚)。
+
+#### 8.6.4 复现
+
+```bash
+sudo apt install -y python3-usb1
+cd ~/glxss3-linux
+python3 pi/stream.py --check --fps 30 --async-urb 16
+python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16
+python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16 --mirror-fps 10 --mirror-rotate 180
+python3 -m glxss ctl status
+python3 -m glxss ctl button click     # 无硬件时验证显示切换
+python3 -m glxss ctl button long      # 无硬件时验证 RTSP 开关
+```
 
 ---
 
@@ -630,15 +775,32 @@ ffmpeg stdin**：YV12 = Y|V|U、yuv420p = Y|U|V，rawvideo 解复用按字节流
 * `dmesg | grep -i bcm2835` 若有 `Mutex fail`，重启 Pi 释放 MMAL 状态；
 * 临时改用 `--codec libx264` 验证问题是否出在硬编。
 
+### 9.7 异步 URB / Fn / 眼镜撕裂
+
+* **`异步 URB 不可用（… claim VS … LIBUSB_ERROR_BUSY）`**：上一次进程没退干净，
+  或另一个取流程序占着 VS；`pgrep -af "stream.py|glxss uvc"`，等 2–3 s 重试。
+  仍失败就 `--async-urb 0` 回退同步（18–19 fps）。
+* **`No module named usb1`**：`sudo apt install -y python3-usb1`；或
+  `python3 -m pip install libusb1`。
+* **Fn 没反应**：确认日志有 `HID 轮询已启动`；`glxss ctl status` 的
+  `UVC 读/显示` 正常。若 HID 被别的进程 claim，先停掉 `glxss hud` 等。
+* **眼镜仍有撕裂**：主机侧已整帧、串行、暂停 UVC；剩余是设备无 vsync 的
+  固有限制。把 `--mirror-fps` 降到 5 可换更高采集帧率，但单帧窗口不变（§8.6.3）。
+* **双路只有 17–18 fps**：这是 GIL 限制，不是 USB；单路 30 fps 已达成。
+  需要更高双路帧率时先 `--mirror-fps 5`（23.7 fps），或把 RTSP 编码关掉。
+
 ---
 
 ## 10. 文件与实现
 
 | 文件 | 作用 |
 |---|---|
-| `glxss/pipeline.py` | **共享帧分发**：`LatestFrame` 最新帧槽、`write_yv12_as_i420`（零拷贝）、`LcdRenderer`、`LcdSink`、`LevelPoller` |
-| `glxss/stream.py` | 核心：UVC 读帧/发布、`EncoderSink`（ffmpeg + 令牌桶）、重连、MJPEG、统计 |
+| `glxss/pipeline.py` | **共享帧分发**：`LatestFrame` 最新帧槽、`write_yv12_as_i420`（零拷贝）、`LcdRenderer`、`LcdSink`、`LevelPoller`（水平仪 + Fn 按键） |
+| `glxss/uvc_async.py` | **720p30 异步多 URB**：独立 libusb handle claim VS、16 URB、零拷贝交接、pause/resume |
+| `glxss/uvc.py` | probe/commit、16 KiB 组帧；异步模式下 VS 控制请求委托给 reader |
+| `glxss/stream.py` | 核心：UVC 读帧/发布、`EncoderSink`（ffmpeg + 令牌桶）、Fn 事件、显示/RTSP 开关、控制 socket、重连、MJPEG、统计 |
 | `pi/stream.py` | 一键启动 CLI（参数映射、`--check`、打印 OBS 地址） |
+| `tools/uvc_async_exp.py` | 同步/多线程/异步吞吐实验台（不依赖 glxss 包） |
 | `pi/service/glxss-stream.service` | systemd：开机推流、失败重启 |
 | `pi/mediamtx.yml` | 最小 mediamtx 配置（RTSP + 本地 API） |
 | `pi/service/mediamtx.service` | systemd：mediamtx |
@@ -653,18 +815,27 @@ ffmpeg stdin**：YV12 = Y|V|U、yuv420p = Y|U|V，rawvideo 解复用按字节流
 * YV12→yuv420p 是**换写入顺序**而不是换 buffer（零像素拷贝、零色彩转换）；
 * LCD 线程按 `--mirror-fps` 用「睡到截止时间」限速，到点取当时最新帧；
 * LCD 渲染按整数步长抽样（720p 4×4、480p 2×2），芯片只解码 288×180 级别的小图；
+* LCD 发送前暂停 UVC 异步读（在途 URB 排空），发送后恢复：1 MB 帧不被 bulk IN
+  抢总线，单帧 29–39 ms，控制请求仍走 `UsbGate` 不插帧；
 * UVC 读失败 → 关设备（attach uvcvideo）+ 指数退避重开；ffmpeg 退出 → 独立退避
   重启，期间继续读 UVC 并丢帧，避免 USB 缓冲溢出；
-* `--fps` 若高于相机实际帧率会提示一次「建议改成实测值」，避免画面变慢
-  （720p 建议 15，实测 ~17）。
+* HID 轮询/加速度计/Fn 在独立线程，所有控制请求走 `UsbGate`；UVC 读线程
+  只从事件队列取按键事件，永不因 HID 阻塞；
+* `--fps` 若高于相机实际帧率会提示一次「建议改成实测值」；异步下 720p 实测
+  30 fps，双路 10fps 预览约 17.5–18.4 fps。
 
 ---
 
 ## 11. 未实现 / 未验证
 
-* **720p30 满帧**：当前同步 16 KiB bulk 读上限 ~26 MB/s，720p 实测 17–19 fps；
-  要多 URB 异步读或内核 uvcvideo（见 `docs/ch-uvc.md` §7.4）；
-* **1080p 直播**未验证：净荷 3,110,400 B，30fps 需 93 MB/s，USB2 实际达不到；
+* **720p30 满帧**：已实现（异步 16 URB，单路 29.7–30.7 fps，见 §8.6）；
+  同步回退仍是 17–19 fps；
+* **双路 30fps 采集 + 10fps 预览**：当前受 CPython GIL 限制（python ~108%，
+  4 核未满），若必须做到，需要把 LCD 渲染/发送移出 Python 线程或改 C 扩展；
+* **眼镜撕裂的彻底消除**：设备端无 vsync/双缓冲，主机只能把 1 MB 发送窗口压到
+  ~30 ms；需要继续 RE 固件的 LCD 接收路径（是否有页面翻转/局部刷新命令）；
+* **1080p 直播**未验证：净荷 3,110,400 B，异步实测 43.64 MB/s / 14 fps，
+  30fps 需 93 MB/s，USB2 实际达不到；
 * **设备模式切换**：同一会话从 720p commit 回 480p 时，设备回读会说 frame 4
   但数据面仍发 720p（按 460,800 组帧会斜纹花屏）；需要 480p 时重新打开设备，
   必要时重新插拔；

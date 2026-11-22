@@ -341,12 +341,15 @@ class UvcStream:
     """已 claim 的 UVC VS 接口封装。"""
 
     def __init__(self, dev, vs_interface, endpoint, timeout: int = 5000,
-                 verbose: bool = False):
+                 verbose: bool = False, async_reader=None):
         self.dev = dev
         self.vs = vs_interface
         self.ep = endpoint
         self.timeout = timeout
         self.verbose = verbose
+        # 可选：uvc_async.AsyncBulkReader。给了它就不在 pyusb handle 上 claim VS，
+        # 由异步 reader 在另一个 libusb handle 上 claim VS 并保持多 URB 在途。
+        self.async_reader = async_reader
         self.probe: Optional[Probe] = None
         self.frame_size = DEFAULT_FRAME_SIZE
         self.width = DEFAULT_WIDTH
@@ -371,7 +374,8 @@ class UvcStream:
         self.negotiated_unverified = False
 
     @classmethod
-    def open(cls, dev, session, timeout: int = 5000, verbose: bool = False) -> "UvcStream":
+    def open(cls, dev, session, timeout: int = 5000, verbose: bool = False,
+             async_reader=None) -> "UvcStream":
         """claim 接口并切 alt，顺序逐行对齐 Android `UvcCamera.prepare()`：
 
         1. VC(if0) force claim；
@@ -379,6 +383,11 @@ class UvcStream:
         3. VS(if1) force claim；
         4. `SET_INTERFACE(VS alt)` —— **即使 alt=0、即使返回失败也发**；
         5. 对 0x81 发 CLEAR_FEATURE(HALT)，清掉上一次残留的 halt。
+
+        ``async_reader``（`uvc_async.AsyncBulkReader`）给出时，VS 由它在另一个
+        libusb handle 上 claim，并已经在 open() 里发过 SET_INTERFACE/CLEAR_HALT；
+        这里跳过 pyusb 的 VS claim/set_alt/clear_halt，避免同一接口被两个 handle
+        重复 claim。probe/commit 仍走本 handle 的 control transfer。
         """
         vc, vs, ep = usb.pick_uvc(dev)
         hid = usb.find_interface(dev, usb.IFACE_HID)
@@ -390,20 +399,24 @@ class UvcStream:
         hid_owned = hid is not None and int(hid.bInterfaceNumber) not in claimed_numbers
         if hid is not None:
             session.claim_interface(hid, label="HID")
-        session.claim_interface(vs, label="UVC VS")
-        # pyusb 没有 Device.set_interface；走 set_interface_altsetting（见 usb.set_alt）。
-        usb.set_alt(dev, vs, vs.bAlternateSetting, verbose=verbose)
-        stream = cls(dev, vs, ep, timeout=timeout, verbose=verbose)
+        if async_reader is None:
+            session.claim_interface(vs, label="UVC VS")
+            # pyusb 没有 Device.set_interface；走 set_interface_altsetting（见 usb.set_alt）。
+            usb.set_alt(dev, vs, vs.bAlternateSetting, verbose=verbose)
+        stream = cls(dev, vs, ep, timeout=timeout, verbose=verbose,
+                     async_reader=async_reader)
         stream.session = session
         stream.vc = vc
         stream.hid = hid
         stream.hid_owned = hid_owned
-        usb.clear_halt(dev, ep.bEndpointAddress, verbose=verbose)
+        if async_reader is None:
+            usb.clear_halt(dev, ep.bEndpointAddress, verbose=verbose)
         if verbose:
             print("  VC: %s" % ("if=%d" % vc.bInterfaceNumber if vc is not None else "未发现"))
             print("  HID: %s" % ("if=%d" % hid.bInterfaceNumber if hid is not None else "未发现"))
-            print("  VS: if=%d alt=%d ep=0x%02x" % (
-                vs.bInterfaceNumber, vs.bAlternateSetting, ep.bEndpointAddress))
+            print("  VS: if=%d alt=%d ep=0x%02x%s" % (
+                vs.bInterfaceNumber, vs.bAlternateSetting, ep.bEndpointAddress,
+                "（异步 URB 读）" if async_reader is not None else ""))
         return stream
 
     def close(self) -> None:
@@ -412,17 +425,27 @@ class UvcStream:
         顺序照 Android `UvcCamera.stop()`：停读 → setInterface(alt0) →
         CLEAR_FEATURE(ENDPOINT_HALT) → releaseInterface。
         """
-        try:
-            usb.set_alt(self.dev, self.vs, 0, verbose=self.verbose)
-        except Exception:
-            pass
-        try:
-            usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
-        except Exception:
-            pass
+        reader = self.async_reader
+        self.async_reader = None
+        if reader is not None:
+            # 异步 reader 自己发 SET_INTERFACE(alt=0)、release VS、关 handle。
+            try:
+                reader.close()
+            except Exception:
+                pass
+        else:
+            try:
+                usb.set_alt(self.dev, self.vs, 0, verbose=self.verbose)
+            except Exception:
+                pass
+            try:
+                usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
+            except Exception:
+                pass
         session = self.session
         if session is not None:
-            release = [self.vs, self.vc]
+            # 异步模式下 VS 从未被 pyusb claim，不要在这里 release 它。
+            release = [self.vc] if reader is not None else [self.vs, self.vc]
             if self.hid_owned:
                 release.append(self.hid)
             for intf in release:
@@ -431,10 +454,28 @@ class UvcStream:
         self.session = None
 
     def _ctrl_in(self, request: int, value: int, length: int, timeout: int) -> bytes:
+        # VS 被异步 reader 的 libusb handle claim 时，发给 VS 接口的 class
+        # 控制请求也必须走那个 handle；pyusb handle 发同一接口会 EBUSY(16)。
+        if self.async_reader is not None:
+            try:
+                return self.async_reader.control_read(
+                    0xA1, request, value, self.vs.bInterfaceNumber,
+                    length, timeout)
+            except Exception as exc:
+                raise GlxssError(
+                    usb.usb_error_hint(exc, "控制读 0xa1/0x%02x" % request)) from exc
         return usb.ctrl_in(self.dev, request, value, self.vs.bInterfaceNumber,
                            length, timeout)
 
     def _ctrl_out(self, request: int, value: int, data: bytes, timeout: int) -> int:
+        if self.async_reader is not None:
+            try:
+                return self.async_reader.control_write(
+                    0x21, request, value, self.vs.bInterfaceNumber,
+                    data, timeout)
+            except Exception as exc:
+                raise GlxssError(
+                    usb.usb_error_hint(exc, "控制写 0x21/0x%02x" % request)) from exc
         return usb.ctrl_out(self.dev, request, value, self.vs.bInterfaceNumber,
                             data, timeout)
 
@@ -531,7 +572,14 @@ class UvcStream:
         self.vendor_post_commit(timeout_ms)
         # 上一次被取消的 URB / 固件 STALL 会让端点停在 halt，表现为“commit 成功但
         # 一个字节都不来”；pyusb 的 clear_halt 失败会退回标准控制请求。
-        usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
+        # 异步模式下 0x81 属于 reader 的 handle，必须由它清 halt。
+        if self.async_reader is not None:
+            try:
+                self.async_reader.clear_halt(self.ep.bEndpointAddress)
+            except Exception:
+                pass
+        else:
+            usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
         try:
             back = self._ctrl_in(UVC_GET_CUR, UVC_VS_COMMIT, 34, timeout_ms)
             if len(back) >= 26:
@@ -743,10 +791,30 @@ class UvcStream:
         self._synced = False
 
     def read_chunk(self, timeout: Optional[int] = None) -> bytes:
-        """读一个 16 KiB 块（usbfs 单 URB 上限，绝不超过 BULK_CHUNK）。"""
+        """读一个 16 KiB 块（usbfs 单 URB 上限，绝不超过 BULK_CHUNK）。
+
+        配了 ``async_reader`` 时从异步队列取块（多 URB 在途）；否则退回 pyusb
+        同步读。两种模式对上层完全一样：都是 ≤16 KiB 的有序字节流。
+        """
+        if self.async_reader is not None:
+            return self.async_reader.read_chunk(timeout or self.timeout)
         return usb.bulk_read(self.dev, self.ep.bEndpointAddress,
                              max(2, int(self.chunk_size)),
                              timeout or self.timeout)
+
+    # -- 异步读的暂停/恢复（LCD 整帧发送时让出总线） -----------------------
+    def pause_reading(self, drain_timeout: float = 0.08) -> None:
+        if self.async_reader is not None:
+            self.async_reader.pause(drain_timeout=drain_timeout)
+
+    def resume_reading(self) -> None:
+        if self.async_reader is not None:
+            self.async_reader.resume()
+
+    def async_stats(self) -> dict:
+        if self.async_reader is None:
+            return {}
+        return self.async_reader.stats_dict()
 
     def read_urb(self, timeout: Optional[int] = None) -> bytes:
         """兼容旧名字：等价于 read_chunk（一次只读 ≤16 KiB，不是一整帧）。"""

@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import shutil
 import socket
 import subprocess
@@ -46,7 +47,7 @@ from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, List, Optional, Tuple
 
-from . import lcd, pipeline, usb, uvc
+from . import control, hid, lcd, pipeline, usb, uvc
 from .errors import GlxssError
 
 DEFAULT_RTSP = "rtsp://127.0.0.1:8554/glxss"
@@ -76,6 +77,18 @@ class StreamConfig:
     bufsize: str = ""
     detach: bool = True
     timeout_ms: int = 5000
+    # 异步 URB：0=同步 16 KiB 读（旧行为）；>0=用 libusb1 保持 N 个 URB 在途。
+    # Pi Zero 2 W 实测：纯读 2 个就够 40 MB/s；但和 HID/ffmpeg 并发时 8 个
+    # 只有 ~28fps，16 个稳定 29.9–30.7fps（见 uvc_async.py）。
+    async_urb: int = 16
+    async_timeout: int = 1000
+    # HID / Fn 按键
+    fn_keys: bool = True
+    hid_poll: float = 0.1
+    fn_long_press: float = 0.9
+    fn_long_packets: int = 4
+    # 控制 socket（""=不启动；glxss ctl 用默认路径连）
+    ctl_socket: str = ""
     ffmpeg: str = "ffmpeg"
     extra_ffmpeg: Tuple[str, ...] = ()
     # 旧版「编码器队列深度」；现在改成最新帧槽（深度 1，旧的直接丢），保留字段
@@ -86,9 +99,13 @@ class StreamConfig:
     mjpeg_fps: float = 10.0
     mjpeg_quality: int = 70
     mirror_fps: float = 0.0
+    # Fn 单击打开预览时用的帧率；0=mirror_fps 或 10
+    preview_fps: float = 0.0
     mirror_fit: str = "fit"
     mirror_rotate: int = 0
     mirror_level: bool = True
+    # 发送 LCD 整帧时暂停 UVC 异步读；关掉可用于复现“抢带宽 → 撕裂窗口变大”
+    lcd_pause: bool = True
     # 观测
     api_url: str = ""
     stats_interval: float = 2.0
@@ -119,6 +136,8 @@ class StreamConfig:
             raise GlxssError("--mjpeg-port 必须在 0..65535")
         if self.mirror_fps < 0:
             raise GlxssError("--mirror-fps 不能为负")
+        if self.preview_fps < 0:
+            raise GlxssError("--preview-fps 不能为负")
         if self.mirror_fit not in ("fit", "cover", "crop", "stretch"):
             raise GlxssError("--mirror-fit 只能是 fit/cover/stretch")
         if self.mirror_rotate not in (0, 180):
@@ -127,6 +146,12 @@ class StreamConfig:
             raise GlxssError("--frame-index 必须在 1..255")
         if self.format_index is not None and not 1 <= self.format_index <= 255:
             raise GlxssError("--format-index 必须在 1..255")
+        if not 0 <= self.async_urb <= 32:
+            raise GlxssError("--async-urb 必须在 0..32（0=同步读，建议 8）")
+        if self.hid_poll <= 0:
+            raise GlxssError("--hid-poll 必须 > 0")
+        if self.fn_long_press < 0.3:
+            raise GlxssError("--fn-long-press 不能小于 0.3 秒")
         if not self.rtsp_url and self.mjpeg_port == 0:
             raise GlxssError("至少要有一种输出：--rtsp 或 --mjpeg-port")
 
@@ -140,6 +165,10 @@ class StreamConfig:
                 width, height = (int(part) for part in str(size).lower().split("x", 1))
             except Exception as exc:
                 raise GlxssError("--size 格式应为 1280x720，收到 %r" % (size,)) from exc
+        ctl_socket = ""
+        if not getattr(args, "no_ctl", False):
+            ctl_socket = (getattr(args, "ctl_socket", None)
+                          or control.default_socket_path())
         config = cls(
             rtsp_url=getattr(args, "rtsp", DEFAULT_RTSP) or "",
             width=width,
@@ -155,14 +184,23 @@ class StreamConfig:
             bufsize=str(getattr(args, "bufsize", "") or ""),
             detach=bool(getattr(args, "detach", True)),
             timeout_ms=int(getattr(args, "timeout", 5000)),
+            async_urb=int(getattr(args, "async_urb", 16)),
+            async_timeout=int(getattr(args, "async_timeout", 1000)),
+            fn_keys=bool(getattr(args, "fn_keys", True)),
+            hid_poll=float(getattr(args, "hid_poll", 0.1)),
+            fn_long_press=float(getattr(args, "fn_long_press", 0.9)),
+            fn_long_packets=int(getattr(args, "fn_long_packets", 4)),
+            ctl_socket=ctl_socket,
             ffmpeg=str(getattr(args, "ffmpeg", "ffmpeg")),
             mjpeg_port=int(getattr(args, "mjpeg_port", 0) or 0),
             mjpeg_fps=float(getattr(args, "mjpeg_fps", 10.0)),
             mjpeg_quality=int(getattr(args, "mjpeg_quality", 70)),
             mirror_fps=float(getattr(args, "mirror_fps", 0.0) or 0.0),
+            preview_fps=float(getattr(args, "preview_fps", 0.0) or 0.0),
             mirror_fit=str(getattr(args, "mirror_fit", "fit")),
             mirror_rotate=int(getattr(args, "mirror_rotate", 0) or 0),
             mirror_level=bool(getattr(args, "mirror_level", True)),
+            lcd_pause=not bool(getattr(args, "no_lcd_pause", False)),
             api_url=str(getattr(args, "api_url", "") or ""),
             stats_interval=float(getattr(args, "stats_interval", 2.0)),
             duration=float(getattr(args, "duration", 0.0) or 0.0),
@@ -483,7 +521,12 @@ def _num(value: float) -> str:
 # 采集源
 # ---------------------------------------------------------------------------
 class UvcSource:
-    """pyusb 读 GLXSS UVC；需要 detach uvcvideo（Linux）。"""
+    """pyusb 读 GLXSS UVC（可选异步多 URB）；需要 detach uvcvideo（Linux）。
+
+    异步读用独立的 libusb handle（`uvc_async.AsyncBulkReader`）claim VS，
+    pyusb handle 继续 claim VC/HID（以及按需 LCD）。probe/commit 仍走 pyusb，
+    所以协商/组帧逻辑与同步模式完全一致；异步不可用时自动回退。
+    """
 
     name = "uvc"
 
@@ -492,6 +535,7 @@ class UvcSource:
         self.dev = None
         self.session: Optional[usb.DeviceSession] = None
         self.stream: Optional[uvc.UvcStream] = None
+        self.async_reader = None
         self.probe = None
         self.gate = usb.UsbGate(verbose=config.verbose)
 
@@ -499,16 +543,53 @@ class UvcSource:
         self.dev = usb.find_normal()
         self.session = usb.DeviceSession(
             self.dev, detach=self.config.detach, verbose=self.config.verbose)
-        self.stream = uvc.UvcStream.open(
-            self.dev, self.session, timeout=self.config.timeout_ms,
-            verbose=self.config.verbose)
-        self.stream.set_dimensions(self.config.width, self.config.height)
-        self.probe = self.stream.negotiate(
-            format_index=self.config.format_index,
-            frame_index=self.config.frame_index,
-            fps=self.config.fps or None,
-            max_frame=self.config.frame_size,
-        )
+        reader = None
+        if self.config.async_urb > 0:
+            try:
+                from .uvc_async import AsyncBulkReader
+                # 固件要求“先 claim HID 再 claim VS”：异步 reader 只 claim VS，
+                # 所以这里先用 pyusb claim HID。
+                self.session.claim(usb.IFACE_HID, label="HID")
+                reader = AsyncBulkReader(
+                    urbs=self.config.async_urb,
+                    timeout=self.config.async_timeout,
+                    verbose=self.config.verbose)
+                reader.open()
+                self.async_reader = reader
+                if self.config.verbose:
+                    print("[stream] 异步 URB 已 claim VS：%d × 16 KiB（probe/commit 后再 start）"
+                          % self.config.async_urb)
+            except Exception as exc:
+                if reader is not None:
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+                reader = None
+                self.async_reader = None
+                print("[stream] 异步 URB 不可用（%s），回退同步 16 KiB 读"
+                      % (str(exc).splitlines()[0] if str(exc) else exc))
+        try:
+            self.stream = uvc.UvcStream.open(
+                self.dev, self.session, timeout=self.config.timeout_ms,
+                verbose=self.config.verbose, async_reader=reader)
+            self.stream.set_dimensions(self.config.width, self.config.height)
+            self.probe = self.stream.negotiate(
+                format_index=self.config.format_index,
+                frame_index=self.config.frame_index,
+                fps=self.config.fps or None,
+                max_frame=self.config.frame_size,
+            )
+            if reader is not None:
+                # commit 之后才开异步事件线程：probe/commit 的 VS 控制请求
+                # 与 libusb 事件循环同 handle 并发没有好处，串行更稳。
+                reader.start()
+                if self.config.verbose:
+                    print("[stream] 异步 URB 已启动：%d × 16 KiB"
+                          % self.config.async_urb)
+        except Exception:
+            self.close()
+            raise
         return self.probe
 
     def read(self) -> StreamFrame:
@@ -519,25 +600,52 @@ class UvcSource:
                            frame.timestamp)
 
     def close(self) -> None:
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = None
+        reader, self.async_reader = self.async_reader, None
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
         if self.session is not None:
             try:
                 self.session.close()
             except Exception:
                 pass
         self.session = None
-        self.stream = None
         self.dev = None
 
+    # 异步读暂停/恢复（LCD 整帧发送用） ----------------------------------
+    def pause_reading(self) -> None:
+        if self.async_reader is not None:
+            self.async_reader.pause()
+
+    def resume_reading(self) -> None:
+        if self.async_reader is not None:
+            self.async_reader.resume()
+
+    def async_stats(self) -> dict:
+        return self.async_reader.stats_dict() if self.async_reader else {}
+
     # 眼镜低帧率预览 -----------------------------------------------------
-    def create_lcd_sink(self, config: StreamConfig,
-                        hub: "pipeline.LatestFrame") -> Optional["pipeline.LcdSink"]:
+    def create_lcd_sink(self, config: StreamConfig, hub: "pipeline.LatestFrame",
+                        level_poller=None) -> Optional["pipeline.LcdSink"]:
         """claim LCD 接口 + 建 LCD 线程（共享同一份帧，不再单独读 UVC）。"""
         if config.mirror_fps <= 0:
             return None
         if self.dev is None or self.session is None:
             raise GlxssError("设备未打开，无法投眼镜")
-        return pipeline.open_lcd_sink(self.dev, self.session, config, hub,
-                                      gate=self.gate)
+        pause = config.lcd_pause
+        return pipeline.open_lcd_sink(
+            self.dev, self.session, config, hub, gate=self.gate,
+            level_poller=level_poller,
+            pause_reader=self.pause_reading if pause else None,
+            resume_reader=self.resume_reading if pause else None)
 
 
 class TestPatternSource:
@@ -589,7 +697,7 @@ class TestPatternSource:
     def close(self) -> None:
         pass
 
-    def create_lcd_sink(self, config: StreamConfig, hub) -> None:
+    def create_lcd_sink(self, config: StreamConfig, hub, **_kwargs) -> None:
         return None
 
 
@@ -880,8 +988,17 @@ class StreamStats:
     lcd: bool = False
     lcd_fps: float = 0.0
     lcd_ms: float = 0.0
+    lcd_render_ms: float = 0.0
+    lcd_send_ms: float = 0.0
     lcd_frames: int = 0
     lcd_dropped: int = 0
+    # Fn 按键 / 显示模式 / 推流开关 / 异步 URB
+    display: str = "hud"          # hud=不占 LCD；preview=眼镜预览
+    rtsp: bool = False
+    async_urbs: int = 0
+    async_pauses: int = 0
+    buttons: int = 0
+    last_button: str = ""
     last_error: str = ""
 
     @property
@@ -890,15 +1007,21 @@ class StreamStats:
 
     def line(self) -> str:
         mjpeg = (" MJPEG=%.1ffps" % self.mjpeg_fps) if self.mjpeg_fps else ""
-        lcd = (" 眼镜=%.1ffps/%.1fms" % (self.lcd_fps, self.lcd_ms)
-               if self.lcd else "")
+        lcd = (" 眼镜=%.1ffps/渲染%.1f+发送%.1fms" % (
+            self.lcd_fps, self.lcd_render_ms, self.lcd_send_ms)
+            if self.lcd else "")
+        async_text = (" 异步=%dURB/暂停%d" % (self.async_urbs, self.async_pauses)
+                      if self.async_urbs else "")
+        key_text = (" 按键=%s" % self.last_button) if self.last_button else ""
         return (
             "帧=%d 编码=%d 丢弃=%d 采集=%.1ffps 编码=%.1ffps YUV=%.2fMB/s "
-            "实测=%dkbps 观众=%d 重启=%d/%d%s%s 运行=%s" % (
+            "实测=%dkbps 观众=%d 重启=%d/%d%s%s 显示=%s%s 推流=%s%s 运行=%s" % (
                 self.captured, self.sent, self.dropped, self.capture_fps,
                 self.send_fps, self.bytes_in / self.elapsed / 1e6,
                 int(self.bitrate_kbps), self.viewers,
                 self.encoder_restarts, self.source_restarts, mjpeg, lcd,
+                self.display, async_text,
+                "ON" if self.rtsp else "OFF", key_text,
                 _hms(self.elapsed)))
 
 
@@ -931,6 +1054,20 @@ class Streamer:
         self._mjpeg: Optional[MjpegOutput] = None
         self._lcd: Optional[pipeline.LcdSink] = None
         self._api: Optional[MediamtxStats] = None
+        self._hid: Optional[pipeline.LevelPoller] = None
+        self._ctl: Optional[control.ControlServer] = None
+        # 显示模式：hud（不占 LCD，留给 HUD 进程）/ preview（本进程投相机画面）
+        self._display_mode = "hud"
+        self._preview_fps = max(1.0, float(
+            config.preview_fps or config.mirror_fps or 10.0))
+        self._rtsp_enabled = bool(config.rtsp_url)
+        self._mode_lock = threading.Lock()
+        self._button_lock = threading.Lock()
+        self._last_button_kind = ""
+        # Fn 动作（开/关预览、开/关 RTSP）可能阻塞 1–2 s，绝不能放在 UVC 读线程；
+        # 主循环只把动作塞进队列，由独立 worker 执行。
+        self._actions: "queue.Queue[str]" = queue.Queue()
+        self._action_thread: Optional[threading.Thread] = None
         # 编码器线程的累计计数（pipe 重启后归零，靠这里换算成总量）
         self._pipe_frames = 0
         self._pipe_dropped = 0
@@ -941,6 +1078,264 @@ class Streamer:
     # -- 打印 -----------------------------------------------------------
     def _print(self, message: str) -> None:
         print("[stream] " + message, flush=True)
+
+    # -- HID / Fn 按键 --------------------------------------------------
+    def _start_hid_poller(self) -> bool:
+        if self._hid is not None:
+            return True
+        source = self._source
+        if source is None or getattr(source, "dev", None) is None:
+            return False
+        cfg = self.config
+        if not cfg.fn_keys and not cfg.mirror_level:
+            return False
+        watcher = None
+        if cfg.fn_keys:
+            watcher = hid.FnWatcher(long_seconds=cfg.fn_long_press,
+                                    long_packets=cfg.fn_long_packets)
+        poller = pipeline.LevelPoller(
+            source.dev, interval=cfg.hid_poll,
+            timeout=min(1500, max(200, cfg.timeout_ms)),
+            gate=getattr(source, "gate", None), verbose=cfg.verbose,
+            watcher=watcher, enable_accel=bool(cfg.mirror_level))
+        poller.start()
+        self._hid = poller
+        self._print("HID 轮询已启动：%.0f ms，Fn %s，长按 %.1f s/%d 包" % (
+            cfg.hid_poll * 1000.0, "ON" if cfg.fn_keys else "OFF",
+            cfg.fn_long_press, cfg.fn_long_packets))
+        return True
+
+    def _stop_hid_poller(self) -> None:
+        poller, self._hid = self._hid, None
+        if poller is not None:
+            poller.stop()
+
+    def _drain_buttons(self) -> None:
+        poller = self._hid
+        if poller is None:
+            return
+        for event in poller.drain_events():
+            with self._button_lock:
+                self.stats.buttons += 1
+                self.stats.last_button = event.kind
+                self._last_button_kind = event.kind
+            if event.kind == "click":
+                self._print("Fn 按键：%s → 切换显示模式（当前 %s）" % (
+                    event.format(), self._display_mode))
+                self._actions.put("display")
+            elif event.kind == "long":
+                self._print("Fn 按键：%s → 切换 RTSP 推流（当前 %s）" % (
+                    event.format(), "ON" if self._rtsp_enabled else "OFF"))
+                self._actions.put("rtsp")
+
+    def _start_action_worker(self) -> None:
+        if self._action_thread is not None:
+            return
+        self._action_thread = threading.Thread(
+            target=self._action_loop, name="fn-action", daemon=True)
+        self._action_thread.start()
+
+    def _action_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                action = self._actions.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if action == "display":
+                    self._toggle_display()
+                elif action == "rtsp":
+                    self._toggle_rtsp()
+            except Exception as exc:
+                self._print("Fn 动作 %s 失败：%s" % (
+                    action, str(exc).splitlines()[0] if str(exc) else exc))
+
+    def _stop_action_worker(self) -> None:
+        thread, self._action_thread = self._action_thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    # -- 显示模式（HUD ↔ 相机预览） -------------------------------------
+    def _start_preview(self) -> bool:
+        with self._mode_lock:
+            if self._lcd is not None:
+                self.stats.display = "preview"
+                return True
+            source = self._source
+            if source is None or not hasattr(source, "create_lcd_sink"):
+                self._print("眼镜预览启动失败：采集源未打开")
+                return False
+            self._start_hid_poller()   # 水平仪 / Fn 轮询在预览打开前就绪
+            cfg = self.config
+            old_fps = cfg.mirror_fps
+            cfg.mirror_fps = self._preview_fps
+            try:
+                lcd_sink = source.create_lcd_sink(
+                    cfg, self.hub, level_poller=self._hid)
+                if lcd_sink is None:
+                    self._print("眼镜预览启动失败：当前源不支持投屏")
+                    return False
+                lcd_sink.start()
+                self._lcd = lcd_sink
+                self.stats.lcd = True
+                self.stats.display = "preview"
+                self._display_mode = "preview"
+                self._print("显示模式 -> camera preview（眼镜预览 %.1f fps）"
+                            % self._preview_fps)
+                return True
+            except Exception as exc:
+                self._lcd = None
+                self.stats.lcd = False
+                self.stats.display = "hud"
+                self._display_mode = "hud"
+                self._print("眼镜预览启动失败：%s" % (
+                    str(exc).splitlines()[0] if str(exc) else exc))
+                return False
+            finally:
+                cfg.mirror_fps = old_fps
+
+    def _stop_preview(self) -> bool:
+        with self._mode_lock:
+            lcd_sink, self._lcd = self._lcd, None
+            if lcd_sink is None:
+                self.stats.lcd = False
+                self.stats.display = "hud"
+                self._display_mode = "hud"
+                return True
+            try:
+                lcd_sink.release()
+            except Exception as exc:
+                self._print("停止眼镜预览时释放 LCD 失败：%s" % (
+                    str(exc).splitlines()[0] if str(exc) else exc))
+            self.stats.lcd = False
+            self.stats.display = "hud"
+            self._display_mode = "hud"
+            self._print("显示模式 -> HUD（眼镜预览已停，LCD 接口已释放）")
+            return True
+
+    def _set_display(self, preview: bool) -> bool:
+        return self._start_preview() if preview else self._stop_preview()
+
+    def _toggle_display(self) -> bool:
+        # 以 _lcd 是否存在为准，避免 _display_mode 与线程状态短暂不一致。
+        return self._set_display(self._lcd is None)
+
+    # -- RTSP 推流开关（长按 Fn） ---------------------------------------
+    def _set_rtsp(self, enabled: bool) -> bool:
+        with self._mode_lock:
+            if not self.config.rtsp_url:
+                self._print("长按 Fn 忽略：当前没有配置 RTSP 推流")
+                return False
+            enabled = bool(enabled)
+            if enabled == self._rtsp_enabled:
+                return True
+            self._rtsp_enabled = enabled
+            self.stats.rtsp = enabled
+            if not enabled:
+                # 真正的 ffmpeg.stop() 可能阻塞 3 s，不能放在控制 socket 线程里；
+                # 主循环看到 _rtsp_enabled=False 会停止它。
+                self._print("RTSP 推流停止请求（主循环即将停 ffmpeg；长按 Fn 恢复）")
+            else:
+                self._print("RTSP 推流已恢复（下一轮启动 ffmpeg）")
+            return True
+
+    def _toggle_rtsp(self) -> bool:
+        return self._set_rtsp(not self._rtsp_enabled)
+
+    # -- 控制 socket -----------------------------------------------------
+    def _status_dict(self) -> dict:
+        stats = self.stats
+        source = self._source
+        async_info = {}
+        if source is not None and hasattr(source, "async_stats"):
+            try:
+                async_info = source.async_stats() or {}
+            except Exception:
+                async_info = {}
+        return {
+            "connected": source is not None,
+            "fps": round(stats.capture_fps, 1),
+            "encoder_fps": round(stats.send_fps, 1),
+            "brightness": None,
+            "view": stats.display,
+            "display": stats.display,
+            "mode": 2 if stats.display == "preview" else 1,
+            "screen": True,
+            "hud": stats.display != "preview",
+            "rec": False,
+            "rtsp": bool(stats.rtsp and self.config.rtsp_url),
+            "stream": bool(stats.rtsp and self.config.rtsp_url),
+            "mirror_fps": self._preview_fps if stats.display == "preview" else 0.0,
+            "buttons": stats.buttons,
+            "last_button": stats.last_button,
+            "async": async_info,
+            "monitor": {
+                "read_fps": round(stats.capture_fps, 1),
+                "read_ms": 0.0,
+                "decode_ms": round(stats.lcd_ms, 1),
+                "frames_stale": stats.lcd_dropped,
+            },
+            "time": time.strftime("%H:%M:%S"),
+            "socket": self.config.ctl_socket,
+            "error": stats.last_error,
+        }
+
+    def _handle_ctl(self, request: dict) -> dict:
+        cmd = str(request.get("cmd", "")).strip().lower()
+        if cmd in ("", "status", "ping"):
+            response = {"ok": True, "status": self._status_dict()}
+            if cmd == "ping":
+                response["pong"] = True
+            return response
+        if cmd in ("display", "view"):
+            raw = str(request.get("value", "toggle")).strip().lower()
+            if raw in ("", "toggle"):
+                ok = self._toggle_display()
+            elif raw in ("hud", "off", "0", "screen"):
+                ok = self._set_display(False)
+            elif raw in ("preview", "camera", "uvc", "on", "1", "monitor"):
+                ok = self._set_display(True)
+            else:
+                return {"ok": False, "error": "display 需要 preview/hud/toggle"}
+            return {"ok": ok, "status": self._status_dict()}
+        if cmd in ("rtsp", "stream"):
+            raw = str(request.get("value", "toggle")).strip().lower()
+            if raw in ("", "toggle"):
+                ok = self._toggle_rtsp()
+            elif raw in ("on", "start", "1", "true"):
+                ok = self._set_rtsp(True)
+            elif raw in ("off", "stop", "0", "false"):
+                ok = self._set_rtsp(False)
+            else:
+                return {"ok": False, "error": "rtsp 需要 on/off/toggle"}
+            return {"ok": ok, "status": self._status_dict()}
+        if cmd in ("button", "fn"):
+            # 调试/自动化用：不碰硬件，直接把事件注入主循环队列。
+            kind = str(request.get("value", "click")).strip().lower()
+            if kind not in ("click", "long"):
+                return {"ok": False, "error": "button 需要 click/long"}
+            if self._hid is None:
+                return {"ok": False, "error": "HID 轮询未启动"}
+            self._hid.inject_event(hid.FnEvent(kind, time.monotonic(), 0.0, 0))
+            return {"ok": True, "status": self._status_dict()}
+        if cmd == "quit":
+            self.stop()
+            return {"ok": True, "message": "正在退出"}
+        return {"ok": False, "error": "未知命令 %r（支持 status/display/rtsp/quit）" % cmd}
+
+    def _start_ctl(self) -> None:
+        path = (self.config.ctl_socket or "").strip()
+        if not path:
+            return
+        try:
+            server = control.ControlServer(path, self._handle_ctl)
+            server.start()
+            self._ctl = server
+            self._print("控制 socket: %s（glxss ctl status）" % path)
+        except Exception as exc:
+            self._ctl = None
+            self._print("控制 socket 启动失败（继续运行）：%s" % (
+                str(exc).splitlines()[0] if str(exc) else exc))
 
     def _print_banner(self) -> None:
         cfg = self.config
@@ -957,13 +1352,27 @@ class Streamer:
         if cfg.mjpeg_port:
             self._print("MJPEG → http://%s:%d/stream" % (
                 local_ip(), cfg.mjpeg_port))
+        if cfg.async_urb:
+            self._print("UVC 读：异步 %d URB × 16 KiB（不可用时自动回退同步）"
+                        % cfg.async_urb)
+        else:
+            self._print("UVC 读：同步 16 KiB（--async-urb 0）")
+        if cfg.fn_keys:
+            self._print("Fn 按键：单击=显示 %s ↔ preview；长按 ≥%.1f s=%s" % (
+                "preview" if cfg.mirror_fps else "hud",
+                cfg.fn_long_press,
+                "停止/恢复 RTSP" if cfg.rtsp_url else "无效（未配置 RTSP）"))
         if cfg.mirror_fps:
             self._print("眼镜预览 %.1f fps（会占用 LCD 接口，和 HUD 冲突）" % cfg.mirror_fps)
 
     # -- 主循环 ---------------------------------------------------------
     def run(self) -> StreamStats:
         cfg = self.config
+        self.stats.display = "hud"
+        self.stats.rtsp = bool(cfg.rtsp_url)
         self._print_banner()
+        self._start_ctl()
+        self._start_action_worker()
         started = self.stats.started
         last_report = time.monotonic()
         last_captured = 0
@@ -985,6 +1394,13 @@ class Streamer:
 
             slow_warned = False
             while not self._stop.is_set():
+                # 0) Fn 按键：只从队列取事件，绝不在读线程里发 USB 请求。
+                self._drain_buttons()
+                if (cfg.fn_keys and self._hid is not None
+                        and not self._hid.alive and self._source is not None):
+                    self._print("HID 轮询线程已退出，重启")
+                    self._stop_hid_poller()
+                    self._start_hid_poller()
                 now = time.monotonic()
                 if cfg.duration and now - started >= cfg.duration:
                     break
@@ -1001,16 +1417,11 @@ class Streamer:
                         if probe is not None:
                             self._print("UVC 已打开：%s" % probe.format().replace(
                                 "\n", " "))
-                        if cfg.mirror_fps and hasattr(source, "create_lcd_sink"):
-                            try:
-                                self._lcd = source.create_lcd_sink(cfg, self.hub)
-                                if self._lcd is not None:
-                                    self._lcd.start()
-                                    self.stats.lcd = True
-                            except Exception as exc:
-                                self._lcd = None
-                                self.stats.lcd = False
-                                self._print("眼镜预览启动失败（跳过）：%s" % exc)
+                        self._start_hid_poller()
+                        # 重连后保持用户用 Fn/ctl 选过的显示模式：preview 就重开，
+                        # hud 就不占 LCD。
+                        if cfg.mirror_fps or self._display_mode == "preview":
+                            self._start_preview()
                     except GlxssError as exc:
                         self.stats.source_restarts += 1
                         self.stats.last_error = str(exc)
@@ -1022,7 +1433,15 @@ class Streamer:
 
                 # 2) 编码器：没有就启动；死了就按退避时间重启。
                 #    等待期间继续读 UVC（帧直接丢），避免 USB 端缓冲溢出。
-                if cfg.rtsp_url and self._pipe is None and now >= encoder_retry_at:
+                if self._pipe is not None and not self._rtsp_enabled:
+                    pipe, self._pipe = self._pipe, None
+                    self._print("RTSP 推流已停止（ffmpeg 退出）")
+                    try:
+                        pipe.stop()
+                    except Exception:
+                        pass
+                if (cfg.rtsp_url and self._rtsp_enabled
+                        and self._pipe is None and now >= encoder_retry_at):
                     try:
                         self._pipe = EncoderSink(cfg, self.hub)
                         self._pipe.start()
@@ -1087,11 +1506,23 @@ class Streamer:
                         lcd_stats = self._lcd.stats_dict()
                         self.stats.lcd = True
                         self.stats.lcd_fps = lcd_stats["fps"]
-                        self.stats.lcd_ms = lcd_stats["render_ms"] + lcd_stats["send_ms"]
+                        self.stats.lcd_render_ms = lcd_stats["render_ms"]
+                        self.stats.lcd_send_ms = lcd_stats["send_ms"]
+                        self.stats.lcd_ms = (lcd_stats["render_ms"]
+                                             + lcd_stats["send_ms"])
                         self.stats.lcd_frames = lcd_stats["frames"]
                         self.stats.lcd_dropped = lcd_stats["dropped"]
                         if lcd_stats["last_error"]:
                             self.stats.last_error = lcd_stats["last_error"]
+                    source = self._source
+                    if source is not None and hasattr(source, "async_stats"):
+                        try:
+                            async_info = source.async_stats() or {}
+                        except Exception:
+                            async_info = {}
+                        self.stats.async_urbs = int(async_info.get("urbs", 0) or 0)
+                        self.stats.async_pauses = int(
+                            async_info.get("pauses", 0) or 0)
                     line = self.stats.line()
                     if cfg.rtsp_url and not (self._api and self._api.online):
                         line += "（目标 %s）" % cfg.bitrate
@@ -1120,10 +1551,8 @@ class Streamer:
 
     # -- 清理 -----------------------------------------------------------
     def _close_source(self) -> None:
-        if self._lcd is not None:
-            self._lcd.stop()
-            self._lcd = None
-            self.stats.lcd = False
+        self._stop_preview()
+        self._stop_hid_poller()
         if self._source is not None:
             try:
                 self._source.close()
@@ -1132,6 +1561,14 @@ class Streamer:
         self._source = None
 
     def _close_all(self) -> None:
+        self._stop.set()
+        if self._ctl is not None:
+            try:
+                self._ctl.stop()
+            except Exception:
+                pass
+            self._ctl = None
+        self._stop_action_worker()
         self.hub.close()
         if self._pipe is not None:
             self._pipe.stop()

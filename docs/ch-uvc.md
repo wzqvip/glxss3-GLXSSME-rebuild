@@ -54,7 +54,7 @@ claim if0 (VC) + if1 (VS)
 | 格式 | `bFormatIndex=1` → **YV12 未压缩**（`idx2` 是 MJPEG） |
 | 帧档位（2026-11-22 Pi 直接解析 VS 描述符） | frame **1**=1920×1080、**2**=1280×960、**3**=1280×720、**4**=640×480、5=4128×3104、6=3264×2448 |
 | **默认档位** | **`bFrameIndex=3` → 1280×720@30**（原厂预览同款全画幅）；640×480 回退用 frame 4 |
-| 实际帧率（720p） | Pi Zero 2 W 实测 **~17–19 fps**（USB/主机同步读上限；协商 interval 仍是 30fps） |
+| 实际帧率（720p） | 同步读 Pi Zero 2 W 实测 **~17–19 fps**；异步 16 URB **29.7–30.7 fps**（§7.5；协商 interval 一直是 30fps） |
 | 实际帧率（480p，历史） | **29.7–30.4 fps**（2026-11-22 Pixel；Pi 30.0 fps） |
 | 一帧（720p） | `1382400 = 1280×720×1.5`，**无 stride padding** |
 | 一帧总长（720p） | `1382412 = 1382400 + 12`（12 B UVC payload header，整帧只有这 1 个） |
@@ -330,7 +330,8 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 **修法**：读循环每次只读 **16384**，用"一帧 + 一个 chunk"的 `rx` 缓冲做字节流组帧
 （§6）。改完后 Pixel 上 480p 稳定 **29.7–30.4 fps、4900 帧 0 无效 URB**；Pi 侧同样
 改成 `BULK_CHUNK=16384`（`linux/glxss/uvc.py`），不再依赖 libusb 拆 URB 的后端行为。
-720p 在 Pi Zero 2 W 上受同步读上限约 **17–19 fps / 25–26 MB/s**（见 §7.4）。
+720p 在 Pi Zero 2 W 上同步读约 **17–19 fps / 25–26 MB/s**；用异步多 URB 后
+**29.7–30.7 fps / 40.6–42.4 MB/s**（见 §7.5）。
 
 > 与"URB 尺寸 = frameSize+22"不矛盾：`1382422`（720p）/ `460822`（480p）是
 > **协议层面的逻辑帧长**（原厂 `frameBufferSize`），16 KiB 是**主机侧单次 USB
@@ -396,8 +397,9 @@ Linux [`UvcStream.read_frame()`](../linux/glxss/uvc.py)）：
 | 协商结果 | `format=YV12(idx=1) 1280x720 frameIdx=3 maxFrame=1382400B interval=333333(=30.0fps)` |
 | 缓冲 | `frameSize=1382400 chunk=16384 rxBuf≈1.40 MB urbSize=1382422（仅日志）` |
 | 单次 bulk | `n = 16384`（分块上限），一帧由 ~85 块组成（`1382412 = 12 + 1382400`） |
-| 帧率（Pi，`--check`） | **18.6–19.0 fps / 25.7–26.2 MB/s**（2026-11-22，未预热 10 帧均值） |
-| 帧率（Pi，稳态单推流） | **16.9–17.2 fps / 21–22 MB/s**，0 丢弃字节 |
+| 帧率（Pi，同步 `--check`） | **18.6–19.0 fps / 25.7–26.2 MB/s**（2026-11-22 早些时候，未预热 10 帧均值） |
+| 帧率（Pi，异步 16 URB） | **29.7–30.7 fps / 40.6–42.4 MB/s**（2026-11-22 晚，见 §7.5） |
+| 帧率（Pi，同步稳态单推流） | **16.9–17.2 fps / 21–22 MB/s**，0 丢弃字节 |
 | 解码 | YV12→ARGB 纯 Kotlin 约 8–15 ms/帧；Bitmap A/B 双缓冲，每帧零分配 |
 | 并发 | 投屏 10 fps（1 MB bulk OUT）同时 UVC 读 13 fps（实测，见 §7.4） |
 
@@ -522,7 +524,8 @@ cd linux && python -m unittest discover -s tests -v
 ```
 
 Pi Zero 2 W 上的离线组帧基准（假设备按 16 KiB 返回 6 帧连续数据，跑 3 帧）：
-**5.1 ms/帧、~196 fps 组帧吞吐、0 丢弃字节**，远高于 17–19 fps 的 720p 目标——组帧不是瓶颈。
+**5.1 ms/帧、~196 fps 组帧吞吐、0 丢弃字节**，远高于同步读的 17–19 fps
+甚至 30 fps 目标——组帧不是瓶颈。
 
 Pi 真机验证（2026-11-22，Raspberry Pi Zero 2 W + pyusb 1.2.1，眼镜 `2e09:0030`）。
 下表是 480p 历史会话（同一天早些时候）；720p 数据见 §7.4：
@@ -609,22 +612,142 @@ Pi Zero 2 W 实测（2026-11-22，`2e09:0030`，`--detach`，mediamtx 常驻）�
 | 测试 | 结果 |
 |---|---|
 | `--list-modes` | 解析出 frame 1…6，frame 3 = 1280×720 / 1,382,400 B |
-| `--check --fps 30` | probe `format=1 frame=3 interval=333333 maxFrame=1382400 maxPayload=16384`；**1280×720，18.6–19.0 fps / 25.7–26.2 MB/s** |
-| 稳态读帧 | **19.0 fps，0 丢弃字节**；`/tmp/full720_steady.png` = 1280×720 |
-| 单推流 `--fps 25` | 采集 **16.9–17.2 fps**、编码同采集、0 重启；`ffprobe` → `h264 1280x720 25/1`；CPU python ~53–55%、ffmpeg ~6–9% |
-| 双路 `--fps 25 --mirror-fps 10 --mirror-rotate 180` | 采集 **13.0–13.2 fps**、编码 13.2、眼镜 **10.0 fps / 46–56 ms**，0 重启；CPU python ~73%、ffmpeg ~6%，45°C、无降频 |
+| `--check --fps 30`（同步回退） | probe `format=1 frame=3 interval=333333 maxFrame=1382400 maxPayload=16384`；**1280×720，18.6–19.0 fps / 25.7–26.2 MB/s** |
+| 稳态读帧（同步） | **19.0 fps，0 丢弃字节**；`/tmp/full720_steady.png` = 1280×720 |
+| 单推流 `--fps 25`（同步） | 采集 **16.9–17.2 fps**、编码同采集、0 重启；`ffprobe` → `h264 1280x720 25/1`；CPU python ~53–55%、ffmpeg ~6–9% |
+| 双路 `--fps 25 --mirror-fps 10 --mirror-rotate 180`（同步） | 采集 **13.0–13.2 fps**、编码 13.2、眼镜 **10.0 fps / 46–56 ms**，0 重启；CPU python ~73%、ffmpeg ~6%，45°C、无降频 |
+| **单推流 `--fps 30 --async-urb 16`** | 采集 **29.7–30.7 fps**、编码 30.0、0 重启；`ffprobe` → `h264 1280x720 30/1`；python ~128%、ffmpeg ~31% |
+| **双路 `--fps 30 --async-urb 16 --mirror-fps 10`** | 采集 **17.5–18.4 fps**、眼镜 **10.0 fps**（渲染 22–28 + 发送 29–39 ms）；python ~108%、ffmpeg ~23%，45–52°C |
 | 抓帧 | `/tmp/full720.png` / `full720_steady.png` = 1280×720，全画幅（比 480p 多出右侧墙面/桌面），**不再偏左** |
 | 640×480 回退 | `--size 640x480` 仍按 frame 4 协商；若设备坚持 480p，`negotiate()` 自动回退并打印警告 |
 
 > **为什么只有 ~17–19 fps**：720p30 需要 41.5 MB/s，而 Pi Zero 2 W 上 pyusb
-> 同步 16 KiB bulk 读的实测上限约 25–26 MB/s（USB 主机/U RB 往返开销），
-> 不是设备协商失败——probe/commit 回读就是 30fps interval。要跑满 30fps
-> 需要多 URB 异步/内核 uvcvideo，本仓库暂未实现；直播建议 `--fps 15`。
+> 同步 16 KiB bulk 读的实测上限约 26–29 MB/s（单 URB 在途，USB 主机往返
+> 开销），不是设备协商失败——probe/commit 回读就是 30fps interval。
+> **2026-11-22 晚已用异步多 URB 跑满，见 §7.5**；同步读仍保留为回退。
 >
 > **设备模式切换的怪癖**：同一会话里从 720p 再 commit 回 480p，设备回读会
 > 说 frame 4，但数据面仍按 720p 发（按 460,800 组帧会得到斜纹花屏）。因此
 > 默认只做“从设备当前档 → 720p”；需要 480p 时用 `--size 640x480` 重新打开
 > （必要时重新插拔）。回退路径针对的是“设备从一开始就只给 480p”的情形。
+
+### 7.5 720p30：异步多 URB（2026-11-22 晚）
+
+**结论：720p 30fps 达成。** 单路采集稳态 **29.7–30.7 fps / 40.6–42.4 MB/s**，
+0 丢弃字节；组帧稳态 **30.10 fps，帧间隔中位 33.3 ms、p95 33.4 ms**。
+
+#### 7.5.1 实验：同步 vs 多线程 vs 异步
+
+实验台 [`linux/tools/uvc_async_exp.py`](../linux/tools/uvc_async_exp.py)，
+Pi Zero 2 W、`2e09:0030`、1280×720（frame 3，1,382,400 B/帧）、每次 URB 16 KiB：
+
+| 读法 | 8 s 吞吐 | 720p 理论帧率 | 备注 |
+|---|---|---|---|
+| 同步单读（旧路径） | 28.9 MB/s | 20.9 fps | 单 URB 在途 |
+| 2 线程同步读 | 40.2 MB/s | 29.1 fps | 已经到设备/管道上限 |
+| 4 / 8 线程同步读 | 40.2 / 40.3 MB/s | 29.1 fps | 再加线程不涨 |
+| libusb 异步 2 / 4 / 8 / 16 URB | 40.25 MB/s | 29.1 fps | 2 个就饱和，16 个留余量 |
+| 异步 8 URB + 组帧（20 s，跳过前 3 s） | 40.5 MB/s | **30.10 fps** | 中位间隔 33.3 ms |
+| 异步 16 URB + `--check` | **42.4 MB/s** | **30.7 fps** | 含 2 帧预热 |
+
+补充：1080p（frame 1，3,110,400 B/帧）异步读实测 **43.64 MB/s / 14.0 fps**，
+说明 USB 管道本身能超过 41.5 MB/s；720p 的 30 fps 是**设备侧输出上限**，
+不是主机侧瓶颈。同步读的 28.9 MB/s 是单 URB 往返延迟造成的，不是 dwc_otg
+总带宽。
+
+#### 7.5.2 实现（`linux/glxss/uvc_async.py` + `uvc.py`）
+
+* **独立 libusb handle**：libusb 允许同一设备开多个 handle，只要 claim 的接口
+  不重叠。异步 reader 只 claim **VS(if1)**；pyusb handle 继续 claim VC(if0) /
+  HID(if2) / LCD(if3)。固件要求“先 claim HID 再 claim VS”，所以
+  `UvcSource.open()` 先用 pyusb claim HID，再打开 async reader。
+* **控制面仍走 pyusb**：VS 被另一个 handle claim 后，pyusb 对 if1 的 class
+  控制请求会 `EBUSY(16)`；因此 `UvcStream._ctrl_in/_ctrl_out` 在异步模式下
+  自动改走 reader 的 `controlRead/controlWrite`（probe/commit/CLEAR_HALT）。
+  `probe/commit` 完成、commit 成功之后才启动异步事件线程，避免控制面与
+  libusb 事件循环并发。
+* **多 URB**：16 × 16 KiB；回调只把 `(transfer, length)` 放进队列，
+  **不在回调里复制 16 KiB**；消费者 `read_chunk()` 复制并立即补交 URB。
+  这样回调线程不再承担内存拷贝/GIL 热点。
+* **同步回退**：`--async-urb 0` 强制旧路径；`usb1` 未安装、claim 失败、
+  设备忙时自动回退并在日志里说明原因。
+* **暂停/恢复**：`pause()` 停止提交新 URB 并等在途 URB 排空（实测 ~6 ms），
+  `resume()` 补交。用途见 §7.6（LCD 整帧让出总线）。
+
+#### 7.5.3 双路实测（UVC 30fps + 眼镜预览）
+
+`pi/stream.py --fps 30 --async-urb 16 --mirror-fps 10 --mirror-rotate 180`
+（20 s 稳态；`--fps` 同时作为 UVC interval）：
+
+| 预览 | 采集 | 编码 | 眼镜 | 眼镜渲染 | 1 MB 发送 | 暂停次数/总时长 |
+|---|---|---|---|---|---|---|
+| 关 | **29.7–30.7 fps** | 30.0 fps | — | — | — | 0 |
+| 5 fps | **23.7 fps** | 23.7 fps | 5.0 fps | 24–30 ms | 29–37 ms | ~4/s |
+| 10 fps | **17.5–18.4 fps** | 17.5–18.4 fps | **10.0 fps** | 22–28 ms | **29–39 ms** | ~10/s |
+| 15 fps | 14.1 fps | 14.1 fps | 15.0 fps | 18–20 ms | 30–36 ms | ~15/s |
+| 20 fps | 12.4 fps | 12.4 fps | 17.1–17.5 fps | 19–28 ms | 29–39 ms | ~20/s |
+
+> 双路 10 fps 时 python ~108%（单核百分比）、ffmpeg ~23%，4 个 A53 核没有跑满；
+> 限制是 **CPython GIL**：读线程、异步回调/拷贝、编码写入、LCD 渲染/发送
+> 四个线程抢一把 GIL，LCD 线程取到 GIL 的墙钟被拉长。单路 30 fps 时 python
+> ~128%、ffmpeg ~31%。
+
+当前实现（16 URB、零拷贝交接）下，不加暂停（`--no-lcd-pause`）实测：
+采集 **19.9–21.9 fps**、LCD 10.0 fps、单帧发送 **37–43 ms**；加
+`pause()/resume()` 后发送 **32–39 ms**、采集 16.8–18.4 fps。暂停用 2–4 fps
+采集换 5–10 ms 更短的撕裂窗口。早期 8 URB、回调里复制 16 KiB 的实验台曾出现
+“LCD 6.3 fps / ~150 ms”，那是 CPU/拷贝瓶颈，不是当前实现。
+
+#### 7.5.4 复现命令
+
+```bash
+cd ~/glxss3-linux
+sudo apt install -y python3-usb1
+python3 tools/uvc_async_exp.py --mode sync   --framing --seconds 10
+python3 tools/uvc_async_exp.py --mode async --urb 8 --framing --seconds 20 --warmup 3
+python3 pi/stream.py --check --fps 30 --async-urb 16
+python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16
+python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16 --mirror-fps 10 --mirror-rotate 180
+```
+
+### 7.6 眼镜预览撕裂：排查与修法（2026-11-22 晚）
+
+**先核对主机侧，三项都是“正确的”：**
+
+| 检查项 | 结论 | 证据 |
+|---|---|---|
+| LCD 是否整帧一次 bulk OUT | ✅ 是 | `lcd.LcdLink.send_packet()` 一次 `dev.write(ep, 1,024,016 B)`；Python 侧不分块 |
+| 控制请求会不会插进 1 MB 帧中间 | ✅ 不会 | HID/亮度/probe 等全部走 `usb.UsbGate`，`LcdSink` 持闸门完成整帧 |
+| 上一帧没发完会不会发下一帧 | ✅ 不会 | `LcdSink._loop` 同步 `send_packet()` 返回后才取下一帧；另有 `_send_lock` 串行 + 短写检查 |
+
+**根因在设备端，不在主机分块**：`docs/ch-display.md §2.2` 已确认
+“设备端把 payload 直接当帧缓冲用”，没有双缓冲/vsync 命令。1 MB 帧在 USB 上
+要 **30 ms 左右**（≈35 MB/s），而 640×400 面板刷新周期约 16.7 ms（60 Hz），
+所以一次 USB 写入必然跨约 1–2 次面板扫描；主机只能缩短这个窗口，不能消除。
+
+**本轮修法：LCD 整帧发送时暂停 UVC 异步读。**
+`LcdSink` 在 `send_packet()` 前后调用 `pause_reader()/resume_reader()`：
+先让在途 URB 排空（~6 ms），LCD 独占总线发送，再恢复 UVC。实测：
+
+| 场景（10 fps 预览） | 单帧发送窗口 | LCD 实际 fps | 采集 |
+|---|---|---|---|
+| 旧：同步 UVC + 无暂停 | 40–56 ms | 10.0 | 13.0–13.2 |
+| 异步 16 URB + 无暂停（`--no-lcd-pause`） | 37–43 ms | 10.0 | **19.9–21.9** |
+| 异步 16 URB + 暂停（默认） | **32–39 ms** | **10.0** | 16.8–18.4 |
+
+> 暂停把发送窗口再压 5–10 ms，代价是采集少 2–4 fps；`--no-lcd-pause` 可切回。
+> 32–39 ms 已接近原厂 App 抓包的“单帧约 30 ms / 35 MB/s”（`ch-display.md §6`），
+> 剩余撕裂是面板无 vsync 的固有限制。早期用 8 URB、无零拷贝交接的实验台曾测到
+> ~150 ms/6.3 fps，那是 CPU/拷贝瓶颈，不是当前实现。
+
+**“把预览从 10 提到 15–20 能否减少撕裂？”**
+不能减少**单帧**的撕裂窗口：实测 5/10/15/20 fps 时发送窗口都是 29–37 ms。
+提高预览帧率只是让画面更新更频繁（运动更顺），代价是暂停占空比变大、
+采集 fps 下降（10→15→20 fps 时采集 18→14→12 fps）。**建议 10 fps**；
+如果要更顺的相机画面，用 5 fps 预览换 23.7 fps 采集。
+
+**没有采用的方案**：把 1 MB 帧拆成 16 KiB 分块穿插发送——主机侧本来就不分块，
+拆块只会让设备更早看到半帧，撕裂更严重；`UsbGate` 已经保证控制请求不会插入。
 
 ---
 
@@ -652,7 +775,8 @@ Pi Zero 2 W 实测（2026-11-22，`2e09:0030`，`--detach`，mediamtx 常驻）�
 10. **固件半死时 UVC 一定 0 帧**，而控制面/状态查询都正常。别改代码，先按
     [ch-firmware.md §7](ch-firmware.md#7-半死现象与恢复-sop) 重灌。
 11. **1080p 档位**：净荷 3,110,400 B；30 fps 就是 93 MB/s，远超 USB 2.0 HS 的实际上限，
-    还要和投屏抢带宽。720p 已实测（§7.4，~17–19 fps）；1080p 未实测，标【未】。
+    还要和投屏抢带宽。异步 16 URB 实测 1080p 43.64 MB/s / **14.0 fps**（§7.5.1），
+    说明管道能过 41.5 MB/s；1080p30 不可达。
 12. **厂商宣称的 800 万像素拍照 / 720p 录像不是这条 UVC 流**（见 [apk-versions.md §6](apk-versions.md#6-代码功能差异184--237)），
     很可能走另一条 vendor 通道，未逆向。
 13. **不要用 App 文档里的零基 idx 当 `bFrameIndex`**：720p 是 frame **3**，
@@ -671,4 +795,10 @@ Pi Zero 2 W 实测（2026-11-22，`2e09:0030`，`--detach`，mediamtx 常驻）�
       对照实验发/不发都能出流，见 §2.4）。
 - [ ] 相机自动对焦 / 曝光控制（2.3.7 有 `nativeGetmAutoFocus`，UVC PU 控制未试）。
 - [ ] 8 MP 静像与 720p 录像的数据通道。
-- [ ] 720p30 满帧：需要多 URB 异步读或内核 uvcvideo（当前同步 pyusb 上限 ~26 MB/s）。
+- [x] 720p30 满帧（2026-11-22 晚）：异步 16 URB，单路 29.7–30.7 fps /
+      40.6–42.4 MB/s；双路 10 fps 预览 17.5–18.4 fps，见 §7.5。
+- [x] 眼镜预览撕裂（2026-11-22 晚）：主机侧整帧/串行确认；LCD 发送时暂停
+      UVC，发送窗口 40–56 ms → 29–39 ms；剩余为设备端无 vsync，见 §7.6。
+- [ ] 设备端双缓冲/局部刷新命令（本轮未发现；需继续 RE 固件 LCD 接收路径）。
+- [ ] 双路 30 fps 采集 + 10 fps 预览：当前受 CPython GIL 限制（python ~108%），
+      若需要，考虑把 LCD 渲染/发送移出 Python 进程或改 C 扩展。

@@ -397,7 +397,34 @@ class FnButton(private val longMs: Long = 900) {
 > `lifecycleScope.launch(Dispatchers.IO) { while (active) { ...; delay(300) } }`，
 > 别在主线程轮询。
 
-### 7.4 先使能传感器，否则 IMU 全 0
+### 7.4 本仓库 Python 实现（2026-11-22）
+
+`linux/glxss/hid.py` 的 `FnWatcher` 把上面的 Kotlin 状态机做成纯逻辑，并保留
+原厂的“连续第 4 个按下包”语义，同时加 0.9 s 时间阈值（100 ms 轮询时第 4 包
+只有 0.3 s，不能只看包数）：
+
+```python
+from glxss import hid
+
+watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+for event in watcher.feed(report):        # 每个 28 B 报告喂一次
+    if event.kind == "click":
+        print("单击", event.duration, event.packets)
+    elif event.kind == "long":
+        print("长按", event.duration, event.packets)
+```
+
+`pipeline.LevelPoller` 在独立线程里按 `--hid-poll`（默认 100 ms）读报告、
+更新水平仪，并把按键事件放进队列；`stream.Streamer` 主循环只 `drain_events()`，
+**绝不在 UVC 读线程里发 USB 控制请求**。控制请求和 LCD bulk OUT 共用
+`usb.UsbGate`，所以 HID 轮询既不会插进 1 MB LCD 帧，也不会阻塞 UVC 读流。
+
+`pi/stream.py` 的绑定：单击 = 眼镜显示 HUD ↔ camera preview；长按 = RTSP
+推流开/关；事件写 `[stream] Fn 按键：…` 日志，并可用 `glxss ctl status`
+查看 `显示/RTSP/按键`。没有硬件时用 `glxss ctl button click|long` 注入同一
+事件队列做端到端测试。
+
+### 7.5 先使能传感器，否则 IMU 全 0
 
 ```kotlin
 fun enableSensors(conn: UsbDeviceConnection) {

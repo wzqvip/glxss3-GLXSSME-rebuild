@@ -81,8 +81,26 @@ def build_parser() -> argparse.ArgumentParser:
                    help="同时提供 MJPEG HTTP 的端口（0=关闭）")
     p.add_argument("--mjpeg-fps", type=float, default=10.0, help="MJPEG 帧率上限")
     p.add_argument("--mjpeg-quality", type=int, default=70, help="MJPEG 质量 10-95")
+    p.add_argument("--async-urb", type=int, default=16,
+                   help="异步 URB 数（0=同步 16 KiB 读；16 可在 Pi 上稳定 720p 30fps）")
+    p.add_argument("--async-timeout", type=int, default=1000,
+                   help="单个异步 URB 超时毫秒（默认 1000）")
+    p.add_argument("--hid-poll", type=float, default=0.1,
+                   help="HID/Fn 轮询间隔秒（默认 0.1；设备报告周期 300ms）")
+    p.add_argument("--no-fn", dest="fn_keys", action="store_false", default=True,
+                   help="禁用 Fn 按键（单击切显示 / 长按切 RTSP）")
+    p.add_argument("--fn-long-press", type=float, default=0.9,
+                   help="Fn 长按阈值秒（默认 0.9，且至少 4 个按下包）")
+    p.add_argument("--fn-long-packets", type=int, default=4,
+                   help="Fn 长按所需连续按下包数（默认 4）")
+    p.add_argument("--ctl-socket", default=None,
+                   help="控制 socket 路径（默认 glxss 的默认路径；--no-ctl 关闭）")
+    p.add_argument("--no-ctl", action="store_true",
+                   help="不启动控制 socket（只靠状态行/日志）")
     p.add_argument("--mirror-fps", type=float, default=0.0,
-                   help="投到眼镜屏的帧率（0=关；开启会占用 LCD 接口，和 HUD 冲突）")
+                   help="启动即投眼镜屏的帧率（0=不投，Fn 单击打开）")
+    p.add_argument("--preview-fps", type=float, default=0.0,
+                   help="Fn 打开眼镜预览时用的帧率（0=mirror-fps 或 10）")
     p.add_argument("--mirror-rotate", type=int, choices=(0, 180), default=0,
                    help="眼镜预览旋转：0=正常 / 180=画面上下颠倒时用")
     p.add_argument("--mirror-fit", default="fit",
@@ -91,6 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
                    default=True, help="眼镜预览叠水平仪（读 HID 加速度计，默认开）")
     p.add_argument("--no-mirror-level", dest="mirror_level", action="store_false",
                    help="不读 HID，只画三分线 + 中心准星")
+    p.add_argument("--no-lcd-pause", action="store_true",
+                   help="LCD 发送时不暂停 UVC 异步读（对照用；会加大撕裂窗口）")
     p.add_argument("--api-url", default="auto",
                    help="mediamtx API（用于实测码率）；auto=本机推流时用 :9997，否则关闭")
     p.add_argument("--stats-interval", type=float, default=2.0, help="统计打印间隔（秒）")
@@ -133,6 +153,14 @@ def run_check(config: StreamConfig) -> int:
         if stream is not None and getattr(stream, "negotiated_fallback", False):
             print("[check] 警告：1280×720 协商失败，已回退 %dx%d（画面仍是裁切视角）"
                   % (frame.width, frame.height))
+        async_stats = getattr(source, "async_stats", None)
+        if callable(async_stats):
+            info = async_stats() or {}
+            if info:
+                print("[check] 异步 URB：%d 个在途/%d B，已读 %.1f MB，错误 %d，暂停 %d 次"
+                      % (info.get("urbs", 0), info.get("chunk", 0),
+                         info.get("bytes", 0) / 1e6, info.get("errors", 0),
+                         info.get("pauses", 0)))
     finally:
         source.close()
     print("[check] OK")
