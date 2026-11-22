@@ -97,6 +97,8 @@ class MainActivity : ComponentActivity() {
     private var fillMode by mutableStateOf(com.wzqvip.glxsscast.cast.CastService.MODE_CROP)
     private var showUvc by mutableStateOf(false)
     private var busy by mutableStateOf(false)
+    private var rollIdx by mutableStateOf(0)
+    private val ROTATE_VALUES = intArrayOf(0, 2, 4, 6, 8, 10, 12, 14)
 
     // ---- 画面调整 ----
     private var zoom by mutableStateOf(1f)
@@ -1196,6 +1198,24 @@ class MainActivity : ComponentActivity() {
                             },
                             modifier = Modifier.weight(1f)
                         ) { Text("断开") }
+
+                    // 实验项：改 roll 会让画面翻转，只有拔插眼镜能恢复 —— 所以放在最底下
+                    Text(
+                        "实验项：改了 roll 会导致画面上下翻转，需拔插眼镜恢复",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Button(
+                        onClick = {
+                            usb.connection?.let { c ->
+                                rollIdx = (rollIdx + 1) % ROTATE_VALUES.size
+                                val r = ROTATE_VALUES[rollIdx]
+                                status = if (LcdControl.setRoll(c, r)) "roll=$r 已发送（$rollIdx/${ROTATE_VALUES.size-1}）" else "roll 发送失败"
+                            } ?: run { status = "未连接" }
+                        },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("显示翻转（roll=" + ROTATE_VALUES[rollIdx] + "）") }
                     }
                     Row(
                         Modifier.fillMaxWidth(),
@@ -1453,6 +1473,8 @@ class MainActivity : ComponentActivity() {
                             enabled = usb.isOpen && !busy,
                             modifier = Modifier.weight(1f)
                         ) { Text("读取状态") }
+
+
                         Button(
                             onClick = { readProductInfo() },
                             enabled = usb.isOpen && !busy,
@@ -1794,3 +1816,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
+
+

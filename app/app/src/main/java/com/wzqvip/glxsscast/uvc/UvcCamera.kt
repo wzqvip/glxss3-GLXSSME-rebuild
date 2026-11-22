@@ -407,6 +407,7 @@ class UvcCamera(private val ctx: Context) {
             }
         }
 
+
         // 3) claim + 切 alt setting
         val vsOk = UsbGate.io("claim:vs") { c.claimInterface(foundAlt, true) }
         if (!vsOk) {
@@ -1364,6 +1365,8 @@ class UvcCamera(private val ctx: Context) {
         selectedOption = null
     }
 }
+
+
 
 
 

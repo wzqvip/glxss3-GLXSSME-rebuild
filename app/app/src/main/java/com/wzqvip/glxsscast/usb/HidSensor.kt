@@ -61,8 +61,8 @@ class HidSensor(private val link: UsbLink) {
             val gyroScale = intArrayOf(250, 500, 1000, 2000)[gyroFsr.coerceIn(0, 3)] / 32768.0
             return String.format(
                 Locale.US,
-                "lux=%d · 温度=%.1f°C · acc=(%.2f, %.2f, %.2f)g · gyro=(%.0f, %.0f, %.0f)°/s · af=%d caf=%d",
-                lux, temperatureC,
+                "按键=%s(0x%02x) · lux=%d · 温度=%.1f°C · acc=(%.2f, %.2f, %.2f)g · gyro=(%.0f, %.0f, %.0f)°/s · af=%d caf=%d",
+                if (keyStatus == 1) "按下" else "松开", keyCode, lux, temperatureC,
                 acc[0] * accScale, acc[1] * accScale, acc[2] * accScale,
                 gyro[0] * gyroScale, gyro[1] * gyroScale, gyro[2] * gyroScale,
                 afResult, cafFlag
@@ -299,3 +299,5 @@ class HidSensor(private val link: UsbLink) {
         }
     }
 }
+
+
