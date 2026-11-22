@@ -554,6 +554,84 @@ def bulk_read(dev, ep_addr: int, size: int, timeout: int = 5000) -> bytes:
         raise GlxssError(usb_error_hint(exc, "bulk IN 0x%02x" % ep_addr)) from exc
 
 
+# ---------------------------------------------------------------------------
+# alt setting / 端点复位
+# ---------------------------------------------------------------------------
+USB_REQ_SET_INTERFACE = 0x0B
+USB_REQ_CLEAR_FEATURE = 0x01
+USB_FEATURE_ENDPOINT_HALT = 0x00
+
+
+def set_alt(dev, intf, alt: Optional[int] = None, timeout: int = 2000,
+            verbose: bool = False) -> bool:
+    """切换接口 alt setting，等价于 Android 的 `UsbDeviceConnection.setInterface`。
+
+    本设备 VS 只有一个 alt=0，但**仍然要发**：SET_INTERFACE 会让设备复位端点
+    数据翻转/HALT 状态。Android 每次打开都发（alt=0 也发、返回 false 也继续），
+    Pi 侧漏掉它就会出现「commit 成功但 bulk IN 一个字节都不来」。
+
+    注意 pyusb 1.2 **没有** `Device.set_interface`（老代码调它只会抛
+    AttributeError 被吞掉）；正确入口是
+    `Device.set_interface_altsetting(interface, alternate_setting)`
+    → libusb_set_interface_alt_setting → usbfs SETINTERFACE。
+    再不行退回标准控制请求 bmRequestType=0x01 / bRequest=0x0B。
+    """
+    number = int(getattr(intf, "bInterfaceNumber", intf))
+    if alt is None:
+        alt = int(getattr(intf, "bAlternateSetting", 0) or 0)
+    try:
+        dev.set_interface_altsetting(number, int(alt))
+        if verbose:
+            print("  SET_INTERFACE if%d alt=%d ok" % (number, int(alt)))
+        return True
+    except AttributeError:
+        pass
+    except Exception as exc:
+        if verbose:
+            print("  SET_INTERFACE if%d alt=%d 失败: %s（改试控制请求）" % (
+                number, int(alt), exc))
+    try:
+        dev.ctrl_transfer(0x01, USB_REQ_SET_INTERFACE, int(alt), number, 0,
+                          timeout=timeout)
+        if verbose:
+            print("  SET_INTERFACE(ctrl) if%d alt=%d ok" % (number, int(alt)))
+        return True
+    except Exception as exc:
+        if verbose:
+            print("  SET_INTERFACE(ctrl) if%d alt=%d 失败: %s（继续）" % (
+                number, int(alt), exc))
+        return False
+
+
+def clear_halt(dev, ep_addr: int, timeout: int = 1000, verbose: bool = False) -> bool:
+    """CLEAR_FEATURE(ENDPOINT_HALT)，wValue=0 / wIndex=端点地址。
+
+    上一次被取消的 bulk IN 结束时设备可能把 0x81 留在 HALT 状态，下一次
+    commit 之后一个字节都不来（Android 在 stop() 里同样清一次）。
+    """
+    try:
+        dev.clear_halt(ep_addr)
+        if verbose:
+            print("  CLEAR_FEATURE(HALT) ep=0x%02x ok" % ep_addr)
+        return True
+    except AttributeError:
+        pass
+    except Exception as exc:
+        if verbose:
+            print("  CLEAR_FEATURE(HALT) ep=0x%02x: %s（改试控制请求）" % (
+                ep_addr, exc))
+    try:
+        dev.ctrl_transfer(0x02, USB_REQ_CLEAR_FEATURE, USB_FEATURE_ENDPOINT_HALT,
+                          ep_addr, 0, timeout=timeout)
+        if verbose:
+            print("  CLEAR_FEATURE(HALT,ctrl) ep=0x%02x ok" % ep_addr)
+        return True
+    except Exception as exc:
+        if verbose:
+            print("  CLEAR_FEATURE(HALT,ctrl) ep=0x%02x 失败: %s" % (ep_addr, exc))
+        return False
+
+
 def open_normal(detach: bool = False, verbose: bool = False,
                 claim: Sequence[int] = (IFACE_LCD,)):
     """便捷函数：找正常模式设备并 claim 指定接口，返回 (dev, session)。"""

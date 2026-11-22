@@ -135,14 +135,20 @@ class MonitorSource(ImageSource):
                 stream.set_dimensions(uvc.DEFAULT_WIDTH, uvc.DEFAULT_HEIGHT)
                 frame_size = uvc.DEFAULT_WIDTH * uvc.DEFAULT_HEIGHT * 3 // 2
                 try:
-                    stream.negotiate(fps=camera_fps, max_frame=frame_size)
+                    stream.negotiate(
+                        format_index=uvc.DEFAULT_FORMAT_INDEX,
+                        frame_index=uvc.DEFAULT_FRAME_INDEX,
+                        fps=camera_fps, max_frame=frame_size)
                 except GlxssError as exc:
                     if camera_fps is None:
                         raise
                     if verbose:
-                        print("  UVC %.1f fps 协商失败（%s），改用设备默认帧率" % (
+                        print("  UVC %.1f fps 协商失败（%s），改用默认帧率" % (
                             camera_fps, str(exc).splitlines()[0]))
-                    stream.negotiate(max_frame=frame_size)
+                    stream.negotiate(
+                        format_index=uvc.DEFAULT_FORMAT_INDEX,
+                        frame_index=uvc.DEFAULT_FRAME_INDEX,
+                        max_frame=frame_size)
         except Exception:
             if stream is not None:
                 try:

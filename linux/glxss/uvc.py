@@ -39,6 +39,15 @@ DEFAULT_HEIGHT = 480
 DEFAULT_FRAME_SIZE = DEFAULT_WIDTH * DEFAULT_HEIGHT * 3 // 2  # 460800
 DEFAULT_INTERVAL = 333333  # 100 ns 单位 → 30 fps
 DEFAULT_MAX_PAYLOAD = 16384
+# 与 Android UvcCamera 实测一致：bFormatIndex=1（YV12）、bFrameIndex=4（640×480@30）。
+# 不能沿用 GET_CUR 的当前帧号：设备状态在会话之间残留，半坏状态（frame=1 1080p +
+# maxPayload=GET_MAX 全局上限）下 probe/commit 都会成功但 bulk IN 一个字节都不来。
+DEFAULT_FORMAT_INDEX = 1
+DEFAULT_FRAME_INDEX = 4
+# 原厂 libuvc：frameBufferSize = dwMaxVideoFrameSize + 22 = 460822。
+# 一次 bulk 传输正好一整帧（460800 + 12 B payload header），既不会横跨两帧，
+# 也不会像 64 KB 缓冲那样把帧头切碎。
+URB_SLACK = 22
 
 
 def _require_numpy() -> None:
@@ -219,39 +228,66 @@ class UvcStream:
         self._frame_index = 0
         self.session = None
         self.vc = None
-        self.urb_size = DEFAULT_MAX_PAYLOAD + 32
+        self.hid = None
+        self.hid_owned = False
+        self.urb_size = DEFAULT_FRAME_SIZE + URB_SLACK
 
     @classmethod
     def open(cls, dev, session, timeout: int = 5000, verbose: bool = False) -> "UvcStream":
+        """claim 接口并切 alt，顺序逐行对齐 Android `UvcCamera.prepare()`：
+
+        1. VC(if0) force claim；
+        2. **HID(if2) force claim**（原厂/Android 都做；不 claim 时部分固件不出流）；
+        3. VS(if1) force claim；
+        4. `SET_INTERFACE(VS alt)` —— **即使 alt=0、即使返回失败也发**；
+        5. 对 0x81 发 CLEAR_FEATURE(HALT)，清掉上一次残留的 halt。
+        """
         vc, vs, ep = usb.pick_uvc(dev)
+        hid = usb.find_interface(dev, usb.IFACE_HID)
         if vc is not None:
             session.claim_interface(vc, label="UVC VC")
+        # HID 通常已经被 HUD 主循环 claim（同一条连接）；只记录“是不是我们 claim 的”，
+        # close 时不要把上层还要用的 HID 一起 release（Android 共用连接时也不 release）。
+        claimed_numbers = {int(i.bInterfaceNumber) for i in session.claimed}
+        hid_owned = hid is not None and int(hid.bInterfaceNumber) not in claimed_numbers
+        if hid is not None:
+            session.claim_interface(hid, label="HID")
         session.claim_interface(vs, label="UVC VS")
-        if vs.bAlternateSetting != 0:
-            try:
-                dev.set_interface(vs.bInterfaceNumber, vs.bAlternateSetting)
-            except Exception as exc:
-                if verbose:
-                    print("  set_interface(%d, alt=%d) 失败（继续）: %s" % (
-                        vs.bInterfaceNumber, vs.bAlternateSetting, exc))
+        # pyusb 没有 Device.set_interface；走 set_interface_altsetting（见 usb.set_alt）。
+        usb.set_alt(dev, vs, vs.bAlternateSetting, verbose=verbose)
         stream = cls(dev, vs, ep, timeout=timeout, verbose=verbose)
         stream.session = session
         stream.vc = vc
+        stream.hid = hid
+        stream.hid_owned = hid_owned
+        usb.clear_halt(dev, ep.bEndpointAddress, verbose=verbose)
         if verbose:
             print("  VC: %s" % ("if=%d" % vc.bInterfaceNumber if vc is not None else "未发现"))
+            print("  HID: %s" % ("if=%d" % hid.bInterfaceNumber if hid is not None else "未发现"))
             print("  VS: if=%d alt=%d ep=0x%02x" % (
                 vs.bInterfaceNumber, vs.bAlternateSetting, ep.bEndpointAddress))
         return stream
 
     def close(self) -> None:
-        """停流（alt=0）并释放 VC/VS；可重复调用。"""
+        """停流（alt=0）+ 清 halt，再释放 VS/VC/HID；可重复调用。
+
+        顺序照 Android `UvcCamera.stop()`：停读 → setInterface(alt0) →
+        CLEAR_FEATURE(ENDPOINT_HALT) → releaseInterface。
+        """
         try:
-            self.dev.set_interface(self.vs.bInterfaceNumber, 0)
+            usb.set_alt(self.dev, self.vs, 0, verbose=self.verbose)
+        except Exception:
+            pass
+        try:
+            usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
         except Exception:
             pass
         session = self.session
         if session is not None:
-            for intf in (self.vs, self.vc):
+            release = [self.vs, self.vc]
+            if self.hid_owned:
+                release.append(self.hid)
+            for intf in release:
                 if intf is not None:
                     session.release_interface(intf)
         self.session = None
@@ -265,18 +301,20 @@ class UvcStream:
                             data, timeout)
 
     def get_probe(self, timeout: int = 5000) -> Probe:
+        """GET_CUR(probe)；失败再试 GET_DEF，与 Android 的兜底顺序一致。"""
         last_error = None
-        for length in (34, 26):
-            try:
-                data = self._ctrl_in(UVC_GET_CUR, UVC_VS_PROBE, length, timeout)
-            except GlxssError as exc:
-                last_error = exc
-                continue
-            if len(data) >= 26:
-                return Probe.parse(data)
-            last_error = "只返回 %d 字节" % len(data)
+        for request in (UVC_GET_CUR, UVC_GET_DEF):
+            for length in (34, 26):
+                try:
+                    data = self._ctrl_in(request, UVC_VS_PROBE, length, timeout)
+                except GlxssError as exc:
+                    last_error = exc
+                    continue
+                if len(data) >= 26:
+                    return Probe.parse(data)
+                last_error = "只返回 %d 字节" % len(data)
         raise GlxssError(
-            "GET_CUR(probe) 失败：%s\n"
+            "GET_CUR/GET_DEF(probe) 失败：%s\n"
             "  * 确认没有其他 App 占用摄像头；\n"
             "  * Linux 上 uvcvideo 会占住 VS，需要 --detach；\n"
             "  * Windows 需要将 UVC 接口绑定到 WinUSB（Zadig）。" % (last_error,))
@@ -287,22 +325,46 @@ class UvcStream:
                   max_payload: Optional[int] = None,
                   timeout: Optional[int] = None) -> Probe:
         timeout_ms = timeout or self.timeout
-        current = self.get_probe(timeout_ms)
+        try:
+            current = self.get_probe(timeout_ms)
+        except GlxssError as exc:
+            # Android 同样：GET_CUR/GET_DEF 都失败时用全 0 基底继续 probe。
+            # 设备半死/被占用时，SET_CUR 有时仍然能成功并让流恢复。
+            current = Probe.parse(bytes(34))
+            if self.verbose:
+                print("  GET_CUR/GET_DEF(probe) 失败，改用全 0 基底: %s" %
+                      (str(exc).splitlines()[0],))
         if self.verbose:
             print("  GET_CUR(probe):")
             print("    " + current.format().replace("\n", "\n    "))
-        interval = current.interval or DEFAULT_INTERVAL
+        interval = DEFAULT_INTERVAL
         if fps is not None:
             if fps <= 0:
                 raise GlxssError("--fps 必须 > 0")
             interval = max(1, int(round(1e7 / fps)))
-        target_frame = current.max_frame or (self.width * self.height * 3 // 2)
+        # 默认档位写死 Android 实测值（1=YV12 / 4=640×480 / 16384 payload），
+        # 不再继承 GET_CUR 里的 bFormatIndex/bFrameIndex/dwMaxPayloadTransferSize。
+        # 设备会把上一次 commit 的档位留到下一次上电；半坏状态下 GET_CUR 会回
+        # frame=1（1080p）+ maxPayload=0x012c7f8c（GET_MAX 全局上限 19693452），
+        # 这时无论 URB 多大都收不到数据 —— 必须显式覆盖回去。
+        target_format = DEFAULT_FORMAT_INDEX if format_index is None else int(format_index)
+        frame_bytes = int(max_frame or DEFAULT_FRAME_SIZE)
+        if frame_index is None:
+            # 640×480 默认档位固定用 4；换成别的分辨率（--size）时仍尊重设备当前帧号，
+            # 避免把 720p/1080p 强行写成 4。
+            if frame_bytes == DEFAULT_FRAME_SIZE:
+                target_frame = DEFAULT_FRAME_INDEX
+            else:
+                target_frame = int(current.frame_index or DEFAULT_FRAME_INDEX)
+        else:
+            target_frame = int(frame_index)
+        payload = int(max_payload or DEFAULT_MAX_PAYLOAD)
         descriptor = current.descriptor(
-            format_index=format_index,
-            frame_index=frame_index,
+            format_index=target_format,
+            frame_index=target_frame,
             interval=interval,
-            max_frame=max_frame or target_frame,
-            max_payload=max_payload or current.max_payload or DEFAULT_MAX_PAYLOAD,
+            max_frame=frame_bytes,
+            max_payload=payload,
         )
         send_len = 34 if len(descriptor) >= 34 else 26
         try:
@@ -328,15 +390,14 @@ class UvcStream:
         self.probe = probe
         if not self.width or not self.height:
             self.width, self.height = DEFAULT_WIDTH, DEFAULT_HEIGHT
-        # 以当前档位为准；CLI 可显式传 max_frame 覆盖。
-        self.frame_size = max_frame or probe.max_frame or (self.width * self.height * 3 // 2)
-        # 每个 URB 只携带 maxPayload 字节；按它分配读缓冲，避免每次 read 都申请
-        # 460 KB（monitor 每秒要读几十次）。
-        # 留 64 KiB 余量：不同设备/固件的 dwMaxPayloadTransferSize 口径不完全一致，
-        # 读缓冲偏大只会多一次分配，偏小会截断 URB 头导致整帧错位。
-        payload = int(probe.max_payload or DEFAULT_MAX_PAYLOAD)
-        self.urb_size = min(max(65536, payload + 32),
-                            max(1024, self.frame_size + 22))
+        self.frame_size = frame_bytes
+        # URB 必须是一整帧：460800 + 22 = 460822（原厂 frameBufferSize）。
+        # 不能用 dwMaxPayloadTransferSize 定读缓冲，更不能退化成 64 KB ——
+        # 64 KB 读会把 12 B 帧头切碎，设备侧也按“非整帧 URB”处理。
+        self.urb_size = int(self.frame_size) + URB_SLACK
+        if probe.frame_index != target_frame and self.verbose:
+            print("  [UVC] 警告：设备回读 bFrameIndex=%d（期望 %d）" % (
+                probe.frame_index, target_frame))
         return probe
 
     def set_dimensions(self, width: int, height: int) -> None:

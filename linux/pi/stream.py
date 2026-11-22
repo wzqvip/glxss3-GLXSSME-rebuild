@@ -58,11 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-rtsp", action="store_true", help="不推 RTSP（只做 MJPEG/预览）")
     p.add_argument("--size", default="640x480", help="采集分辨率，宽x高（YUV420 需偶数）")
     p.add_argument("--format-index", type=int, default=None,
-                   help="UVC bFormatIndex（默认沿用设备；这台相机一般 1）")
+                   help="UVC bFormatIndex（默认 1=YV12，Android 实测值）")
     p.add_argument("--frame-index", type=int, default=None,
-                   help="UVC bFrameIndex（默认沿用设备；读不到帧时试 4=640x480）")
+                   help="UVC bFrameIndex（默认 4=640x480@30；不要再沿用设备残留值）")
     p.add_argument("--fps", type=float, default=20.0,
-                   help="目标帧率；相机实际 20-25，Pi 上建议 20")
+                   help="目标帧率；同时作为 UVC 协商 interval（30→333333）。"
+                        "相机实际 20-25，Pi 上建议 20")
     p.add_argument("--bitrate", default="1500k", help="H.264 码率（如 1500k、2M）")
     p.add_argument("--maxrate", default="", help="可选：最大码率（CBR 时和 --bitrate 相同）")
     p.add_argument("--bufsize", default="", help="可选：码率缓冲（如 3000k）")

@@ -222,14 +222,15 @@ Yuv.yuv420ToArgb(argb, src, uOff, vOff, w, h)
 1. 找设备 2E09:0030，拿 USB 权限
 2. openDevice（可复用 UsbLink 的连接）
 3. claim if0 (VC)            ← 与原厂 libuvc 对齐；部分设备要求先有 VC
-4. claim if1 (VS alt=0)
-5. setInterface(VS alt=0)    ← 返回 false 也可能已生效
-6. 解析 rawDescriptors → VS_FORMAT_* / VS_FRAME_*
-7. GET_CUR(probe) 拿基底 → 填 fmt/frame/interval/maxFrame/maxPayload
-8. SET_CUR(probe) → GET_CUR(probe) 读回 → SET_CUR(commit)
-9. 分配 transferBuf = frameSize + 22
-10. 线程循环 bulkTransfer(0x81)，按 §6 组帧
-11. 停止：setInterface(alt0) → releaseInterface → close（若连接是自己开的）
+4. claim if2 (HID)           ← 必须；不 claim 时部分固件不出流（Android 也做）
+5. claim if1 (VS alt=0)
+6. setInterface(VS alt=0)    ← 返回 false 也可能已生效；**alt=0 也要发**
+7. 解析 rawDescriptors → VS_FORMAT_* / VS_FRAME_*
+8. GET_CUR(probe) 拿基底 → 填 fmt/frame/interval/maxFrame/maxPayload
+9. SET_CUR(probe) → GET_CUR(probe) 读回 → SET_CUR(commit)
+10. 分配 transferBuf = frameSize + 22
+11. 线程循环 bulkTransfer(0x81)，按 §6 组帧
+12. 停止：setInterface(alt0) → CLEAR_FEATURE(ENDPOINT_HALT, 0x81) → releaseInterface → close
 ```
 
 ### 5.1 选接口与端点
@@ -347,6 +348,72 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 | 并发 | 投屏 25 fps 同时 UVC 24.6 fps（实测不互斥） |
 | 原始抓包 | 30 个 URB × (460812 + 4 B 长度前缀) = 13,824,480 B，与设备文件大小一致 |
 
+### 7.1 Linux / Pi 实测（2026-11-22，Raspberry Pi Zero 2 W + pyusb 1.2.1）
+
+Android 侧的打开方式在 Pi 上**必须显式写回**，否则会踩到下面几个坑（均已改入
+`linux/glxss/uvc.py` / `linux/glxss/usb.py`）：
+
+| 坑 | 实测现象 | 修法 |
+|---|---|---|
+| GET_CUR 残留档位 | `pi/stream.py --check --fps 30` 回读 `bFrameIndex=1`（1080p）、`dwMaxPayloadTransferSize=19693452`（GET_MAX 全局上限）；bulk IN 直接 `[Errno 110]` | probe 固定写 `format=1 / frame=4 / interval=333333 / maxFrame=460800 / maxPayload=16384`，不再继承 GET_CUR |
+| URB 尺寸 | 旧代码把读缓冲算成 65536（`min(64 KiB, frameSize+22)`），不是原厂的 460822 | 固定 `frameSize + 22 = 460822`，一次 bulk 正好一整帧 |
+| SET_INTERFACE 从未发出 | pyusb 1.2 **没有** `Device.set_interface`：旧代码调用抛 AttributeError 被吞成“失败（继续）”，等于没发；而 Android 每次都发（alt=0 也发） | `usb.set_alt()` 用 `Device.set_interface_altsetting()`，失败再退回 `0x01/0x0B` 标准控制请求 |
+| 缺 HID claim | Pi 只 claim 了 VC/VS | `UvcStream.open()` 按 **VC(if0) → HID(if2) → VS(if1)** claim（与 `UvcCamera.prepare()` 逐行一致），stop 时对 0x81 补 CLEAR_FEATURE(HALT) |
+
+Pi 上已验证可用的并发面（同一个 handle，控制面走 `usb.UsbGate` 串行）：
+
+- HID 轮询 `0xA1/0x16`（28 B）正常，实测返回 `00 71 …`（Fn 键未按）；
+- LCD 初始化（`0xA1/0x03` 开屏 + `0xA1/0x05` 模式 2）与 1 MB bulk OUT 正常，
+  实测约 22–24 MB/s；
+- 两者可与 UVC bulk IN 同时跑（对应 Android 的「投屏 + HID 轮询 + 取流」）。
+
+**实测结论（2026-11-22）：主机侧已对齐，但设备侧仍 0 帧。**
+
+重新插拔（眼镜冷启动 → `03E7:2150` → udev 自动灌 `G25_MainFW_1.9.1.img`，
+md5 `9cea02e4…` 与 APK 内置一致 → `2E09:0030`）之后，新的打开流程实测为：
+
+```
+claim if0 / if2 / if1 全 ok
+SET_INTERFACE if1 alt=0 ok          ← 旧代码从未真正发出
+CLEAR_FEATURE(HALT) 0x81 ok
+GET_CUR(probe) = 01 00 | 01 | 04 | 333333 | … | 460800 | 16384   ← 与 Android 完全一致
+SET_CUR(probe)=34  GET_CUR=34  SET_CUR(commit)=34
+```
+
+但 bulk IN 依旧一个字节都不来（`Errno 110`）。usbmon 证实**不是主机没发**：
+
+```
+S Bi:1:003:1 -115 16384 <        ← usbfs 把 460822 B 请求拆成 16 KiB URB 提交
+C Bi:1:003:1 -2 0                ← 设备一直 NAK，最后被 cancel（不是主机错误）
+```
+
+逐项排查都无效（全部 0 帧）：
+
+| 尝试 | 结果 |
+|---|---|
+| HID `0xA1/0x16` 300 ms + LCD 1 MB 帧并发（复刻 Android） | 0 帧 |
+| `--detach` / 不 detach、`dev.reset()`、CLEAR_HALT | 0 帧 |
+| 厂商 XU `0x21/0x01 0x0d0d 0x0400 = 01` | ACK=1，仍 0 帧 |
+| `0xA1/0x18` 系统复位 → 03E7 → 重灌固件（两次，均写满 1,525,136 B） | 0 帧 |
+| 逐档 probe（frame 1…5）+ commit 4（原厂 libuvc 也逐轮 probe） | 0 帧 |
+| MJPEG（format=2）各帧档 | probe/commit 成功，0 帧 |
+| 原厂顺序：开屏 → 显示模式 **1** → 黑帧 → XU → VC → VS → probe/commit | 0 帧 |
+
+控制面全部健康（版本 `G25_MainFW_1.9.1`、0x04/0x05/0x06 传感器属性、LCD 8 B 状态、
+1 MB bulk OUT 正常），只有**媒体数据面没有数据**——与
+[device-recovery.md §1](device-recovery.md#1-三态判定表30-秒分清) 的 **状态 B
+（固件媒体流水线卡死）** 完全一致；按该文档记录，这种状态下原厂 App 同样 0 帧。
+
+⇒ 结论：Pi 侧打开顺序/参数已不再是阻塞点，剩下的是**设备侧 camera 流水线
+（IMX214）没起来**。还需要一次设备侧确认：同一副眼镜在 Android 上复测
+（若 Android 也 0 帧，就是设备/相机硬件或固件状态，需要更彻底的断电冷却或返修）。
+逐项对照用 `linux/tools/uvc_pi_exp.py`：
+
+```bash
+python3 tools/uvc_pi_exp.py --urb 460822 --frame 4 --interval 333333 --hid --lcd --seconds 10
+python3 tools/uvc_pi_exp.py --urb 65536        # 复现旧实现的 64 KiB 读缓冲
+```
+
 实拍对比（同一时刻）：
 
 | 我们 App（修复后） | 原厂 App |
@@ -373,8 +440,12 @@ ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_COMMIT, ifaceNum, commitSrc, 0,
 3. **不要在未同步时追加数据**。流从帧中间开始时，追加 = 永久错位。
 4. **U/V 顺序**：YV12 是 `Y|V|U`；I420 是 `Y|U|V`。偏色先换这个，不要先怀疑白平衡。
 5. **alt setting 别照抄教程**：本设备 alt=0 就带端点；强行 `setInterface(alt=1)` 可能直接失败。
-6. **claim 顺序**：VC(if0) → VS(if1)；同时 claim HID(if2)（否则后面读版本会 -1，见 [ch-hid.md](ch-hid.md)）。
+   但 **alt=0 的 SET_INTERFACE 也要发**（Android 每次都发，用于复位端点状态）。
+6. **claim 顺序**：VC(if0) → **HID(if2)** → VS(if1)，全部 force claim（Linux 用 `--detach`）。
+   HID 不 claim 时部分固件不出流，且后面读版本会 -1（见 [ch-hid.md](ch-hid.md)）。
 7. **`setInterface` 返回 false 不等于没生效**：日志记录后继续跑，真没数据再排查。
+   Python/pyusb 侧注意：没有 `Device.set_interface`，要用
+   `Device.set_interface_altsetting(iface, alt)`（见 §7.1）。
 8. **Android 的 `bulkTransfer` 用 -1 表示"超时"和"设备错误"两种事**：用耗时区分，
    否则拔线后会变成 100% CPU 热循环（实测 3 秒 1500 万次日志）。
 9. **不要同时开两个 App 抢 UVC**：原厂 App 和我们 App 同时 claim 会互相踢掉 alt，表现为 0 帧。

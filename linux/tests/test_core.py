@@ -517,6 +517,115 @@ class UvcHeaderTests(unittest.TestCase):
         self.assertEqual(frame.rgb().shape, (h, w, 3))
 
 
+class UvcNegotiateTests(unittest.TestCase):
+    """Pi 侧回归：probe 不能沿用 GET_CUR 的残留档位，URB 必须 frameSize+22。"""
+
+    @staticmethod
+    def _poisoned_probe():
+        # 半坏状态：bFrameIndex=1（1080p）、maxPayload=GET_MAX 全局上限。
+        cur = bytearray(34)
+        struct.pack_into("<H", cur, 0, 1)
+        cur[2], cur[3] = 1, 1
+        struct.pack_into("<I", cur, 4, 333333)
+        struct.pack_into("<I", cur, 18, 460800)
+        struct.pack_into("<I", cur, 22, 19693452)
+        return cur
+
+    def test_negotiate_overrides_residual_frame_and_urb(self):
+        state = {"cur": self._poisoned_probe()}
+        writes = []
+
+        class FakeDev:
+            def ctrl_transfer(self, request_type, request, value, index,
+                              data_or_length, timeout=0):
+                if request == uvc.UVC_GET_CUR:
+                    return bytes(state["cur"])
+                if request == uvc.UVC_GET_DEF:
+                    raise RuntimeError("no GET_DEF")
+                payload = bytes(data_or_length)
+                writes.append((value, payload))
+                if value == uvc.UVC_VS_PROBE:
+                    state["cur"] = bytearray(payload.ljust(34, b"\x00"))
+                return len(payload)
+
+        stream = uvc.UvcStream(
+            FakeDev(), SimpleNamespace(bInterfaceNumber=1),
+            SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
+        probe = stream.negotiate(fps=30)
+        self.assertEqual(probe.format_index, 1)
+        self.assertEqual(probe.frame_index, 4)
+        self.assertEqual(probe.interval, 333333)
+        self.assertEqual(stream.frame_size, 460800)
+        self.assertEqual(stream.urb_size, 460822)
+        probe_out = [p for (value, p) in writes if value == uvc.UVC_VS_PROBE][0]
+        self.assertEqual(probe_out[3], 4)                      # bFrameIndex
+        self.assertEqual(struct.unpack_from("<I", probe_out, 22)[0], 16384)
+
+    def test_negotiate_keeps_working_when_get_cur_dies(self):
+        class FakeDev:
+            def ctrl_transfer(self, request_type, request, value, index,
+                              data_or_length, timeout=0):
+                if request in (uvc.UVC_GET_CUR, uvc.UVC_GET_DEF):
+                    raise RuntimeError("stalled")
+                return len(bytes(data_or_length))
+
+        stream = uvc.UvcStream(
+            FakeDev(), SimpleNamespace(bInterfaceNumber=1),
+            SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
+        stream.negotiate(fps=30)  # 不该抛：基底用全 0 也能 commit
+        self.assertEqual(stream.urb_size, 460822)
+
+
+class AltSettingTests(unittest.TestCase):
+    def test_set_alt_uses_set_interface_altsetting(self):
+        class Dev:
+            def __init__(self):
+                self.calls = []
+
+            def set_interface_altsetting(self, number, alt):
+                self.calls.append((number, alt))
+
+        dev = Dev()
+        self.assertTrue(usb.set_alt(
+            dev, SimpleNamespace(bInterfaceNumber=1, bAlternateSetting=0)))
+        self.assertEqual(dev.calls, [(1, 0)])
+
+    def test_set_alt_falls_back_to_control_request(self):
+        class Dev:
+            def __init__(self):
+                self.calls = []
+
+            def set_interface_altsetting(self, number, alt):
+                raise NotImplementedError
+
+            def ctrl_transfer(self, request_type, request, value, index,
+                              data_or_length, timeout=0):
+                self.calls.append((request_type, request, value, index))
+                return 0
+
+        dev = Dev()
+        self.assertTrue(usb.set_alt(
+            dev, SimpleNamespace(bInterfaceNumber=1, bAlternateSetting=0)))
+        self.assertEqual(dev.calls, [(0x01, 0x0B, 0, 1)])
+
+    def test_clear_halt_falls_back_to_control_request(self):
+        class Dev:
+            def __init__(self):
+                self.calls = []
+
+            def clear_halt(self, ep):
+                raise AttributeError("no clear_halt")
+
+            def ctrl_transfer(self, request_type, request, value, index,
+                              data_or_length, timeout=0):
+                self.calls.append((request_type, request, value, index))
+                return 0
+
+        dev = Dev()
+        self.assertTrue(usb.clear_halt(dev, 0x81))
+        self.assertEqual(dev.calls, [(0x02, 0x01, 0, 0x81)])
+
+
 class AesTests(unittest.TestCase):
     def test_nist_aes128_ecb_vector(self):
         key = bytes.fromhex("000102030405060708090a0b0c0d0e0f")

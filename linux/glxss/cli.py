@@ -121,9 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("uvc", help="UVC probe/commit 并读帧（可存 PNG）")
     _add_device_args(p, timeout=5000)
     p.add_argument("--frames", type=int, default=3, help="读几帧（默认 3）")
-    p.add_argument("--format-index", type=int, default=None, help="bFormatIndex（默认沿用设备）")
-    p.add_argument("--frame-index", type=int, default=None, help="bFrameIndex（默认沿用设备）")
-    p.add_argument("--fps", type=float, default=None, help="协商帧率（默认沿用设备）")
+    p.add_argument("--format-index", type=int, default=None,
+                   help="bFormatIndex（默认 1=YV12，Android 实测值）")
+    p.add_argument("--frame-index", type=int, default=None,
+                   help="bFrameIndex（默认 4=640×480@30，Android 实测值）")
+    p.add_argument("--fps", type=float, default=None,
+                   help="协商帧率（默认 333333=30fps）")
     p.add_argument("--width", type=int, default=640, help="帧宽（默认 640）")
     p.add_argument("--height", type=int, default=480, help="帧高（默认 480）")
     p.add_argument("--save", metavar="PNG", help="把第一帧转 RGB 存成 PNG")
@@ -185,8 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="HUD 主进程初始视图（可运行中用 ctl view 切换）")
     p.add_argument("--rec", action="store_true",
                    help="监看模式右上角显示录制红点/时间")
-    p.add_argument("--camera-fps", type=float, default=15.0,
-                   help="UVC 协商帧率（默认 15；发送帧率由 --fps 控制）")
+    p.add_argument("--camera-fps", type=float, default=30.0,
+                   help="UVC 协商帧率（默认 30=Android 实测 interval 333333；发送帧率由 --fps 控制）")
     p.add_argument("--uvc-half", action="store_true",
                    help="UVC 先解 320×240 再放大（Pi Zero 2 W 上更省 CPU/延迟）")
     p.add_argument("--monitor-fit", choices=("cover", "stretch", "fit"),
@@ -222,8 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="启动视图（默认 hud；monitor 需要眼镜 UVC，通常配合 --detach）")
     p.add_argument("--rec", action="store_true",
                    help="监看模式右上角显示录制红点/时间")
-    p.add_argument("--camera-fps", type=float, default=15.0,
-                   help="UVC 协商帧率（默认 15；发送帧率仍由 --fps 控制）")
+    p.add_argument("--camera-fps", type=float, default=30.0,
+                   help="UVC 协商帧率（默认 30=Android 实测 interval 333333；发送帧率仍由 --fps 控制）")
     p.add_argument("--uvc-half", action="store_true",
                    help="UVC 先解 320×240 再放大（更省 CPU/延迟）")
     p.add_argument("--monitor-fit", choices=("cover", "stretch", "fit"),
@@ -861,7 +864,7 @@ def _hud_defaults(args) -> None:
                           ("heading_offset", 0.0), ("listen", False),
                           ("socket", None), ("save_png", None),
                           ("view", "hud"), ("rec", False),
-                          ("camera_fps", 15.0), ("uvc_half", False),
+                          ("camera_fps", 30.0), ("uvc_half", False),
                           ("monitor_fit", "cover"), ("rotate", 0)):
         if not hasattr(args, name):
             setattr(args, name, default)
