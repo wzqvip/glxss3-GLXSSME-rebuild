@@ -763,11 +763,13 @@ def _cast_uvc(args) -> int:
         extra = ""
         if monitor_source is not None:
             monitor_stats = monitor_source.stats_dict()
-            extra = " | uvc %.1f fps 读 %.0f ms 解码 %.0f ms 旧帧 %d" % (
+            extra = " | uvc %.1f fps 读 %.0f ms 解码 %.0f ms 旧帧 %d 错 %d" % (
                 monitor_stats.get("read_fps", 0.0),
                 monitor_stats.get("read_ms", 0.0),
                 monitor_stats.get("decode_ms", 0.0),
-                monitor_stats.get("frames_stale", 0))
+                monitor_stats.get("frames_stale", 0),
+                int(monitor_stats.get("read_errors", 0)) +
+                int(monitor_stats.get("decode_errors", 0)))
         print("[%s] %s%s" % (time.strftime("%H:%M:%S"), stats.line(), extra))
 
     try:
@@ -829,6 +831,11 @@ def _cast_uvc(args) -> int:
             monitor_stats.get("timeouts", 0)))
         if monitor_stats.get("last_error"):
             print("  最近错误: " + str(monitor_stats["last_error"]))
+        if int(monitor_stats.get("frames_ready", 0)) == 0:
+            print("[错误] UVC 没有读到任何完整帧；检查 --detach、摄像头占用和固件状态"
+                  "（probe/commit 成功但 0 帧见 docs/device-recovery.md）。",
+                  file=sys.stderr)
+            return 1
     finally:
         if monitor_source is not None:
             monitor_source.close()

@@ -18,7 +18,7 @@ import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
-from glxss import capture, control, firmware, hid, hud, lcd, monitor, uvc
+from glxss import capture, control, firmware, hid, hud, lcd, monitor, usb, uvc
 from glxss.errors import GlxssError
 from glxss.cli import build_parser
 from glxss.cli import main as cli_main
@@ -276,6 +276,26 @@ class YuvTests(unittest.TestCase):
     def test_size_check(self):
         with self.assertRaises(Exception):
             uvc.yv12_to_rgb(b"\x00" * 10, 8, 8)
+
+
+class UsbHelpersTests(unittest.TestCase):
+    def test_interface_label_does_not_require_configuration(self):
+        class FakeInterface:
+            bInterfaceNumber = 1
+            bAlternateSetting = 0
+            bInterfaceClass = 0x0E
+            bInterfaceSubClass = 0x02
+            bInterfaceProtocol = 0
+
+        text = usb.interface_label(FakeInterface())
+        self.assertIn("if=1", text)
+        self.assertIn("class=0x0e", text)
+
+    def test_usb_gate_is_reentrant(self):
+        gate = usb.UsbGate()
+        with gate:
+            with gate:
+                pass
 
 
 class FastRgbaTests(unittest.TestCase):
