@@ -3,10 +3,12 @@ package com.wzqvip.glxsscast.cast
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.graphics.PixelFormat
 import android.graphics.Point
+import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -21,6 +23,7 @@ import android.view.Display
 import android.view.WindowManager
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
+import com.wzqvip.glxsscast.settings.Prefs
 import com.wzqvip.glxsscast.usb.UsbLink
 import java.nio.ByteBuffer
 
@@ -55,6 +58,10 @@ class CastService : Service() {
         private const val TAG = "CastService"
         private const val CHANNEL_ID = "cast"
         private const val NOTIF_ID = 1001
+        /** 通知动作用的 requestCode（每个 PendingIntent 必须不同） */
+        private const val RC_STOP = 2001
+        private const val RC_MODE = 2002
+        private const val RC_OPEN = 2003
 
         @Volatile var running = false; private set
         @Volatile var frames = 0L; private set
@@ -107,11 +114,12 @@ class CastService : Service() {
     override fun onCreate() {
         super.onCreate()
         usb = UsbLink.get(this)
-        // 服务可能先于 Activity 起来：先从 SharedPreferences 恢复画面调整
-        val sp = getSharedPreferences("prefs", MODE_PRIVATE)
-        zoom = sp.getFloat("zoom", 1f).coerceIn(1f, 2f)
-        offsetX = sp.getFloat("ox", 0f).coerceIn(-1f, 1f)
-        offsetY = sp.getFloat("oy", 0f).coerceIn(-1f, 1f)
+        // 服务可能先于 Activity 起来：先从 SharedPreferences 恢复画面调整/画面模式
+        val prefs = Prefs.get(this)
+        fillMode = prefs.fillMode.coerceIn(0, 2)
+        zoom = prefs.zoom
+        offsetX = prefs.offsetX
+        offsetY = prefs.offsetY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -123,11 +131,19 @@ class CastService : Service() {
                 stopSelf()
             }
             ACTION_SET_MODE -> {
-                val m = intent.getIntExtra(EXTRA_MODE, MODE_CROP)
+                // 通知栏「画面模式」不传 EXTRA_MODE → 循环 适应 → 裁剪 → 拉伸 → 适应
+                val m = if (intent.hasExtra(EXTRA_MODE)) {
+                    intent.getIntExtra(EXTRA_MODE, MODE_CROP).coerceIn(0, 2)
+                } else {
+                    (fillMode + 1) % 3
+                }
                 // 注意：Android 14+ 的 MediaProjection 只能建一个 VirtualDisplay，
                 // 不能重建管线；抓取尺寸固定，模式只在行映射时应用（下一帧生效）。
                 fillMode = m
+                Prefs.get(this).fillMode = m
                 lastError = "画面模式: ${modeName(m)}"
+                updateNotification()
+                if (!running) stopSelf()
             }
             ACTION_RESYNC -> {
                 // 手动重新按当前屏幕方向适配抓取尺寸（DisplayListener 漏掉时兜底）
@@ -147,6 +163,57 @@ class CastService : Service() {
         return START_NOT_STICKY
     }
 
+    /** 通知栏动作的 PendingIntent（FLAG_IMMUTABLE：Android 12+ 必须显式声明可变性） */
+    private fun pending(action: String): PendingIntent {
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        return PendingIntent.getService(
+            this, if (action == ACTION_STOP) RC_STOP else RC_MODE,
+            Intent(this, CastService::class.java).setAction(action), flags
+        )
+    }
+
+    /**
+     * 投屏前台通知：带「停止投屏」「画面模式」两个动作，
+     * 点完不用回 App（PendingIntent → [ACTION_STOP] / [ACTION_SET_MODE]）。
+     */
+    private fun buildNotification(): Notification {
+        val openApp = PendingIntent.getActivity(
+            this, RC_OPEN,
+            Intent().setClassName(packageName, "com.wzqvip.glxsscast.MainActivity")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        fun icon(id: Int): Icon = Icon.createWithResource(this, id)
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("GLXSS3 Cast · 投屏中")
+            .setContentText(
+                "画面模式: ${modeName(fillMode)}" +
+                    if (captureDesc.isNotEmpty()) " · 抓取 $captureDesc" else ""
+            )
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .setOngoing(true)
+            .setContentIntent(openApp)
+            .addAction(
+                Notification.Action.Builder(
+                    icon(android.R.drawable.ic_menu_close_clear_cancel), "停止投屏", pending(ACTION_STOP)
+                ).build()
+            )
+            .addAction(
+                Notification.Action.Builder(
+                    icon(android.R.drawable.ic_menu_crop), "画面模式", pending(ACTION_SET_MODE)
+                ).build()
+            )
+            .build()
+    }
+
+    /** 模式切换后刷新通知文案 */
+    private fun updateNotification() {
+        if (!running) return
+        runCatching {
+            getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, buildNotification())
+        }
+    }
+
     private fun startForegroundCompat() {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL_ID) == null) {
@@ -154,11 +221,7 @@ class CastService : Service() {
                 NotificationChannel(CHANNEL_ID, "投屏", NotificationManager.IMPORTANCE_LOW)
             )
         }
-        val notif: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("GLXSS3 Cast")
-            .setContentText("正在投屏到眼镜")
-            .setSmallIcon(android.R.drawable.ic_menu_view)
-            .build()
+        val notif: Notification = buildNotification()
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(NOTIF_ID, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
@@ -245,6 +308,7 @@ class CastService : Service() {
         running = true
         countWindow = 0
         windowStart = System.currentTimeMillis()
+        updateNotification()
         Log.i(TAG, "casting started mode=$fillMode capture=${captureW}x$captureH")
     }
 

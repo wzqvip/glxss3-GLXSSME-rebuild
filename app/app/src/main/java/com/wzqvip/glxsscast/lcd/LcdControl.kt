@@ -54,16 +54,39 @@ object LcdControl {
     fun setRoll(conn: UsbDeviceConnection, roll: Int): Boolean =
         conn.controlTransfer(REQ_CTRL, 0x02, roll, IFACE_LCD, ByteArray(1), 1, TIMEOUT) > 0
 
-    /** 读状态并解析：width,height,bopen,luminance,rollover（与厂商 LCDInfo 一致） */
+    /**
+     * `0xA1/0x04` 的 8 B 状态。
+     *
+     * 实测样本 `80 02 90 01 01 b4 06 00`（任务给的）与 `80 02 90 01 01 b9 0a 00`（抓包）：
+     * ```
+     * [0..1]  width      LE u16  → 640
+     * [2..3]  height     LE u16  → 400
+     * [4]     bopen      0/1     → 屏是否点亮
+     * [5]     luminance  100..254→ 当前亮度（设置后会同步变化，可作 ACK）
+     * [6..7]  rollover   LE u16  → 旋转值（样本 0x000a=10 / 0x0006=6）
+     * ```
+     * 其余（byte 7 的高字节部分 / 未来固件新增位）一律标 UNKNOWN，不猜语义。
+     */
     data class Status(
         val width: Int,
         val height: Int,
         val screenOpen: Boolean,
         val luminance: Int,
         val roll: Int,
+        /** raw[7]，roll 高字节或保留位；UI 标 UNKNOWN */
+        val reserved: Int,
         val raw: ByteArray
     ) {
         fun hex(): String = raw.joinToString("") { "%02x".format(it) }
+
+        /** 一行完整解析，状态栏直接显示 */
+        fun describe(): String = buildString {
+            append("状态 ${hex()} → 分辨率 ${width}×${height}")
+            append(" · 屏=").append(if (screenOpen) "开" else "关")
+            append(" · 亮度=$luminance")
+            append(" · roll=$roll(byte6..7 LE)")
+            append(" · byte7=0x%02x UNKNOWN".format(reserved))
+        }
     }
 
     fun readStatus(conn: UsbDeviceConnection): Status? {
@@ -76,8 +99,24 @@ object LcdControl {
             screenOpen = u(4) != 0,
             luminance = u(5),
             roll = u(6) or (u(7) shl 8),
+            reserved = u(7),
             raw = b
         )
+    }
+
+    /**
+     * 读 EEPROM 产品信息：`0xA1/0x07`，wValue=0x0100，wIndex=3（LCD），264 B。
+     *
+     * 只读、安全。**不要**发 `0x21/0x06`（写 EEPROM，会改 SN/BOM）。
+     * 返回数据布局见 [ProductInfo]。
+     */
+    fun readProductInfo(conn: UsbDeviceConnection): ProductInfo? {
+        val buf = ByteArray(ProductInfo.TOTAL_LEN)
+        val n = conn.controlTransfer(
+            REQ_CTRL, 0x07, 0x0100, IFACE_LCD, buf, ProductInfo.TOTAL_LEN, TIMEOUT
+        )
+        if (n <= 0) return null
+        return ProductInfo.parse(buf)
     }
 
     /** 自动亮度开关 */

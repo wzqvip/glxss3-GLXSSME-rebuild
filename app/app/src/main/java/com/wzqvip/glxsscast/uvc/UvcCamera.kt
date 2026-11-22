@@ -144,6 +144,28 @@ class UvcCamera(private val ctx: Context) {
         val frames: MutableList<FrameDesc> = mutableListOf()
     )
 
+    /**
+     * 设备描述符里的一个「格式 + 分辨率」档位，UI 下拉用。
+     * [formatIndex] / [frameIndex] 是 UVC bFormatIndex / bFrameIndex（重新选择时要原样写回 probe）。
+     */
+    data class StreamOption(
+        val formatName: String,
+        val mapping: PixelMapping,
+        val formatIndex: Int,
+        val frameIndex: Int,
+        val width: Int,
+        val height: Int,
+        val fps: Float,
+        val maxFrameSize: Int,
+        val interval: Int
+    ) {
+        val label: String
+            get() = "$formatName  ${width}×${height} @${String.format(Locale.US, "%.0f", fps)}fps"
+
+        fun matches(formatName: String, w: Int, h: Int): Boolean =
+            this.formatName.equals(formatName, ignoreCase = true) && width == w && height == h
+    }
+
     private val usb = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
 
     // ---- 选中的流参数 ----
@@ -152,6 +174,17 @@ class UvcCamera(private val ctx: Context) {
     @Volatile private var frameWidth = TARGET_W
     @Volatile private var frameHeight = TARGET_H
 
+    /** 最近一次 [prepare] 从描述符解析出的全部档位（UI 下拉选择） */
+    @Volatile private var optionList: List<StreamOption> = emptyList()
+    private var parsedFormats: List<FormatDesc> = emptyList()
+    @Volatile private var selectedOption: StreamOption? = null
+
+    /** 设备描述符里可选的档位（需先 [prepare] 成功） */
+    fun options(): List<StreamOption> = optionList
+
+    /** 当前实际在用的档位 */
+    fun currentOption(): StreamOption? = selectedOption
+
     // ---- USB ----
     private var device: UsbDevice? = null
     private var conn: UsbDeviceConnection? = null
@@ -159,6 +192,12 @@ class UvcCamera(private val ctx: Context) {
     private var vsAltZero: UsbInterface? = null    // 同 id 的 alt=0，stop 时切回去
     private var vsEpIn: UsbEndpoint? = null
     private var ownsConnection = false
+    /**
+     * 是否已把 VS 接口切到带 bulk IN 的 alt。
+     * 不能每次 select() 都重复 setInterface(同一个 alt)：部分固件会因此把刚启动的流复位掉
+     * （现象：commit 成功、只来一个坏 URB，然后就再也收不到数据）。
+     */
+    private var altSelected = false
 
     // ---- 线程 ----
     @Volatile private var running = false
@@ -224,12 +263,27 @@ class UvcCamera(private val ctx: Context) {
     // ==================================================================
 
     /**
-     * 打开设备并完成 probe/commit。
+     * 打开设备并完成 probe/commit（等价于 [prepare] + [select]）。
      *
      * @param reuse 复用已打开的连接（例如 UsbLink.connection）；为 null 时自己 openDevice + 自己 close
      * @return 成功与否；失败时 [lastError] 有原因
      */
     fun open(dev: UsbDevice, reuse: UsbDeviceConnection? = null): Boolean {
+        if (!prepare(dev, reuse)) return false
+        if (!select(null)) {
+            releaseInternal()
+            return false
+        }
+        return true
+    }
+
+    /**
+     * 打开设备、claim 接口、解析 VS 描述符，但**不** probe/commit、不取流。
+     * 成功后 [options] 就是设备支持的全部「格式 + 分辨率」档位，UI 可下拉选择。
+     *
+     * @param reuse 复用已打开的连接；为 null 时自己 openDevice + 自己 close
+     */
+    fun prepare(dev: UsbDevice, reuse: UsbDeviceConnection? = null): Boolean {
         close()
         lastError = null
         if (reuse == null && !usb.hasPermission(dev)) {
@@ -308,44 +362,89 @@ class UvcCamera(private val ctx: Context) {
             // 少数机型要求先 claim alt0 再切 alt1；失败时也继续试（有的设备 setInterface 返回 false 但其实生效）
             Log.w(TAG, "setInterface(alt=${foundAlt.alternateSetting}) returned false, continuing anyway")
         }
+        altSelected = true
 
-        // 4) 解析描述符 → 选格式/帧
-        val formats = try {
+        // 4) 解析描述符 → 档位列表（不在这一步 probe/commit）
+        parsedFormats = try {
             parseFormats(c.rawDescriptors)
         } catch (t: Throwable) {
             Log.w(TAG, "parseFormats failed", t)
-            emptyList<FormatDesc>()
+            emptyList()
         }
-        Log.i(TAG, "VS formats: " + formats.joinToString { f ->
+        optionList = buildOptions(parsedFormats)
+        Log.i(TAG, "VS formats: " + parsedFormats.joinToString { f ->
             "${f.name}#${f.index}" + f.frames.joinToString(prefix = "[", postfix = "]") { fr ->
                 "${fr.width}x${fr.height}@${String.format(Locale.US, "%.1f", fr.fps)}"
             }
         })
-        if (formats.isNotEmpty()) {
-            pickFormat(formats)
-        } else {
-            // 描述符解析失败：按厂商日志的经验值硬试 YV12 640x480，再退回 MJPEG
-            Log.w(TAG, "no VS format descriptors parsed; falling back to guesses")
-            format = FormatDesc(1, "YV12", PixelMapping.YV12, 12)
-            frame = FrameDesc(1, TARGET_W, TARGET_H, TARGET_W * TARGET_H * 3 / 2, 666666, listOf(666666))
-        }
+        Log.i(TAG, "options (${optionList.size}): " + optionList.joinToString { it.label })
+        return true
+    }
 
-        val f = format ?: run {
-            lastError = "no usable video format at ${TARGET_W}x$TARGET_H"
-            Log.e(TAG, lastError!!)
-            releaseInternal()
+    /** 从描述符解析结果构建 UI 档位列表：YV12 → MJPEG → 其它，分辨率从大到小 */
+    private fun buildOptions(formats: List<FormatDesc>): List<StreamOption> {
+        val out = ArrayList<StreamOption>()
+        for (f in formats) {
+            for (fr in f.frames) {
+                out += StreamOption(
+                    formatName = f.name,
+                    mapping = f.mapping,
+                    formatIndex = f.index,
+                    frameIndex = fr.index,
+                    width = fr.width,
+                    height = fr.height,
+                    fps = fr.fps,
+                    maxFrameSize = fr.maxFrameSize,
+                    interval = fr.defaultInterval
+                )
+            }
+        }
+        fun rank(m: PixelMapping) = when (m) {
+            PixelMapping.YV12 -> 0
+            PixelMapping.MJPEG -> 1
+            PixelMapping.I420 -> 2
+            PixelMapping.NV12 -> 3
+            PixelMapping.NV21 -> 4
+            PixelMapping.YUY2 -> 5
+            PixelMapping.UYVY -> 6
+            PixelMapping.UNKNOWN -> 7
+        }
+        out.sortWith(
+            compareBy({ rank(it.mapping) }, { -(it.width.toLong() * it.height).toInt() }, { -it.fps })
+        )
+        return out
+    }
+
+    /**
+     * 应用一个档位（null = 默认 640×480 优先）。
+     * 会重新 probe/commit 并重建收发缓冲，但**不**启动读线程。
+     */
+    fun select(want: StreamOption? = null): Boolean {
+        val c = conn ?: run {
+            lastError = "not prepared"
             return false
         }
-        val fr = frame!!
+        val alt = vsAlt ?: run {
+            lastError = "no VS interface"
+            return false
+        }
+        lastError = null
+        // 停止过流之后 alt 已被切回 0，这里重新切到带 bulk IN 的 alt；已经切过就不重复（会复位流）
+        if (!altSelected) {
+            if (!c.setInterface(alt)) {
+                Log.w(TAG, "setInterface(alt=${alt.alternateSetting}) returned false, continuing anyway")
+            }
+            altSelected = true
+        }
+        val (f, fr) = pick(want)
+        format = f
+        frame = fr
         frameWidth = fr.width
         frameHeight = fr.height
-        Log.i(TAG, "selected: ${negotiatedInfo()}")
+        Log.i(TAG, "selected: ${f.name} ${fr.width}x${fr.height} frameIdx=${fr.index}")
 
         // 5) probe / commit
-        if (!probeAndCommit(c, foundAlt.id, f, fr)) {
-            releaseInternal()
-            return false
-        }
+        if (!probeAndCommit(c, alt.id, f, fr)) return false
 
         // 6) 准备缓冲：URB 对齐原厂 = 单帧净荷 + 22
         frameSize = max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height))
@@ -360,15 +459,77 @@ class UvcCamera(private val ctx: Context) {
         lastHdrInfo = -1
         bmpA = null
         bmpB = null
+        lastBitmap = null
+        selectedOption = StreamOption(
+            formatName = f.name,
+            mapping = f.mapping,
+            formatIndex = f.index,
+            frameIndex = fr.index,
+            width = fr.width,
+            height = fr.height,
+            fps = fr.fps,
+            maxFrameSize = fr.maxFrameSize,
+            interval = fr.defaultInterval
+        )
         Log.i(TAG, "buffers: frameSize=$frameSize urbSize=$urbSize")
+        Log.i(TAG, "negotiated: ${negotiatedInfo()}")
         return true
+    }
+
+    /**
+     * 换档位并重启取流（UI 下拉选择后调用）。
+     * 复用当前 USB 连接：先停读线程 → 切回 alt0 → 重新 probe/commit 新档位 → 重新开始取流。
+     */
+    fun restartStream(want: StreamOption? = null): Boolean {
+        val dev = device ?: run {
+            lastError = "not prepared"
+            return false
+        }
+        stop()
+        lastError = null
+        // 先复用现有连接重新 probe；失败再彻底重开（部分固件在 alt 切换后需要新 fd）
+        if (select(want)) {
+            start()
+            Log.i(TAG, "restarted: ${negotiatedInfo()}")
+            return true
+        }
+        Log.w(TAG, "restartStream: re-probe failed (${lastError}), reopening device")
+        if (!prepare(dev, null)) return false
+        if (!select(want)) return false
+        start()
+        Log.i(TAG, "restarted (reopened): ${negotiatedInfo()}")
+        return true
+    }
+
+    /** 选档位：优先精确 formatIndex+frameIndex，其次 格式名+宽高；都没有就用默认规则 */
+    private fun pick(want: StreamOption?): Pair<FormatDesc, FrameDesc> {
+        if (want != null) {
+            for (f in parsedFormats) for (fr in f.frames) {
+                if (f.index == want.formatIndex && fr.index == want.frameIndex) return f to fr
+            }
+            for (f in parsedFormats) for (fr in f.frames) {
+                if (f.name.equals(want.formatName, true) &&
+                    fr.width == want.width && fr.height == want.height
+                ) return f to fr
+            }
+            Log.w(TAG, "wanted option ${want.label} not in descriptors, using default")
+        }
+        val def = pickFormat(parsedFormats)
+        if (def != null) return def
+        // 描述符解析失败：按厂商日志的经验值硬试 YV12 640x480
+        Log.w(TAG, "no VS format descriptors parsed; falling back to guesses")
+        return FormatDesc(1, "YV12", PixelMapping.YV12, 12) to
+            FrameDesc(1, TARGET_W, TARGET_H, TARGET_W * TARGET_H * 3 / 2, 666666, listOf(666666))
     }
 
     private var lastError: String? = null
     fun lastError(): String? = lastError
 
-    /** 在描述符解析结果里挑 640x480 的最佳组合 */
-    private fun pickFormat(formats: List<FormatDesc>) {
+    /**
+     * 默认档位：640×480 里按 MJPEG > YV12 > I420 > ... 优先级挑；
+     * 没有 640×480 就挑面积最大的。
+     */
+    private fun pickFormat(formats: List<FormatDesc>): Pair<FormatDesc, FrameDesc>? {
         // 优先级：MJPEG（带宽小、解码快）> YV12/I420（本设备极可能只有这个）> NV12 > YUY2
         val order = listOf(
             PixelMapping.MJPEG, PixelMapping.YV12, PixelMapping.I420,
@@ -389,16 +550,14 @@ class UvcCamera(private val ctx: Context) {
         if (best == null) {
             // 没有 640x480？退而求其次：最大的那个
             for (f in formats) for (fr in f.frames) {
-                if (best == null || fr.width * fr.height > best!!.second.width * best!!.second.height) {
+                if (best == null ||
+                    fr.width.toLong() * fr.height > best!!.second.width.toLong() * best!!.second.height
+                ) {
                     best = f to fr
                 }
             }
         }
-        if (best != null) {
-            format = best.first
-            frame = best.second
-            // 把同格式里第一个 640x480 的帧也记下来（便于日志）
-        }
+        return best
     }
 
     /**
@@ -457,8 +616,18 @@ class UvcCamera(private val ctx: Context) {
         probe[2] = f.index.toByte()
         probe[3] = fr.index.toByte()
         putU32(probe, 4, fr.defaultInterval)
-        putU32(probe, 18, max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height)))
-        val payload = if (vsEpIn != null) max(16384, vsEpIn!!.maxPacketSize * 32) else 16384
+        val frameBytes = max(fr.maxFrameSize, estimateFrameBytes(f.mapping, fr.width, fr.height))
+        putU32(probe, 18, frameBytes)
+        // 640×480 保持原厂验证过的 16 KB（不改已知可用路径）；
+        // 720p/1080p 的单帧远超 16 KB，probe 里把 maxPayload 提到整帧大小，
+        // 否则部分固件会按小的 payload 切帧。
+        val payload = if (frameBytes > 1024 * 1024) {
+            min(frameBytes, 8 * 1024 * 1024)
+        } else if (vsEpIn != null) {
+            max(16384, vsEpIn!!.maxPacketSize * 32)
+        } else {
+            16384
+        }
         putU32(probe, 22, payload)
 
         var ret = c.controlTransfer(REQ_OUT, UVC_SET_CUR, VS_PROBE, ifaceNum, probe, 0, len, CTRL_TIMEOUT)
@@ -978,6 +1147,7 @@ class UvcCamera(private val ctx: Context) {
         if (c != null && itf != null) {
             try {
                 c.setInterface(itf)
+                altSelected = false
             } catch (ignored: Throwable) {
             }
         }
@@ -1010,10 +1180,14 @@ class UvcCamera(private val ctx: Context) {
         vsAltZero = null
         vsEpIn = null
         ownsConnection = false
+        altSelected = false
         lastBitmap = null
         bmpA = null
         bmpB = null
         running = false
+        optionList = emptyList()
+        parsedFormats = emptyList()
+        selectedOption = null
     }
 }
 
