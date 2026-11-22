@@ -342,6 +342,8 @@ glxss ctl rec on
 * 同一 `UsbDeviceConnection` 上 UVC bulk IN 与 LCD bulk OUT 并发；HID/亮度/模式
   等控制请求和 LCD 帧走 `usb.UsbGate` 串行，避免控制请求插进 1 MB 帧中间；
 * 切回 HUD 时停流（alt=0）并释放 UVC 接口，下次切监看重开；
+* HUD 主进程默认 2 fps，**切到 monitor 时自动把发送帧率提到 max(--fps, 10)**，
+  切回 HUD 再恢复，不需要重启进程；
 * Linux 必须加 `--detach`（uvcvideo 占着 UVC 接口）；和 `glxss uvc` 一样。
 
 Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
