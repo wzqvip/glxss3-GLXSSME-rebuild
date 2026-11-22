@@ -12,7 +12,7 @@
 2. `1_亮亮眼镜拍照.apk` **就是原厂 2.3.7 本体**（`com.llvision.glxss3.camera`，vc15），它的 3 个 asset 与社区二合一版**逐字节相同**，所有 ABI 的 `.so` 也与社区版**逐字节相同**——社区版只改了 dex（3.81 MB → 4.05 MB），没动 native、没动固件。**【验】**
 3. 三份固件共用**同一把 AES key**（`b5Q8JBFRYYIRawl3`，由 `libboot.so` 内置 RSA 私钥解 `llvision.enkey` 得到），`enkey` 三者 sha256 完全相同 → **厂商从未轮换固件密钥**。**【验】**
 4. 1.7.4 与 1.9.1 **同源同构建日**：`BUILD DATE` 与 `GIT VERSION` 字符串完全一致（`Thu Jun  9 06:59:57 EEST 2016` / commit `6d821e59`），镜像只差 **2,712 字节**代码和版本号。所以 1.7.4 是"同一代的旧 build"，不是"另一代功能固件"。**【验】**
-5. **投屏协议、HID/LCD 命令、固件刷写流程在 1.8.4 与 2.3.7 之间没有任何变化**：LCD 的 10 个 JNI 方法名集合、16 字节帧头常量、`bootInit/bootDownload(path, keyPath, cb)` 签名、USB 设备过滤表全部相同 → 我们的替代 App **一套协议、全版本通用**。**【验】**
+5. **投屏协议、HID/LCD 命令、固件刷写流程在 1.8.4 与 2.3.7 之间没有任何变化**：LCD 的 10 个 JNI 方法名集合、16 字节帧头常量、`bootInit/bootDownload(path, keyPath, cb)` 签名、USB 设备过滤表全部相同 → 我们的重新实现的 App **一套协议、全版本通用**。**【验】**
 
 ---
 
@@ -90,7 +90,7 @@
 | USB 过滤 | `0x2e09:0x0030`（正常）+ `0x3e7:0x2150`（引导），`res/xml/device_filter.xml` | 同（B 另有只含 `0x2e09:0x30` 的 `device_filter_llvision.xml`） | 实质无差异 |
 | 版本查询 `0xA1/0x17` | 由 `nativeProductGetInfo`（`libhid` 的 `sensor_get_product_info`）实现，1.8.4 **已存在** | 同；2.3.7 额外在 Java 侧加了 `LCD.getNativeProductInfo()` | 仅 Java 包装层差异 |
 
-**对我们最有用的协议结论**：`0xA1/0x17` 版本查询、`0xA1/0x07` EEPROM 产品信息、亮度/模式/翻转控制、16 B 帧头 —— 这套接口**从 1.8.4 起就冻结了，三份 App 通用**。我们的替代 App 不需要做"版本适配分支"。**【验】**
+**对我们最有用的协议结论**：`0xA1/0x17` 版本查询、`0xA1/0x07` EEPROM 产品信息、亮度/模式/翻转控制、16 B 帧头 —— 这套接口**从 1.8.4 起就冻结了，三份 App 通用**。我们的重新实现的 App 不需要做"版本适配分支"。**【验】**
 
 ## 5. native 库对比（armeabi-v7a；B 与 C 逐字节相同）【验】
 
@@ -133,7 +133,7 @@
   > ⚠️ 但**加密尾的起点不是常量**：必须按 `size - 0x80000` 算。1.9.1 是 `0x0F4590`，1.7.4 是 `0x0F3AF0`。
   > 当前 `MyriadBootLoader.prepareImage()` 把 `0x0F4590` 写死了，只适用于 1.9.1；刷 1.7.4 前必须先改。**【验】**
 - **F3（密钥未轮换）**：`enkey` 与 `libboot` 内 RSA 私钥在三份 APK 里完全相同 → **解密算法/密钥是一次性写死的**，可以放心把"解 `enkey` → AES-ECB 解 `0x80000` 尾巴"实现成通用工具。**【验】**
-- **F4（协议稳定）**：16 B 帧头、亮度/开关/翻转/显示模式、`0xA1/0x17` 版本查询从 1.8.4 起未变 → 替代 App **不需要按 App 版本做兼容分支**；`0xA1/0x17` 可以大胆用于"连接后显示固件版本"。**【验】**
+- **F4（协议稳定）**：16 B 帧头、亮度/开关/翻转/显示模式、`0xA1/0x17` 版本查询从 1.8.4 起未变 → 重新实现的 App **不需要按 App 版本做兼容分支**；`0xA1/0x17` 可以大胆用于"连接后显示固件版本"。**【验】**
 - **F5（UVC 尺寸表，可直接落地）**：2.3.7 里硬编码的 UVC 帧描述符表给出了眼镜摄像头的真实能力：1080p（idx0）、720p（idx2/6）、480p（idx3），格式 `YUYV=0` / `MJPEG=1`。写 UVC 客户端时按这三档枚举即可，`uvc-camera-plan.md` 里的 1080p 假设得到证实。**【验】**
 - **F6（录像）**：没有"旧版独有录像功能"。两版都用 `EasyMuxer`（MediaCodec + MediaMuxer）出 mp4；1.8.4 多的只是上游 serenegiant demo 代码。若我们要做录制，参考 `CameraServer.handleStartRecording/handleStopRecording` 即可，无需逆向 1.8.4 的 mediaeffect。**【验】**
 - **F7（人脸/视觉通道）**：1.8.4 的 `CameraReportData`（face_num + 4 个 faceLoc + AF 状态）证明**固件本身会做人脸检测并把坐标回传**；2.3.7 改成主机侧送帧（`libfacedtr-libusb`，18 KB，5 个 ABI 都有）。两条路径都是"厂商私有协议"，是我们目前唯一见到的**眼镜→主机数据回传**线索（`FaceDtr` 里还有通用 `nativeControlTransfer`）。**【推】**
@@ -195,3 +195,4 @@ print(hex(out_len), hashlib.sha256(plain[:out_len]).hexdigest())
 | App Store 自更新 | `me-jadx/.../appstore/util/UpdateManager.java:70, 229` |
 
 **复算脚本**（均在仓库外）：`re/old-apks/{an.py, dec.py, fw2.py, fw3.py, fwdiff.py, sodiff.py}`。
+

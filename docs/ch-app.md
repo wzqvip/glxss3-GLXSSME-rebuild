@@ -1,6 +1,6 @@
 # 第 7 章 · App 架构与开发指南
 
-> 本章讲清楚：这个替代 App 是怎么分层的、每一层负责什么、怎么构建/调试、
+> 本章讲清楚：这个重新实现的 App 是怎么分层的、每一层负责什么、怎么构建/调试、
 > 现在有哪些已知问题、下一步该做什么。
 >
 > 代码根目录：[`app/app/src/main/java/com/wzqvip/glxsscast/`](../app/app/src/main/java/com/wzqvip/glxsscast/)
@@ -271,3 +271,4 @@ conn.bulkTransfer(ep, frame16PlusRgba, frame16PlusRgba.size, 5000)
 - 若你自行把厂商 `.so` 放进 `jniLibs/` 使用 `BootLoader` 路径，请自行确认许可与合规，
   并在分发时保留上游（serenegiant / Apache-2.0）声明；
 - 与 LLVision 无关联，见 [NOTICE.md](../NOTICE.md)。
+

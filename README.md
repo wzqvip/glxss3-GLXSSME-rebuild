@@ -1,6 +1,6 @@
-# GLXSS3（G25）AR 眼镜替代项目
+# 亮亮视野 Glxss Me GLXSS3 投屏协议研究 / GLXSS3 Cast Protocol Research
 
-> 对亮亮视野 LLVision GLXSS3（G25）AR 眼镜（Glxss Me）的互操作性研究：它怎么把手机画面投到眼镜、
+> 对亮亮视野 LLVision GLXSS3（G25）AR 眼镜（Glxss Me）App（`com.llvision.glxss3.camera` v2.3.7）的互操作性研究，以及基于研究结果的重新实现：它怎么把手机画面投到眼镜、
 > 摄像头/音频/HID 怎么驱动，以及用我们自己的 App 重新实现。
 >
 > A study of the LLVision GLXSS3 (G25) AR glasses, for interoperability and personal hardware
@@ -126,3 +126,4 @@ dist/         构建好的 APK
 ## 许可
 
 禁止商业使用，详见 [LICENSE](LICENSE)。分析结论来自对官方 App 的协议分析，不含原始代码。
+

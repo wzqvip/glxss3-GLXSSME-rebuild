@@ -7,7 +7,7 @@
 > 用 Frida 在 App 的 `:llvision_G25` 进程 hook `libusb_control_transfer` / `libusb_bulk_transfer`
 > 抓取全部控制传输；同时用 `uiautomator` 驱动 App 界面触发各功能。
 >
-> **这是全部"待验证项"的答案**，可直接用于替代 App 实现。
+> **这是全部"待验证项"的答案**，可直接用于重新实现的 App 实现。
 
 ## 1. 设备描述符（实测）
 
@@ -73,7 +73,7 @@ libusb_bulk_transfer(ep=0x01, len=1,024,016, timeout=5000)
 3. Sync display 开关 ⇒ 显示模式 2 / 1；
 4. Advance settings → LED indicator ⇒ LED 命令。
 
-## 5. 给替代 App 的结论
+## 5. 给重新实现的 App 的结论
 
 - 帧发送：单次 bulk 写 `16B 头 + RGBA`（Android 可用 `bulkTransfer`，大缓冲会自动分包）；
 - 亮度：`controlTransfer(0xA1, 0x01, value, 0x0003, buf, 1, 5000)`；
@@ -81,3 +81,4 @@ libusb_bulk_transfer(ep=0x01, len=1,024,016, timeout=5000)
 - 状态查询：`controlTransfer(0xA1, 0x04, 0, 0x0003, statusBuf, 8, 5000)`；
 - 自动亮度/LED：`0xA1, 0x10/0x19, 0/1, 0x0002`；
 - 音频：标准 UAC，无需逆向。
+
