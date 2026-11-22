@@ -35,6 +35,9 @@ class Prefs private constructor(ctx: Context) {
         private const val KEY_HID_CLICK = "hid_click_action"
         private const val KEY_HID_LONG = "hid_long_action"
         private const val KEY_AUTO_RECONNECT = "auto_reconnect"
+        private const val KEY_ACC_FSR = "acc_fsr"
+        private const val KEY_GYRO_FSR = "gyro_fsr"
+        private const val KEY_FSR_INIT = "fsr_initialized"
 
         @Volatile private var inst: Prefs? = null
         fun get(ctx: Context): Prefs =
@@ -111,4 +114,20 @@ class Prefs private constructor(ctx: Context) {
     var autoReconnect: Boolean
         get() = sp.getBoolean(KEY_AUTO_RECONNECT, true)
         set(v) { sp.edit().putBoolean(KEY_AUTO_RECONNECT, v).apply() }
+
+    // ---- 传感器量程（索引 0..3，与固件 0x06 的 acc_fsr / gyro_fsr 一致） ----
+    /** 默认 ±4g：实测 1g 对应 raw≈8192（32768/8192 = 4） */
+    var accFsr: Int
+        get() = sp.getInt(KEY_ACC_FSR, 1).coerceIn(0, 3)
+        set(v) { sp.edit().putInt(KEY_ACC_FSR, v.coerceIn(0, 3)).apply() }
+
+    /** 默认 ±2000dps；连上眼镜后由 0x06 报的硬件值覆盖（首次） */
+    var gyroFsr: Int
+        get() = sp.getInt(KEY_GYRO_FSR, 3).coerceIn(0, 3)
+        set(v) { sp.edit().putInt(KEY_GYRO_FSR, v.coerceIn(0, 3)).apply() }
+
+    /** 是否已经按硬件 0x06 / 用户选择初始化过量程（初始化后不再被 0x06 覆盖） */
+    var fsrInitialized: Boolean
+        get() = sp.getBoolean(KEY_FSR_INIT, false)
+        set(v) { sp.edit().putBoolean(KEY_FSR_INIT, v).apply() }
 }

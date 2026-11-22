@@ -55,10 +55,10 @@ class HidSensor(private val link: UsbLink) {
     ) {
         fun hex(): String = raw.joinToString("") { "%02x".format(it) }
 
-        /** 传感器一行（UI 状态栏） */
-        fun sensorLine(accFsr: Int = 0, gyroFsr: Int = 0): String {
-            val accScale = intArrayOf(2, 4, 8, 16)[accFsr.coerceIn(0, 3)] / 32768.0
-            val gyroScale = intArrayOf(250, 500, 1000, 2000)[gyroFsr.coerceIn(0, 3)] / 32768.0
+        /** 传感器一行（UI 状态栏）；默认 ±4g / ±2000dps（实测硬件 0x06 的值见 MainActivity） */
+        fun sensorLine(accFsr: Int = 1, gyroFsr: Int = 3): String {
+            val accScale = HidSensor.accScale(accFsr)
+            val gyroScale = HidSensor.gyroScale(gyroFsr)
             return String.format(
                 Locale.US,
                 "按键=%s(0x%02x) · lux=%d · 温度=%.1f°C · acc=(%.2f, %.2f, %.2f)g · gyro=(%.0f, %.0f, %.0f)°/s · af=%d caf=%d",
@@ -80,6 +80,44 @@ class HidSensor(private val link: UsbLink) {
         private const val CTRL_TIMEOUT_MS = 800
         private const val LONG_REPEAT = 3
 
+        /** FSR 档位表，索引 0..3 与固件 `0x06` 的 acc_fsr / gyro_fsr 一致 */
+        val ACC_FSR_G = intArrayOf(2, 4, 8, 16)
+        val GYRO_FSR_DPS = intArrayOf(250, 500, 1000, 2000)
+
+        /** acc 原始计数 → g（满量程 = 32768） */
+        fun accScale(fsr: Int): Double = ACC_FSR_G[fsr.coerceIn(0, 3)] / 32768.0
+
+        /** gyro 原始计数 → °/s（满量程 = 32768） */
+        fun gyroScale(fsr: Int): Double = GYRO_FSR_DPS[fsr.coerceIn(0, 3)] / 32768.0
+
+        data class AccRangeEstimate(
+            val sampleCount: Int,
+            val medianRaw: Double,
+            val fsrG: Double,
+            val nearestIndex: Int
+        ) {
+            val nearestG: Int get() = ACC_FSR_G[nearestIndex]
+        }
+
+        /**
+         * 静止时 |acc| 应 = 1g，而 `raw = 32768 * |acc| / FSR`，所以
+         * `FSR ≈ 32768 / median(|acc_raw|)`。取最接近的标准档位。
+         *
+         * @return null = 样本不足或传感器未使能（几乎全 0）
+         */
+        fun estimateAccRange(rawMagnitudes: List<Double>): AccRangeEstimate? {
+            val v = rawMagnitudes.filter { it > 0.0 }.sorted()
+            if (v.size < 3) return null
+            val med = if (v.size % 2 == 1) v[v.size / 2]
+            else (v[v.size / 2 - 1] + v[v.size / 2]) / 2.0
+            if (med < 64.0) return null
+            val fsr = 32768.0 / med
+            val nearest = ACC_FSR_G.indices.minByOrNull {
+                kotlin.math.abs(ACC_FSR_G[it] - fsr)
+            } ?: 1
+            return AccRangeEstimate(v.size, med, fsr, nearest)
+        }
+
         /** 最近创建的实例（实验 harness / stats 读取用） */
         @Volatile var last: HidSensor? = null
             private set
@@ -96,6 +134,10 @@ class HidSensor(private val link: UsbLink) {
     @Volatile var failCount = 0L; private set
     @Volatile var lastError: String = ""; private set
     @Volatile var eventCount = 0L; private set
+
+    /** 当前换算用的 FSR 档位（UI 选择 / 0x06 读到的硬件值），只影响显示与日志 */
+    @Volatile var accFsr: Int = 1
+    @Volatile var gyroFsr: Int = 3
 
     /** 报告回调（HID 线程；UI 用 runOnUiThread/状态更新） */
     @Volatile var onReport: ((Report) -> Unit)? = null
@@ -189,7 +231,7 @@ class HidSensor(private val link: UsbLink) {
                     Log.w(TAG, "onReport failed", t)
                 }
                 if (pollCount == 1L || pollCount % 20 == 0L) {
-                    Oplog.logf("HID", "poll=%d %s", pollCount, r.sensorLine())
+                    Oplog.logf("HID", "poll=%d %s", pollCount, r.sensorLine(accFsr, gyroFsr))
                 }
             }
             val spent = SystemClock.elapsedRealtime() - t0

@@ -176,6 +176,49 @@ object LcdControl {
     fun getHidReport(conn: UsbDeviceConnection): ByteArray? = ctrl(conn, 0x16, 0, IFACE_AUX, 28)
 
     /**
+     * `0xA1/0x06`：IMU 属性（16 B，wIndex=2）。
+     *
+     * 布局（docs/ch-hid.md §4/§5.3，真机验证）：
+     * ```
+     * 0  u8  acc_status     1  u8  acc_enabled   2  u8  acc_fsr (0..3)
+     * 3  u8  gyro_status    4  u8  gyro_enabled  5  u8  gyro_fsr (0..3)
+     * 8  u64 chip_id (LE)
+     * ```
+     * `*_fsr` 就是 28 B 报告里 acc/gyro 的换算档位（±2/4/8/16g、±250/500/1000/2000dps）。
+     */
+    data class ImuAttr(
+        val accStatus: Int,
+        val accEnabled: Boolean,
+        val accFsr: Int,
+        val gyroStatus: Int,
+        val gyroEnabled: Boolean,
+        val gyroFsr: Int,
+        val chipId: Long,
+        val raw: ByteArray
+    ) {
+        fun hex(): String = raw.joinToString("") { "%02x".format(it) }
+        val fsrValid: Boolean get() = accFsr in 0..3 && gyroFsr in 0..3
+    }
+
+    fun readImuAttributes(conn: UsbDeviceConnection): ImuAttr? {
+        val b = ctrl(conn, 0x06, 0, IFACE_AUX, 16) ?: return null
+        if (b.size < 16) return null
+        fun u(i: Int) = b[i].toInt() and 0xff
+        var chip = 0L
+        for (i in 0..7) chip = chip or ((b[8 + i].toLong() and 0xff) shl (8 * i))
+        return ImuAttr(
+            accStatus = u(0),
+            accEnabled = u(1) != 0,
+            accFsr = u(2),
+            gyroStatus = u(3),
+            gyroEnabled = u(4) != 0,
+            gyroFsr = u(5),
+            chipId = chip,
+            raw = b.copyOf(16)
+        )
+    }
+
+    /**
      * 使能传感器：`0xA1/0x10` 光感(自动亮度) / `0x11` 罗盘 / `0x12` 加速度 / `0x14` 陀螺。
      * 不使能时 28 B 报告里 IMU/罗盘全是 0。
      */

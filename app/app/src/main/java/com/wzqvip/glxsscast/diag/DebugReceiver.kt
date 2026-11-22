@@ -76,7 +76,8 @@ class DebugReceiver : BroadcastReceiver() {
             )
             "ctrl_poll_stop" -> ExpHarness.stopCtrlPoll()
             // 需要 Activity 的命令（投屏授权 / 录像 / HID UI / 状态）
-            "cast", "record_start", "record_stop", "hid_start", "hid_stop", "status" -> {
+            "cast", "record_start", "record_stop", "hid_start", "hid_stop", "status",
+            "fsr_estimate", "level_calib", "sensor_attr" -> {
                 val i = Intent(app, MainActivity::class.java).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                     putExtra("cmd", cmd)
