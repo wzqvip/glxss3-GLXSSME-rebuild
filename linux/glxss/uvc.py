@@ -4,11 +4,17 @@
 协议出处 docs/ch-uvc.md：
   * VC if0（class 0x0e/0x01）、VS if1（0x0e/0x02），VS 的 alt=0 就带 bulk IN 0x81；
   * probe 34 B（UVC 1.10），wIndex=VS 接口号，wValue=0x0100(probe)/0x0200(commit)；
-  * 设备侧一帧 = 12 B UVC payload header（0c 0f ...）+ 460800 B YV12，整帧一个 header；
+  * YV12 format 1 的 VS 帧描述符（2026-11-22 在 Pi 上直接解析配置描述符实测）：
+      frame 1 = 1920×1080, frame 2 = 1280×960,
+      frame 3 = 1280×720（dwMaxVideoFrameBufferSize=1,382,400）,
+      frame 4 = 640×480, frame 5 = 4128×3104, frame 6 = 3264×2448。
+    **原厂预览用的是 frame 3**；App 表里的 idx2/6 是零基列表下标，不是 bFrameIndex；
+  * 默认一帧 = 12 B UVC payload header（0c 0f ...）+ 1,382,400 B YV12，整帧一个
+    header；`--size 640x480`/回退时仍是 12 B + 460,800 B；
   * **主机侧单次 bulk 读最多 16384 B**（usbfs 单 URB 上限 / libusb
     MAX_BULK_BUFFER_LENGTH，与 Android 一致）。读线程按 16 KiB 分块，再在字节流上
-    按 `hdrLen + frameSize` 组帧（`_take_frame`），不能拿 460822 一次读；
-  * YV12 = Y | V | U，640×480，无 stride padding；转 RGB 使用 BT.601 limited range。
+    按 `hdrLen + frameSize` 组帧（`_take_frame`），不能拿 1,382,422 一次读；
+  * YV12 = Y | V | U，无 stride padding；转 RGB 使用 BT.601 limited range。
 
 numpy 只在真正解码时导入，保证没装 numpy 时 `glxss --help` / `list` 仍可用。
 """
@@ -37,26 +43,44 @@ UVC_SET_CUR = 0x01
 UVC_VS_PROBE = 0x0100
 UVC_VS_COMMIT = 0x0200
 
-DEFAULT_WIDTH = 640
-DEFAULT_HEIGHT = 480
-DEFAULT_FRAME_SIZE = DEFAULT_WIDTH * DEFAULT_HEIGHT * 3 // 2  # 460800
+DEFAULT_WIDTH = 1280
+DEFAULT_HEIGHT = 720
+DEFAULT_FRAME_SIZE = DEFAULT_WIDTH * DEFAULT_HEIGHT * 3 // 2  # 1,382,400
 DEFAULT_INTERVAL = 333333  # 100 ns 单位 → 30 fps
 DEFAULT_MAX_PAYLOAD = 16384
-# 与 Android UvcCamera 实测一致：bFormatIndex=1（YV12）、bFrameIndex=4（640×480@30）。
-# 不能沿用 GET_CUR 的当前帧号：设备状态在会话之间残留，半坏状态（frame=1 1080p +
-# maxPayload=GET_MAX 全局上限）下 probe/commit 都会成功但 bulk IN 一个字节都不来。
+# 2026-11-22 在 Pi 上直接读配置描述符（标准 GET_DESCRIPTOR）确认的 VS 帧档位：
+#   bFrameIndex=1 1920×1080 / 2 1280×960 / 3 1280×720 / 4 640×480 /
+#   5 4128×3104 / 6 3264×2448。
+# 原厂预览（Frida: uvc_frame_t.data_bytes=1,382,400）就是 **frame 3**；之前的
+# frame 4 是 640×480 的裁切窗口（所以画面偏左、不是正前视角）。
+# 注意：docs/apk-versions.md 的 “idx2/6 = 720p、idx3 = 480p” 是 App 内部**零基
+# 列表下标**，不是 UVC bFrameIndex（探针回读已经证实 frame 3 才是 720p）。
 DEFAULT_FORMAT_INDEX = 1
-DEFAULT_FRAME_INDEX = 4
+DEFAULT_FRAME_INDEX = 3
+# 640×480 回退档：设备坚持只给 480p 时保留原行为（旧版默认值）。
+LEGACY_FRAME_INDEX = 4
+LEGACY_WIDTH = 640
+LEGACY_HEIGHT = 480
+LEGACY_FRAME_SIZE = LEGACY_WIDTH * LEGACY_HEIGHT * 3 // 2  # 460,800
+# 显式指定 --size 时的常见档位（描述符读不到时的兜底映射）。
+KNOWN_MODES = {
+    1: (1920, 1080),
+    2: (1280, 960),
+    3: (1280, 720),
+    4: (640, 480),
+    5: (4128, 3104),
+    6: (3264, 2448),
+}
 # 主机侧单次 bulk 读取上限：usbfs 每个 URB 最大 16384 B（与 libusb
-# MAX_BULK_BUFFER_LENGTH 一致，Android 实测 460822 会立刻返回 -1）。
+# MAX_BULK_BUFFER_LENGTH 一致，Android 实测整帧一次读会立刻返回 -1）。
 # Linux 的 libusb 会在内部把大请求拆成 16 KiB URB，但那属于后端实现细节：
 # 显式按 16 KiB 读，主机行为才与 Android 逐字节一致，也不依赖 libusb 版本。
 BULK_CHUNK = 16384
 # UVC payload header 最长 12 B（2 + PTS 4 + SCR 6）。
 MAX_HEADER = 12
-# 原厂 libuvc：frameBufferSize = dwMaxVideoFrameSize + 22 = 460822。
-# 这是**逻辑帧缓冲**（仅用于日志/统计），不是单次 USB 读尺寸；实际读取用
-# BULK_CHUNK=16384，再按 `hdrLen + frameSize = 460812` 组帧。
+# 原厂 libuvc：frameBufferSize = dwMaxVideoFrameSize + 22 = 1,382,422（720p）/
+# 460,822（480p）。这是**逻辑帧缓冲**（仅用于日志/统计），不是单次 USB 读尺寸；
+# 实际读取用 BULK_CHUNK=16384，再按 `hdrLen + frameSize` 组帧。
 URB_SLACK = 22
 # 原厂 UVC 打开序列里的两条 vendor XU 写（entity 4，wIndex=0x0400）：
 #   probe 之前 0x0d0d=01（相机侧开关），commit 之后 0x0606=00 ×2（送流开关）。
@@ -193,6 +217,91 @@ class Probe:
 
 
 # ---------------------------------------------------------------------------
+# VS 帧描述符（bFrameIndex → 分辨率）
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class FrameMode:
+    """UVC VS 帧描述符里的一档。``frame_size`` 按 YV12 3/2 计算。
+
+    描述符里的 ``dwMaxVideoFrameBufferSize`` 在本设备上并不总是可靠（frame
+    2/5/6 是畸形值），所以宽高以下列字段为准，帧字节数用 ``w*h*3//2``。
+    """
+
+    format_index: int
+    frame_index: int
+    width: int
+    height: int
+    max_frame: int = 0
+
+    @property
+    def frame_size(self) -> int:
+        return self.width * self.height * 3 // 2
+
+    def __str__(self) -> str:
+        return "frame %d = %dx%d（YV12 %d B）" % (
+            self.frame_index, self.width, self.height, self.frame_size)
+
+
+def read_config_descriptor(dev, timeout: int = 3000) -> bytes:
+    """标准 GET_DESCRIPTOR(config) 读原始配置描述符；只读、不改设备状态。
+
+    分两步：先读 9 B 头拿 ``wTotalLength``，再按总长读全（一次读 65535 会被
+    libusb/内核以 EINVAL 拒掉）。
+    """
+    head = bytes(dev.ctrl_transfer(0x80, 0x06, 0x0200, 0, 9, timeout=timeout))
+    if len(head) < 4:
+        raise GlxssError("配置描述符只返回 %d B" % len(head))
+    total = head[2] | (head[3] << 8)
+    raw = bytes(dev.ctrl_transfer(0x80, 0x06, 0x0200, 0,
+                                  max(9, min(total, 65535)), timeout=timeout))
+    if len(raw) < total:
+        raise GlxssError("配置描述符不完整：%d/%d B" % (len(raw), total))
+    return raw
+
+
+def parse_frame_modes(raw: bytes, format_index: int = 1) -> Tuple[FrameMode, ...]:
+    """从原始配置描述符解析 VS 的帧档位（CS_INTERFACE 0x24/0x04、0x24/0x05）。
+
+    只取 ``format_index`` 这一种格式；顺序与描述符一致。纯函数，便于单测。
+    """
+    modes: list[FrameMode] = []
+    current_format: Optional[int] = None
+    offset = 0
+    end = len(raw)
+    while offset + 2 <= end:
+        length = raw[offset]
+        kind = raw[offset + 1]
+        if length < 2 or offset + length > end:
+            break
+        if kind == 0x04:                 # 标准接口描述符：进入新接口
+            current_format = None
+        elif kind == 0x24 and length >= 3:  # class-specific interface
+            subtype = raw[offset + 2]
+            if subtype == 0x04 and length >= 5:      # VS_FORMAT_UNCOMPRESSED
+                current_format = raw[offset + 3]
+            elif (subtype == 0x05 and length >= 9
+                  and current_format == format_index):  # VS_FRAME_UNCOMPRESSED
+                frame_index = raw[offset + 3]
+                width = raw[offset + 5] | (raw[offset + 6] << 8)
+                height = raw[offset + 7] | (raw[offset + 8] << 8)
+                max_frame = (struct.unpack_from("<I", raw, offset + 17)[0]
+                             if length >= 21 else 0)
+                if width and height:
+                    modes.append(FrameMode(current_format, frame_index,
+                                           width, height, max_frame))
+        offset += length
+    return tuple(modes)
+
+
+def read_frame_modes(dev, format_index: int = 1) -> Tuple[FrameMode, ...]:
+    """读设备描述符里的帧档位；失败返回空元组（调用方退回 KNOWN_MODES）。"""
+    try:
+        return parse_frame_modes(read_config_descriptor(dev), format_index)
+    except Exception:
+        return ()
+
+
+# ---------------------------------------------------------------------------
 # 读流 / 组帧
 # ---------------------------------------------------------------------------
 @dataclass
@@ -255,6 +364,11 @@ class UvcStream:
         self._synced = False
         self.dropped_bytes = 0
         self.synced_frames = 0
+        # negotiate() 填：设备描述符里的帧档位、是否发生了 720p→480p 回退、
+        # 以及 GET_CUR 回读不可用时是否只能盲 commit（未确认）。
+        self.frame_modes: Tuple[FrameMode, ...] = ()
+        self.negotiated_fallback = False
+        self.negotiated_unverified = False
 
     @classmethod
     def open(cls, dev, session, timeout: int = 5000, verbose: bool = False) -> "UvcStream":
@@ -377,12 +491,75 @@ class UvcStream:
                     VENDOR_XU_STREAM, index + 1, ok))
         return ok
 
+    def _set_probe_readback(self, current: Probe, target_format: int,
+                            target_frame: int, interval: int,
+                            frame_bytes: int, payload: int,
+                            timeout_ms: int) -> Tuple[bytes, int, Optional[Probe]]:
+        """SET_CUR(probe) + GET_CUR(probe) 回读；失败降级到 26 B 结构。
+
+        返回 ``(descriptor, send_len, readback)``；``readback`` 为 None 表示设备
+        没给回读（此时不能确认档位，调用方会当失败处理）。
+        """
+        descriptor = current.descriptor(
+            format_index=target_format,
+            frame_index=target_frame,
+            interval=interval,
+            max_frame=frame_bytes,
+            max_payload=payload,
+        )
+        send_len = 34 if len(descriptor) >= 34 else 26
+        try:
+            self._ctrl_out(UVC_SET_CUR, UVC_VS_PROBE, descriptor[:send_len], timeout_ms)
+        except GlxssError:
+            if send_len != 34:
+                raise
+            self._ctrl_out(UVC_SET_CUR, UVC_VS_PROBE, descriptor[:26], timeout_ms)
+            send_len = 26
+        readback = None
+        try:
+            back = self._ctrl_in(UVC_GET_CUR, UVC_VS_PROBE, 34, timeout_ms)
+            if len(back) >= 26:
+                readback = Probe.parse(back)
+        except GlxssError:
+            pass
+        return descriptor, send_len, readback
+
+    def _commit(self, source: bytes, send_len: int, timeout_ms: int) -> Optional[Probe]:
+        """SET_CUR(commit) + 原厂收尾 XU + CLEAR_HALT，并尝试读回 commit。"""
+        self._ctrl_out(UVC_SET_CUR, UVC_VS_COMMIT, source[:send_len], timeout_ms)
+        # Android commit 之后：XU 0x0606=00 ×2 → CLEAR_FEATURE(HALT, 0x81)。
+        self.vendor_post_commit(timeout_ms)
+        # 上一次被取消的 URB / 固件 STALL 会让端点停在 halt，表现为“commit 成功但
+        # 一个字节都不来”；pyusb 的 clear_halt 失败会退回标准控制请求。
+        usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
+        try:
+            back = self._ctrl_in(UVC_GET_CUR, UVC_VS_COMMIT, 34, timeout_ms)
+            if len(back) >= 26:
+                return Probe.parse(back)
+        except GlxssError:
+            pass
+        return None
+
     def negotiate(self, format_index: Optional[int] = None,
                   frame_index: Optional[int] = None, fps: Optional[float] = None,
                   max_frame: Optional[int] = None,
                   max_payload: Optional[int] = None,
-                  timeout: Optional[int] = None) -> Probe:
+                  timeout: Optional[int] = None,
+                  allow_fallback: bool = True) -> Probe:
+        """probe/commit 到 **1280×720（bFrameIndex=3）**，回读确认，失败回退 480p。
+
+        关键点（2026-11-22 Pi 实测）：
+
+        * 设备 VS 描述符里 720p 是 **frame 3**（1,382,400 B），不是 App 文档里
+          零基列表的 “idx2/6”；frame 2 是 1280×960、frame 6 是 3264×2448。
+          因此这里按**描述符枚举**选档位，而不是猜数字；
+        * SET_CUR(probe) 之后必须 GET_CUR 回读，``bFrameIndex`` 与目标一致才算
+          成功；不一致（设备回退）就换下一个候选，全失败再显式回退 640×480；
+        * 回退时保持旧行为（frame 4 / 460,800 B），并打印清楚的探测结果。
+        """
         timeout_ms = timeout or self.timeout
+        self.negotiated_fallback = False
+        self.negotiated_unverified = False
         # Android `UvcCamera.prepare()`：claim + setInterface 之后、probe 之前
         # 先发 vendor XU 0x0d0d=01。
         self.vendor_pre_probe(timeout_ms)
@@ -403,63 +580,143 @@ class UvcStream:
             if fps <= 0:
                 raise GlxssError("--fps 必须 > 0")
             interval = max(1, int(round(1e7 / fps)))
-        # 默认档位写死 Android 实测值（1=YV12 / 4=640×480 / 16384 payload），
-        # 不再继承 GET_CUR 里的 bFormatIndex/bFrameIndex/dwMaxPayloadTransferSize。
-        # 设备会把上一次 commit 的档位留到下一次上电；半坏状态下 GET_CUR 会回
-        # frame=1（1080p）+ maxPayload=0x012c7f8c（GET_MAX 全局上限 19693452），
-        # 这时无论 URB 多大都收不到数据 —— 必须显式覆盖回去。
+        # 默认档位写死（1=YV12 / 3=1280×720 / 16384 payload），不再继承 GET_CUR
+        # 里的 bFormatIndex/bFrameIndex/dwMaxPayloadTransferSize：设备会把上一次
+        # commit 的档位留到下一次上电，半坏状态下 GET_CUR 会回 frame=1（1080p）+
+        # maxPayload=GET_MAX 全局上限，这时无论 URB 多大都收不到数据。
         target_format = DEFAULT_FORMAT_INDEX if format_index is None else int(format_index)
-        frame_bytes = int(max_frame or DEFAULT_FRAME_SIZE)
-        if frame_index is None:
-            # 640×480 默认档位固定用 4；换成别的分辨率（--size）时仍尊重设备当前帧号，
-            # 避免把 720p/1080p 强行写成 4。
-            if frame_bytes == DEFAULT_FRAME_SIZE:
-                target_frame = DEFAULT_FRAME_INDEX
-            else:
-                target_frame = int(current.frame_index or DEFAULT_FRAME_INDEX)
-        else:
-            target_frame = int(frame_index)
         payload = int(max_payload or DEFAULT_MAX_PAYLOAD)
-        descriptor = current.descriptor(
-            format_index=target_format,
-            frame_index=target_frame,
-            interval=interval,
-            max_frame=frame_bytes,
-            max_payload=payload,
-        )
-        send_len = 34 if len(descriptor) >= 34 else 26
-        try:
-            self._ctrl_out(UVC_SET_CUR, UVC_VS_PROBE, descriptor[:send_len], timeout_ms)
-        except GlxssError:
-            if send_len == 34:
-                self._ctrl_out(UVC_SET_CUR, UVC_VS_PROBE, descriptor[:26], timeout_ms)
-                send_len = 26
+
+        # 描述符是档位的唯一真相；读不到时用 KNOWN_MODES 兜底。
+        modes = read_frame_modes(self.dev, target_format)
+        if not modes:
+            if self.verbose:
+                print("  [UVC] 读不到 VS 帧描述符，改用内置档位表")
+            modes = tuple(FrameMode(target_format, idx, w, h, w * h * 3 // 2)
+                          for idx, (w, h) in sorted(KNOWN_MODES.items()))
+        self.frame_modes = modes
+        by_index = {mode.frame_index: mode for mode in modes}
+        if self.verbose:
+            print("  VS 帧档位: " + "; ".join(str(mode) for mode in modes))
+
+        target_w = int(self.width or DEFAULT_WIDTH)
+        target_h = int(self.height or DEFAULT_HEIGHT)
+        was_480p = (target_w, target_h) == (LEGACY_WIDTH, LEGACY_HEIGHT)
+
+        if frame_index is not None:
+            # 显式 --frame-index：尊重它，但仍用描述符校正宽高/帧长。
+            candidates = [int(frame_index)]
+            mode = by_index.get(candidates[0])
+            if mode is not None:
+                target_w, target_h = mode.width, mode.height
+                frame_bytes = mode.frame_size
             else:
-                raise
-        committed = descriptor[:send_len]
-        try:
-            back = self._ctrl_in(UVC_GET_CUR, UVC_VS_PROBE, 34, timeout_ms)
-            if len(back) >= 26:
-                committed = back[:34]
+                frame_bytes = int(max_frame or (target_w * target_h * 3 // 2))
+            was_480p = (target_w, target_h) == (LEGACY_WIDTH, LEGACY_HEIGHT)
+        else:
+            matched = [m for m in modes
+                       if (m.width, m.height) == (target_w, target_h)]
+            if matched:
+                # 同一分辨率若有多档（例如两个 720p），逐个试。
+                candidates = [m.frame_index for m in matched]
+            elif (target_w, target_h) == (DEFAULT_WIDTH, DEFAULT_HEIGHT):
+                candidates = [DEFAULT_FRAME_INDEX]
+            elif was_480p:
+                candidates = [LEGACY_FRAME_INDEX]
+            else:
+                candidates = [int(current.frame_index or DEFAULT_FRAME_INDEX)]
+            mode = by_index.get(candidates[0])
+            if mode is not None and target_w == mode.width and target_h == mode.height:
+                frame_bytes = mode.frame_size
+            else:
+                frame_bytes = int(max_frame or (target_w * target_h * 3 // 2))
+
+        attempts = []      # (candidate, got, descriptor, send_len, readback)
+        chosen = None      # (probe, mode)
+        for candidate in candidates:
+            descriptor, send_len, readback = self._set_probe_readback(
+                current, target_format, candidate, interval, frame_bytes,
+                payload, timeout_ms)
+            got = readback.frame_index if readback is not None else None
+            attempts.append((candidate, got, descriptor, send_len, readback))
+            if readback is None or readback.frame_index != candidate:
                 if self.verbose:
-                    print("  GET_CUR(probe) 回读:")
-                    print("    " + Probe.parse(back).format().replace("\n", "\n    "))
-        except GlxssError:
-            pass
-        self._ctrl_out(UVC_SET_CUR, UVC_VS_COMMIT, committed[:send_len], timeout_ms)
-        # Android commit 之后：XU 0x0606=00 ×2 → CLEAR_FEATURE(HALT, 0x81)。
-        self.vendor_post_commit(timeout_ms)
-        # 上一次被取消的 URB / 固件 STALL 会让端点停在 halt，表现为“commit 成功但
-        # 一个字节都不来”；pyusb 的 clear_halt 失败会退回标准控制请求。
-        usb.clear_halt(self.dev, self.ep.bEndpointAddress, verbose=self.verbose)
-        probe = Probe.parse(committed)
+                    print("  [UVC] 请求 frame=%d，回读 frame=%s，继续下一档" % (
+                        candidate, "无" if got is None else got))
+                continue
+            mode = by_index.get(candidate)
+            if mode is not None and (mode.width, mode.height) != (target_w, target_h):
+                if self.verbose:
+                    print("  [UVC] frame=%d 描述符是 %dx%d（目标 %dx%d），跳过" % (
+                        candidate, mode.width, mode.height, target_w, target_h))
+                continue
+            if self.verbose:
+                print("  GET_CUR(probe) 回读:")
+                print("    " + readback.format().replace("\n", "\n    "))
+            # commit 用设备回读的值（它可能修正了 interval/maxFrame）。
+            source = readback.raw[:send_len]
+            if len(source) < send_len:
+                source = descriptor[:send_len]
+            committed = self._commit(source, send_len, timeout_ms)
+            final = readback
+            if (committed is not None and committed.frame_index == candidate
+                    and final.frame_index != candidate):
+                final = committed
+            chosen = (final, mode)
+            break
+
+        # GET_CUR 完全不可用时（控制面半死）无法回读确认：照旧盲 commit 目标
+        # 描述符，让 SET_CUR 有机会把数据面救回来（旧版行为），并标记 unverified。
+        if chosen is None and not any(got is not None for _, got, *_ in attempts):
+            blind = attempts[-1] if attempts else None
+            if blind is not None and blind[2] is not None:
+                candidate, _, descriptor, send_len, _ = blind
+                committed = self._commit(descriptor, send_len, timeout_ms)
+                final = committed or Probe.parse(descriptor)
+                chosen = (final, by_index.get(candidate))
+                self.negotiated_unverified = True
+                print("[UVC] GET_CUR 回读不可用，无法确认 bFrameIndex；"
+                      "已按请求盲 commit frame=%d" % candidate)
+
+        if chosen is None:
+            detail = "；".join(
+                "请求 frame=%d 回读 %s" % (cand, "无" if got is None else got)
+                for cand, got, *_ in attempts) or "没有候选档位"
+            if allow_fallback and not was_480p:
+                print("[UVC] %dx%d（bFrameIndex=%s）协商失败（%s），"
+                      "回退 640×480" % (
+                          target_w, target_h,
+                          "/".join(str(c) for c in candidates), detail))
+                probe = self.negotiate(
+                    format_index=target_format, frame_index=LEGACY_FRAME_INDEX,
+                    fps=fps, max_frame=LEGACY_FRAME_SIZE,
+                    max_payload=payload, timeout=timeout_ms,
+                    allow_fallback=False)
+                self.negotiated_fallback = True
+                print("[UVC] 已回退到 640×480（frame=%d，frameSize=%d）；"
+                      "720p 不可用，画面仍是裁切视角" % (
+                          probe.frame_index, self.frame_size))
+                return probe
+            raise GlxssError(
+                "UVC 协商失败：目标 %dx%d（bFrameIndex=%s）没有生效。\n"
+                "  探测结果：%s\n"
+                "  设备 VS 帧档位：%s\n"
+                "  * 确认没有其他程序占用摄像头；\n"
+                "  * 设备可能坚持 640×480：用 --size 640x480 或允许回退。"
+                % (target_w, target_h, "/".join(str(c) for c in candidates),
+                   detail, "; ".join(str(m) for m in modes)))
+
+        probe, mode = chosen
         self.probe = probe
-        if not self.width or not self.height:
-            self.width, self.height = DEFAULT_WIDTH, DEFAULT_HEIGHT
-        self.frame_size = frame_bytes
-        # urb_size 只是逻辑帧缓冲（frameSize + 22 = 460822，原厂 frameBufferSize）；
+        if mode is not None:
+            self.width, self.height = mode.width, mode.height
+            self.frame_size = mode.frame_size
+        else:
+            self.width, self.height = target_w, target_h
+            self.frame_size = frame_bytes
+        # urb_size 只是逻辑帧缓冲（frameSize + 22，原厂 frameBufferSize）；
         # 单次 USB 读固定 16384，不能用它当 read size：usbfs 单 URB 上限就是 16 KiB，
-        # Android 上拿 460822 去 bulkTransfer 会立刻 -1（不是超时）。
+        # Android 上拿 1,382,422 去 bulkTransfer 会立刻 -1（不是超时）。
         self.urb_size = int(self.frame_size) + URB_SLACK
         self.chunk_size = min(BULK_CHUNK, max(64, self.urb_size))
         # 新会话：清空上一次的字节流组帧状态，避免旧半帧污染新档位。
@@ -467,9 +724,11 @@ class UvcStream:
         self._synced = False
         self.dropped_bytes = 0
         self.synced_frames = 0
-        if probe.frame_index != target_frame and self.verbose:
-            print("  [UVC] 警告：设备回读 bFrameIndex=%d（期望 %d）" % (
-                probe.frame_index, target_frame))
+        self.negotiated_fallback = False
+        if self.verbose:
+            print("  [UVC] 协商成功：frame=%d %dx%d frameSize=%d chunk=%d" % (
+                probe.frame_index, self.width, self.height,
+                self.frame_size, self.chunk_size))
         return probe
 
     def set_dimensions(self, width: int, height: int) -> None:
@@ -499,7 +758,7 @@ class UvcStream:
         """判定 `buf[off]` 开始的是否是合法 UVC payload header（本设备 12 B）。
 
         与 Android `UvcCamera.headerOk()` 逐行一致，用 header 自身的冗余位做校验
-        （误判概率 ~1e-10，远低于“扫 0x0C”：460 KB 里平均会误判十几次）：
+        （误判概率 ~1e-10，远低于“扫 0x0C”：1.38 MB 里平均会误判几十次）：
           * `bHeaderLength ∈ 2..12`；
           * `bmHeaderInfo` bit1(EOF)=1、bit6(ERR)=0；
           * 带 SCR（bit3）时 SCR 前 2 字节 = PTS 前 2 字节（实测
@@ -605,10 +864,10 @@ class UvcStream:
     def read_frame(self, timeout: Optional[int] = None) -> UvcFrame:
         """读一帧：每次 bulk 读 ≤16 KiB，按字节流组帧。
 
-        为什么不能一次 bulk 读 460822：usbfs 单 URB 上限 16384 B（与 libusb
-        MAX_BULK_BUFFER_LENGTH 一致）。Android 上 `bulkTransfer(…, 460822)` 会
-        立刻返回 -1（dt≈0，不是超时）；原厂 libusb 的 460822 是它**内部**拆成
-        ~29 个 16 KiB URB 再重组，不是一次传完。这里显式分块，在主机侧重组成帧。
+        为什么不能一次 bulk 读 1,382,422：usbfs 单 URB 上限 16384 B（与 libusb
+        MAX_BULK_BUFFER_LENGTH 一致）。Android 上 `bulkTransfer(…, 460822/1382422)`
+        会立刻返回 -1（dt≈0，不是超时）；原厂 libusb 的大值只是它**内部**拆成
+        ~85 个 16 KiB URB 再重组，不是一次传完。这里显式分块，在主机侧重组成帧。
         """
         timeout_ms = timeout or self.timeout
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -734,8 +993,8 @@ def decode_yv12_rgba(data: bytes, width: int = DEFAULT_WIDTH,
                      fit: str = "cover", half: bool = False):
     """YV12 → out_width×out_height RGBA uint8，给 monitor 的 10 fps 快路径。
 
-    * fit="cover"（默认）：等比填满、居中裁切；640×480 → 640×400 只裁上下，
-      不缩放，是最快的路径；
+    * fit="cover"（默认）：等比填满、居中裁切；1280×720 → 640×400 左右各裁
+      64 列（全画幅 16:9 裁成 16:10），比 640×480 的“设备侧裁切窗口”更居中；
     * fit="stretch"：直接缩放到目标尺寸；
     * fit="fit"：等比缩放 + 黑边；
     * half=True：Y 隔行隔列取样（320×240），色度用原半分辨率平面，再放大：

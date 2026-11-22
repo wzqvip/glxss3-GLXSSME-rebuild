@@ -3,18 +3,18 @@
 
 链路（**一次采集、一次解码、多消费者分发**，对齐原厂 `:llvision_G25`）：
 
-    GLXSS G25（UVC bulk IN，YV12 640×480）
+    GLXSS G25（UVC bulk IN，YV12 1280×720）
       → pyusb 读帧线程（和 `glxss uvc` 同一条路，需要 --detach 摘掉 uvcvideo）
       → 发布到「最新帧槽」`pipeline.LatestFrame`（旧的直接丢，不排队）
            ├─ 编码线程 → ffmpeg stdin（YV12→yuv420p 只换写入顺序，零像素拷贝）
            │            → h264_v4l2m2m（Pi 硬编码 /dev/video11）→ RTSP
-           └─ LCD 线程 → 2×2 抽样 320×200 → YUV→RGB → 640×400 → 眼镜 bulk OUT
+           └─ LCD 线程 → 4×4 抽样 320×180/320×200 → YUV→RGB → 640×400 → 眼镜
                         （--mirror-fps 限速，丢旧帧）
 
 备选输出：
 
     * MJPEG HTTP（:8080/stream）：OBS 用「VLC 视频源」拉；不需要 mediamtx，
-      但 640×480 JPEG 在 Zero 2 W 上只能跑 ~8-12 fps，CPU 也更高。
+      但 720p JPEG 在 Zero 2 W 上更慢，只作调试用。
     * 眼镜预览（--mirror-fps）：把同一路画面低帧率投到眼镜 640×400 屏上，
       方便对准；和 HUD 主进程抢 LCD 接口，二选一。
 
@@ -61,11 +61,11 @@ class StreamConfig:
     """一路直播的全部参数（`pi/stream.py` 负责把命令行映射到这里）。"""
 
     rtsp_url: str = DEFAULT_RTSP
-    width: int = 640
-    height: int = 480
-    fps: float = 20.0
-    # UVC 描述符里的格式/帧序号；None=沿用设备当前值。这台相机同时提供
-    # 1920x1080/1280x960/640x480 等多个 bFrameIndex，默认帧不一定是 640x480。
+    width: int = 1280
+    height: int = 720
+    fps: float = 15.0
+    # UVC 描述符里的格式/帧序号；None=negotiate() 按分辨率自动选（720p=frame 3）。
+    # 设备 YV12 还有 1920×1080 / 1280×960 / 640×480 等档位（见 uvc.KNOWN_MODES）。
     format_index: Optional[int] = None
     frame_index: Optional[int] = None
     bitrate: str = "1500k"
@@ -87,6 +87,7 @@ class StreamConfig:
     mjpeg_quality: int = 70
     mirror_fps: float = 0.0
     mirror_fit: str = "fit"
+    mirror_rotate: int = 0
     mirror_level: bool = True
     # 观测
     api_url: str = ""
@@ -120,6 +121,8 @@ class StreamConfig:
             raise GlxssError("--mirror-fps 不能为负")
         if self.mirror_fit not in ("fit", "cover", "crop", "stretch"):
             raise GlxssError("--mirror-fit 只能是 fit/cover/stretch")
+        if self.mirror_rotate not in (0, 180):
+            raise GlxssError("--mirror-rotate 只能是 0 或 180")
         if self.frame_index is not None and not 1 <= self.frame_index <= 255:
             raise GlxssError("--frame-index 必须在 1..255")
         if self.format_index is not None and not 1 <= self.format_index <= 255:
@@ -129,19 +132,19 @@ class StreamConfig:
 
     @classmethod
     def from_args(cls, args) -> "StreamConfig":
-        """把 argparse.Namespace 转成配置；尺寸支持 `--size 640x480`。"""
-        width, height = 640, 480
+        """把 argparse.Namespace 转成配置；尺寸支持 `--size 1280x720`。"""
+        width, height = 1280, 720
         size = getattr(args, "size", None)
         if size:
             try:
                 width, height = (int(part) for part in str(size).lower().split("x", 1))
             except Exception as exc:
-                raise GlxssError("--size 格式应为 640x480，收到 %r" % (size,)) from exc
+                raise GlxssError("--size 格式应为 1280x720，收到 %r" % (size,)) from exc
         config = cls(
             rtsp_url=getattr(args, "rtsp", DEFAULT_RTSP) or "",
             width=width,
             height=height,
-            fps=float(getattr(args, "fps", 20.0)),
+            fps=float(getattr(args, "fps", 15.0)),
             format_index=getattr(args, "format_index", None),
             frame_index=getattr(args, "frame_index", None),
             bitrate=str(getattr(args, "bitrate", "1500k")),
@@ -158,6 +161,7 @@ class StreamConfig:
             mjpeg_quality=int(getattr(args, "mjpeg_quality", 70)),
             mirror_fps=float(getattr(args, "mirror_fps", 0.0) or 0.0),
             mirror_fit=str(getattr(args, "mirror_fit", "fit")),
+            mirror_rotate=int(getattr(args, "mirror_rotate", 0) or 0),
             mirror_level=bool(getattr(args, "mirror_level", True)),
             api_url=str(getattr(args, "api_url", "") or ""),
             stats_interval=float(getattr(args, "stats_interval", 2.0)),
@@ -195,7 +199,8 @@ def yv12_to_i420(data: bytes, width: int, height: int) -> bytes:
 
     Debian 12 的 ffmpeg 5.1 已移除 `yv12` 像素格式（`-pix_fmt yv12` 报
     "No such pixel format"），所以这里交换两个色度平面再喂给 ffmpeg。
-    640×480 下只是一次 460 KB 的内存拷贝，20 fps 时开销 <1% CPU。
+    1280×720 下是一次 1.38 MB 的整帧切片，实际编码走
+    `pipeline.write_yv12_as_i420()`（三次 memoryview 写入，零像素拷贝）。
     """
     y_size = width * height
     c_size = y_size // 4
@@ -334,7 +339,7 @@ class FfmpegEncoder:
         """把一帧 YV12 按 yuv420p 顺序写进 stdin，返回字节数；管道断了返回 0。
 
         YV12 = Y|V|U、yuv420p = Y|U|V，所以只要按 Y→U→V 的顺序分三次写，
-        不用在 Python 里拼 460 KB 的新 buffer（见 pipeline.yv12_plane_views）。
+        不用在 Python 里拼 1.38 MB 的新 buffer（见 pipeline.yv12_plane_views）。
         数据长度不对会抛 GlxssError，调用方只丢这一帧。
         """
         proc = self.proc

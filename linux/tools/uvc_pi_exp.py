@@ -5,7 +5,7 @@
 用途：在不改主代码的前提下逐项对照 Android 的成功参数，找出 Pi 上
 “probe/commit 成功但 bulk IN 超时”的差异。
 
-    python3 tools/uvc_pi_exp.py --chunk 16384 --frame 4 --interval 333333
+    python3 tools/uvc_pi_exp.py --chunk 16384 --frame 3 --max-frame 1382400 --interval 333333
     python3 tools/uvc_pi_exp.py --chunk 460822        # 复现“一次读整帧”（usbfs 拒绝）
     python3 tools/uvc_pi_exp.py --chunk 65536         # 复现旧实现的 64 KiB 读缓冲
     python3 tools/uvc_pi_exp.py --hid --lcd --seconds 10
@@ -13,8 +13,9 @@
 关键点（与 Android 一致）：
   * claim 顺序 VC(if0) → HID(if2) → VS(if1 alt) 全部 force；
   * setInterface(VS alt) 即使返回 false 也继续；
-  * probe: bmHint=1, format=1, frame=4, interval=333333, maxFrame=460800,
-    maxPayload=16384；commit 原样提交 GET_CUR 回读；
+  * probe 默认 bmHint=1, format=1, frame=3（1280×720）, interval=333333,
+    maxFrame=1382400, maxPayload=16384；commit 原样提交 GET_CUR 回读。
+    测 640×480 回退档用 `--frame 4 --max-frame 460800`；
   * 单次 bulk 读默认 16384 B（usbfs 单 URB 上限）；读到的字节流按
     `hdrLen + maxFrame` 组帧（与 glxss.uvc 相同的 header 校验/重同步）；
   * header 无效只计一次、继续读（不中止）。
@@ -243,10 +244,10 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--chunk", "--urb", dest="chunk", type=int, default=16384,
                    help="单次 bulk 读字节数（usbfs 单 URB 上限 16384）")
-    p.add_argument("--frame", type=int, default=4)
+    p.add_argument("--frame", type=int, default=3)
     p.add_argument("--format", type=int, default=1)
     p.add_argument("--interval", type=int, default=333333)
-    p.add_argument("--max-frame", type=int, default=460800)
+    p.add_argument("--max-frame", type=int, default=1382400)
     p.add_argument("--max-payload", type=int, default=16384)
     p.add_argument("--timeout", type=int, default=5000)
     p.add_argument("--seconds", type=float, default=10.0)

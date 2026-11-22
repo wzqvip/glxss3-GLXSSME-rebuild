@@ -6,9 +6,9 @@
 
 例子（Pi 上跑，mediamtx 也在 Pi 上）：
 
-    python3 pi/stream.py                          # 640×480@20fps 1.5Mbps → 本机 mediamtx
+    python3 pi/stream.py                          # 1280×720@15fps 2Mbps → 本机 mediamtx
     python3 pi/stream.py --check                  # 只检查 UVC 能不能读、实测 fps
-    python3 pi/stream.py --fps 25 --bitrate 2M    # 画面更顺/更清晰，CPU 也更高
+    python3 pi/stream.py --fps 25 --bitrate 3M    # 720p 编码 25fps（采集受 USB 带宽限制）
     python3 pi/stream.py --mjpeg-port 8080        # 顺带开 MJPEG，OBS 用 VLC 源
     python3 pi/stream.py --mirror-fps 3           # 同时把画面投到眼镜上预览
 
@@ -56,14 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rtsp", default=DEFAULT_RTSP,
                    help="RTSP 推流地址（mediamtx 的 path）")
     p.add_argument("--no-rtsp", action="store_true", help="不推 RTSP（只做 MJPEG/预览）")
-    p.add_argument("--size", default="640x480", help="采集分辨率，宽x高（YUV420 需偶数）")
+    p.add_argument("--size", default="1280x720", help="采集分辨率，宽x高（YUV420 需偶数）")
     p.add_argument("--format-index", type=int, default=None,
                    help="UVC bFormatIndex（默认 1=YV12，Android 实测值）")
     p.add_argument("--frame-index", type=int, default=None,
-                   help="UVC bFrameIndex（默认 4=640x480@30；不要再沿用设备残留值）")
-    p.add_argument("--fps", type=float, default=20.0,
-                   help="目标帧率；同时作为 UVC 协商 interval（30→333333）。"
-                        "相机实际 20-25，Pi 上建议 20")
+                   help="UVC bFrameIndex（默认按描述符自动选 3=1280x720@30）")
+    p.add_argument("--fps", type=float, default=15.0,
+                   help="目标帧率；同时作为 UVC 协商 interval。"
+                        "720p 在 Pi Zero 2 W 上实测约 14-15fps（USB 带宽上限）")
     p.add_argument("--bitrate", default="1500k", help="H.264 码率（如 1500k、2M）")
     p.add_argument("--maxrate", default="", help="可选：最大码率（CBR 时和 --bitrate 相同）")
     p.add_argument("--bufsize", default="", help="可选：码率缓冲（如 3000k）")
@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mjpeg-quality", type=int, default=70, help="MJPEG 质量 10-95")
     p.add_argument("--mirror-fps", type=float, default=0.0,
                    help="投到眼镜屏的帧率（0=关；开启会占用 LCD 接口，和 HUD 冲突）")
+    p.add_argument("--mirror-rotate", type=int, choices=(0, 180), default=0,
+                   help="眼镜预览旋转：0=正常 / 180=画面上下颠倒时用")
     p.add_argument("--mirror-fit", default="fit",
                    choices=["fit", "cover", "crop", "stretch"], help="眼镜预览的映射方式")
     p.add_argument("--mirror-level", dest="mirror_level", action="store_true",
@@ -124,9 +126,13 @@ def run_check(config: StreamConfig) -> int:
         for _ in range(count):
             frame = source.read()
         elapsed = max(1e-6, time.monotonic() - started)
-        print("[check] 实测 %.1f fps，%.2f MB/s，frame_size=%d" % (
-            count / elapsed, count * frame.frame_size / elapsed / 1e6,
-            frame.frame_size))
+        print("[check] 实测 %dx%d，%.1f fps，%.2f MB/s，frame_size=%d" % (
+            frame.width, frame.height, count / elapsed,
+            count * frame.frame_size / elapsed / 1e6, frame.frame_size))
+        stream = getattr(source, "stream", None)
+        if stream is not None and getattr(stream, "negotiated_fallback", False):
+            print("[check] 警告：1280×720 协商失败，已回退 %dx%d（画面仍是裁切视角）"
+                  % (frame.width, frame.height))
     finally:
         source.close()
     print("[check] OK")

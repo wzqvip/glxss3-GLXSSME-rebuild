@@ -416,7 +416,7 @@ export GLXSS_SOCK=/tmp/glxssctl.sock   # 与上面一致
 /opt/glxss/venv/bin/python -m glxss ctl view hud
 ```
 
-眼镜 UVC 640×480 YV12 → 640×400 RGBA，叠加三分线/水平仪/可选 REC 后发回眼镜。
+眼镜 UVC **1280×720** YV12（全画幅，frame 3）→ 640×400 RGBA，叠加三分线/水平仪/可选 REC 后发回眼镜。
 `glxss-cast.service` 必须带 `--detach`，否则 UVC VS 接口被 uvcvideo 占用。
 CPU 紧张时给主进程加 `--uvc-half`（先解 320×240 再放大）。独立运行：
 `glxss cast --source uvc --fps 10 --detach --rotate 180 --rec`。

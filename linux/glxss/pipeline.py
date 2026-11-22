@@ -4,13 +4,13 @@
 链路：
 
     UVC 读线程（`stream.Streamer.run` 主循环，16 KiB 分块组帧）
-      └─ 读到一整帧 YV12（`bytes`，不可变，460800 B）
+      └─ 读到一整帧 YV12（`bytes`，不可变，1,382,400 B）
            └─ LatestFrame.publish()            # 只覆盖一个槽，旧的直接丢
                 ├─ EncoderSink 线程 → ffmpeg stdin（YV12→yuv420p **只换写入顺序**）
-                └─ LcdSink  线程 → 320×200 降采样 → YUV→RGB → 640×400 → 眼镜
+                └─ LcdSink  线程 → 4×4 抽样 → YUV→RGB → 640×400 → 眼镜
 
 为什么不是「推流一个进程 + 监看一个进程」：UVC 只有一条流，谁多读一次谁就多
-一次 460 KB 拷贝、一次 YUV→RGBA 解码；Pi Zero 2 W 只有 4 个 1 GHz A53 核，
+一次 1.38 MB 拷贝、一次 YUV→RGBA 解码；Pi Zero 2 W 只有 4 个 1 GHz A53 核，
 两个进程抢 CPU 的结果就是采集掉到 4.6 fps（见 `pi/STREAM.md` §8.5 优化前记录）。
 原厂的做法是单线程读、共享一帧、各消费者各取最新，这里照做。
 
@@ -134,8 +134,8 @@ def yv12_plane_views(data, width: int, height: int):
 
     这是喂 ffmpeg 的「零转换」关键：yuv420p = Y|U|V，YV12 = Y|V|U，两者只是
     后两段顺序不同。rawvideo 解复用器按字节流读一整帧（``avio_read`` 会循环读满
-    ``frame_size``），所以分三次 ``write()`` 与拼 460 KB 大 buffer 再写一次**完全
-    等价**，但省掉了 Python 侧 460 KB 的 memcpy。
+    ``frame_size``），所以分三次 ``write()`` 与拼 1.38 MB 大 buffer 再写一次**完全
+    等价**，但省掉了 Python 侧 1.38 MB 的 memcpy。
 
     顺带查证过 ffmpeg 的 ``-vf shuffleplanes=0:2:1``：**它并不零转换**。5.1 的
     shuffleplanes 只接受带 alpha 的 yuva420p，会在前后各自动插入一个
@@ -261,9 +261,13 @@ def yuv_to_lcd_rgb(y_small, u_small, v_small):
     return Image.merge("YCbCr", (y_img, u_img, v_img)).convert("RGB")
 
 
-def _plane_image(plane, width: int, height: int, left: int = 0, top: int = 0):
-    """numpy 平面切片 → L 模式 PIL 图；连续切片走 ``frombuffer``（零拷贝）。"""
-    view = plane[top:top + height, left:left + width]
+def _plane_image_view(view):
+    """numpy 2D 视图 → L 模式 PIL 图；连续时走 ``frombuffer``（零拷贝）。
+
+    非连续视图（带 step 的抽样）先 ``ascontiguousarray`` 拷一小块：720p 的
+    4×4 抽样只有 288×180 = 52 KB，比整幅 1.38 MB 小两个数量级。
+    """
+    height, width = view.shape
     if view.flags.c_contiguous:
         return Image.frombuffer("L", (width, height), view, "raw", "L", 0, 1)
     return Image.frombytes("L", (width, height),
@@ -271,26 +275,32 @@ def _plane_image(plane, width: int, height: int, left: int = 0, top: int = 0):
 
 
 class LcdRenderer:
-    """一帧 YV12 → 640×400 RGBA 包（三分线 + 水平仪），复用同一个输出 packet。
+    """一帧 YV12（1280×720）→ 640×400 RGBA 包（三分线 + 水平仪），复用 packet。
 
-    全部转换都在**半分辨率**（320×240，cover 裁切成 320×200）上做——像素数
-    只有 1/4：
+    720p 输入按 **4×4 整数抽样**（480p 回退时 2×2）直接得到 320×180 / 320×200
+    级别的小图，像素数只有整幅的 1/16～1/4：
 
-      1. Y/U/V 平面按 2×2 抽样成半分辨率（Y 走 PIL 的 NEAREST 缩小，U/V 本来
-         就是半分辨率）；``Image.frombuffer`` 让平面**零拷贝**变成 PIL 图；
-      2. 有限范围 → 全范围的 256 项 LUT（``Image.point``，C 实现）；
-      3. ``Image.merge("YCbCr") + convert("RGB")``：色彩矩阵用 PIL 的 C 代码
+      1. 按 ``fit`` 先定裁切框：cover 取居中的 16:10 窗口（1280×720 →
+         1152×720，左右各裁 64 列，**居中**所以不会像原 480p 窗口那样偏左）；
+         fit/stretch 用整幅（保住全画幅 16:9）；
+      2. Y 按 ``step`` 整数抽样，U/V 按 ``step/2``（4:2:0 本来就半分辨率），
+         三者严格 1:1 配对；带 stride 的视图只拷贝 52 KB 级的小块；
+      3. 有限范围 → 全范围的 256 项 LUT（``Image.point``，C 实现）；
+      4. ``Image.merge("YCbCr") + convert("RGB")``：色彩矩阵用 PIL 的 C 代码
          （numpy 定点公式在 Pi Zero 2 W 上要 14 ms，这里是 4 ms 级）；
-      4. 半分辨率上画三分线/水平仪（0.4 ms），``convert("RGBA")`` 时 alpha
+      5. 320×200 上画三分线/水平仪（0.4 ms），``convert("RGBA")`` 时 alpha
          天然是 255，不用再 putalpha；
-      5. 2× 最近邻放大**直接写进复用的 packet**（numpy 四象限 uint32 赋值，
+      6. 2× 最近邻放大**直接写进复用的 packet**（numpy 四象限 uint32 赋值，
          3.8 ms）。不用 ``resize()+tobytes()``：那会每帧新分配 2 MB，光缺页
          就要 11 ms（Pi Zero 2 W 实测）。
 
-    ``fit`` 语义与 ``--mirror-fit`` 一致：cover/stretch/fit/crop。
+    ``fit`` 语义与 ``--mirror-fit`` 一致：cover/stretch/fit/crop（crop=cover）。
+    ``rotate=180`` 时先翻转源画面再画叠加层（叠加层保持正立）。
     """
 
-    def __init__(self, fit: str = "fit", level: Optional[Callable[[], object]] = None):
+    def __init__(self, fit: str = "fit", level: Optional[Callable[[], object]] = None,
+                 rotate: int = 0):
+        self.rotate = 180 if int(rotate or 0) % 360 == 180 else 0
         if np is None:
             raise GlxssError("LCD 渲染需要 numpy：sudo apt install -y python3-numpy")
         if Image is None:
@@ -315,22 +325,39 @@ class LcdRenderer:
 
     # -- 采样 --------------------------------------------------------------
     def _ycbcr(self, frame):
-        """YV12 → 半分辨率 YCbCr 图（U/V 与缩小后的 Y 1:1 配对）。"""
+        """YV12 → 小尺寸 YCbCr 图（U/V 与抽样后的 Y 1:1 配对）。
+
+        1280×720 + cover：裁 1152×720 → step=4 → 288×180；
+        1280×720 + fit  ：整幅 → step=4 → 320×180（再居中加 10 px 黑边）；
+        640×480  + cover：裁 640×400 → step=2 → 320×200（旧行为）。
+        """
         width, height = frame.width, frame.height
         if width <= 0 or height <= 0 or width % 2 or height % 2:
             raise GlxssError("YUV420 宽高必须是正偶数（当前 %dx%d）" % (width, height))
         y_plane, u_plane, v_plane = yv12_planes(frame.data, width, height)
         if self.fit == "cover":
             crop_w, crop_h = cover_box(width, height)
-            left = ((width - crop_w) // 2) // 2 * 2
-            top = ((height - crop_h) // 2) // 2 * 2
         else:
-            crop_w, crop_h, left, top = width, height, 0, 0
-        half_w, half_h = crop_w // 2, crop_h // 2
-        y_big = _plane_image(y_plane, crop_w, crop_h, left, top)
-        y_small = y_big.resize((half_w, half_h), Image.NEAREST)
-        u_small = _plane_image(u_plane, half_w, half_h, left // 2, top // 2)
-        v_small = _plane_image(v_plane, half_w, half_h, left // 2, top // 2)
+            crop_w, crop_h = width, height
+        # 整数步长：抽样后的尺寸尽量接近半分辨率画布 320×200。
+        # 4:2:0 要求步长为偶数，色度平面才能按 step/2 整除。
+        step = max(2, int(round(min(crop_w / LCD_HALF_W, crop_h / LCD_HALF_H))))
+        step -= step % 2
+        # 裁切框先对齐到 step 的整数倍，保证 Y/U/V 抽样后尺寸完全一致。
+        crop_w = max(2, crop_w - crop_w % step)
+        crop_h = max(2, crop_h - crop_h % step)
+        left = max(0, ((width - crop_w) // 2) // 2 * 2)
+        top = max(0, ((height - crop_h) // 2) // 2 * 2)
+        crop_w = min(crop_w, (width - left) - (width - left) % step)
+        crop_h = min(crop_h, (height - top) - (height - top) % step)
+        y_small = _plane_image_view(
+            y_plane[top:top + crop_h:step, left:left + crop_w:step])
+        u_small = _plane_image_view(
+            u_plane[top // 2:(top + crop_h) // 2:step // 2,
+                    left // 2:(left + crop_w) // 2:step // 2])
+        v_small = _plane_image_view(
+            v_plane[top // 2:(top + crop_h) // 2:step // 2,
+                    left // 2:(left + crop_w) // 2:step // 2])
         return yuv_to_lcd_rgb(y_small, u_small, v_small)
 
     def _to_lcd_canvas(self, rgb):
@@ -385,6 +412,9 @@ class LcdRenderer:
     def render(self, frame):
         """渲染一帧，返回**复用的** ``array('B')`` 帧包（长度 1,024,016）。"""
         image = self._to_lcd_canvas(self._ycbcr(frame))
+        if self.rotate == 180:
+            # 相机/面板装反时翻转源画面；叠加层随后绘制，保持正立。
+            image = image.transpose(Image.ROTATE_180)
         draw = ImageDraw.Draw(image, "RGBA")  # RGB 图 + "RGBA" 才有 alpha 混合
         self._draw_grid(draw)
         self._draw_level(draw)
@@ -508,7 +538,8 @@ class LcdSink:
         self.link = link if link is not None else lcd.LcdLink(
             dev, ep_addr, timeout=self.timeout)
         self.renderer = LcdRenderer(fit=getattr(config, "mirror_fit", "fit"),
-                                    level=level)
+                                    level=level,
+                                    rotate=getattr(config, "mirror_rotate", 0))
         self._level_poller = level_poller
         self.stats = LcdStats()
         self._lock = threading.Lock()

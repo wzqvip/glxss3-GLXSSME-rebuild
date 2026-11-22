@@ -335,16 +335,19 @@ glxss ctl rec on
 
 * 叠加层：三分线（九宫格）、水平仪（HID 加速度计 pitch/roll，地平线 + 准星）、
   `rec` 时右上角红点 + `REC mm:ss`；
-* 映射：默认 `cover`——640×480 上下各裁 40 行得到 640×400，**不缩放**，最快；
-  `--monitor-fit stretch|fit` 会重采样，Pi Zero 2 W 上明显更慢；
+* 映射：默认 `cover`——1280×720 居中裁掉左右各 64 列得到 1152×720（16:10），
+  再 4×4 抽样到 288×180、填满 320×200；**居中裁切**，不会再像旧 640×480
+  裁切窗口那样偏左。`--monitor-fit stretch|fit` 会重采样，Pi Zero 2 W 上更慢；
 * `--camera-fps` 只控制 UVC 协商帧率（默认 15），发送帧率仍由 `--fps` 控制；
-  需要更低延迟可设 30，但会多占 USB 带宽；
+  720p 在 Pi Zero 2 W 上实测约 17–19 fps（USB 同步读上限）；
 * UVC 读帧 + YV12→RGBA 在后台线程，主循环永远取“最新完成的一帧”发送；
   解码慢只丢旧帧，不拖慢发送；
 * **UVC 每次 bulk 读 16384 B（16 KiB），按字节流组帧**：usbfs 单 URB 上限就是
-  16384（= libusb `MAX_BULK_BUFFER_LENGTH`）。一帧仍是 `12 B header + 460800 B
-  YV12 = 460812`，由 `UvcStream.read_frame()` 从 ~29 个 16 KiB 块拼出来；
-  460822 只是原厂 `frameBufferSize`（libusb 内部拆 URB），不能拿来当单次读尺寸。
+  16384（= libusb `MAX_BULK_BUFFER_LENGTH`）。默认一帧是 `12 B header +
+  1,382,400 B YV12 = 1,382,412`（1280×720），由 `UvcStream.read_frame()` 从
+  ~85 个 16 KiB 块拼出来；640×480 回退时是 `12 + 460,800 = 460,812`（~29 块）。
+  1,382,422 / 460,822 只是原厂 `frameBufferSize`（libusb 内部拆 URB），
+  不能拿来当单次读尺寸。
   header 校验用 `bHeaderLength=12 + EOF=1 + ERR=0 + SCR[0..1]==PTS[0..1]`，
   未同步时丢弃到下一个合法 header（流从帧中间开始是常态）；
 * 同一 `UsbDeviceConnection` 上 UVC bulk IN 与 LCD bulk OUT 并发；HID/亮度/模式
@@ -354,7 +357,8 @@ glxss ctl rec on
   切回 HUD 再恢复，不需要重启进程；
 * Linux 必须加 `--detach`（uvcvideo 占着 UVC 接口）；和 `glxss uvc` 一样。
 
-Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
+Pi Zero 2 W 实测（合成 YV12 640×480，CPU 1 GHz，performance governor；
+720p 的整帧解码约 2.25×，直播的眼镜预览已改走 4×4 抽样，不走这张表）：
 
 | 路径 | 单帧耗时 |
 |---|---:|
@@ -373,13 +377,22 @@ Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
 > 读不到帧，是固件媒体流水线停摆，见 `docs/device-recovery.md`（需重灌固件，
 > 不在本工具范围内）。
 
-真机 UVC（2026-11-22，`2e09:0030` + 16 KiB 分块组帧）：
+真机 UVC（2026-11-22，`2e09:0030` + 16 KiB 分块组帧）。**默认 1280×720
+（bFrameIndex=3，全画幅）**；640×480（frame 4）保留为回退：
+
+| 项 | 实测（720p，默认） |
+|---|---|
+| `pi/stream.py --check --fps 30` | **1280×720，18.6–19.0 fps / 25.7–26.2 MB/s**（预热 2 帧后） |
+| 稳态读帧 | **19.0 fps**，0 丢弃字节；`/tmp/full720_steady.png` 1280×720 |
+| RTSP `--fps 25` | 采集 16.9–17.2 fps、编码同采集、0 重启；ffprobe `h264 1280x720 25/1`；CPU python+ffmpeg **~61–64%** |
+| RTSP + 投屏（`--fps 25 --mirror-fps 10`） | 采集 13.0–13.2 fps、编码 13.2、眼镜 **10.0 fps / 46–56 ms**；CPU **~79%**，45°C 无降频 |
+
+640×480 回退档（历史，2026-11-22 早些时候）：
 
 | 项 | 实测 |
 |---|---|
-| `pi/stream.py --check --fps 30` | **29.9 fps / 13.80 MB/s**（预热 2 帧后） |
+| `--check --fps 30` | **29.9 fps / 13.80 MB/s** |
 | 稳态读帧 | **30.0 fps**，33.3 ms/帧，0 丢弃字节 |
-| `glxss cast --source uvc --fps 10 --rotate 180` | 发送 10.0 fps / 10.21 MB/s，100 帧 0 失败，UVC 读 15 fps |
 | RTSP `--fps 20` | 采集 30.0 fps、发送 20.0 fps、0 重启；ffprobe `h264 640x480 20/1` |
 | RTSP `--fps 25` | 采集 30.0 fps、编码 25.1 fps，CPU（python+ffmpeg）**41.0%** |
 
@@ -388,10 +401,11 @@ Pi Zero 2 W 实测（合成 YV12，CPU 1 GHz，performance governor）：
 `pi/stream.py --mirror-fps N` 不再是「再读一次 UVC、再解一次码」，而是：
 
 ```text
-UVC 读线程（16 KiB 分块组帧，30 fps）
+UVC 读线程（16 KiB 分块组帧，720p 实测 ~17–19 fps）
   → LatestFrame.publish()                  # 一个槽，旧的直接丢，不排队
        ├─ EncoderSink 线程 → ffmpeg stdin（YV12→yuv420p 只换写入顺序，零拷贝）
-       └─ LcdSink 线程   → 320×200 → YUV→RGB(C) → 640×400 → OSD → bulk OUT
+       └─ LcdSink 线程   → 4×4 抽样 288×180/320×180 → YUV→RGB(C) → 640×400
+                          → OSD → bulk OUT
 ```
 
 * 读线程只「读 + 发布」，**任何消费者慢都不会拖慢采集**；
@@ -400,12 +414,16 @@ UVC 读线程（16 KiB 分块组帧，30 fps）
 * 眼镜这一路的额外成本：~13 ms 渲染 + 1 MB bulk OUT（4 ms CPU），10 fps 合计
   约 0.13 个 A53 核。
 
-Pi Zero 2 W 真机（同一条命令 `--fps 25 --mirror-fps 10`，20 s 以上稳态）：
+Pi Zero 2 W 真机（同一台设备，20 s 以上稳态）。640×480 是 2026-11-22 早些时候的
+历史数据；720p 是切到全画幅后的当前数据：
 
-| 指标 | 优化前 | 优化后 |
-|---|---|---|
-| 采集 / 编码 / 眼镜 fps | 4.6 / 4.6 / 4.6 | **30.0 / 25.0 / 10.0** |
-| CPU（python + ffmpeg） | 87.8% | **65–69%**（三次：64.4 / 65.7 / 68.5） |
+| 指标 | 640×480 优化前 | 640×480 优化后 | **1280×720 默认** |
+|---|---|---|---|
+| 采集 / 编码 / 眼镜 fps | 4.6 / 4.6 / 4.6 | **30.0 / 25.0 / 10.0** | **13.0 / 13.2 / 10.0** |
+| CPU（python + ffmpeg） | 87.8% | **65–69%** | **~79%** |
+
+> 720p 的采集上限是 USB 同步读（~26 MB/s），不是 CPU；眼镜侧仍是 10 fps /
+> 46–56 ms（渲染 ~10 ms + 1 MB bulk OUT ~40 ms）。
 
 > 为什么不用 `-vf shuffleplanes`（它会插入 yuva420p 转换，不是零成本）、
 > 为什么半分辨率 + PIL `NEAREST` 而不是 `BILINEAR`、怎么把渲染压到 ~13 ms，

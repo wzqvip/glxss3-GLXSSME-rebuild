@@ -489,7 +489,8 @@ class UvcChunkFramingTests(unittest.TestCase):
     """16 KiB 分块 + 字节流组帧（Android cc310be 的移植）。
 
     背景：usbfs 单次 bulk 读上限 16384 B（= libusb MAX_BULK_BUFFER_LENGTH），
-    一次读 460822 在 Android 上立刻 -1；设备侧一帧仍是 12 B header + 460800 B。
+    一次读 1,382,422 在 Android 上立刻 -1；设备侧一帧是 12 B header +
+    1,382,400 B（1280×720，默认）或 460,800 B（640×480 回退）。
     """
 
     @staticmethod
@@ -541,6 +542,24 @@ class UvcChunkFramingTests(unittest.TestCase):
         self.assertEqual(second.data, payload)
         self.assertEqual(stream.synced_frames, 2)
         self.assertLessEqual(max(dev.sizes), 16384)
+
+    def test_production_720p_frame_uses_16k_chunks(self):
+        header, payload = self._frame(1280, 720)
+        dev = self.ChunkDev(header + payload + header + payload)
+        stream = uvc.UvcStream(dev, SimpleNamespace(bInterfaceNumber=1),
+                               SimpleNamespace(bEndpointAddress=0x81), timeout=2000)
+        stream.set_dimensions(1280, 720)
+        self.assertEqual(stream.frame_size, 1382400)
+        frame = stream.read_frame()
+        self.assertEqual(frame.data, payload)
+        self.assertEqual(len(frame.data), 1382400)
+        self.assertEqual(frame.header.header_len + len(frame.data), 1382412)
+        self.assertEqual((frame.width, frame.height), (1280, 720))
+        self.assertLessEqual(max(dev.sizes), 16384)
+        self.assertGreater(len(dev.sizes), 80)       # 1.38 MB / 16 KiB ≈ 85 块
+        second = stream.read_frame()
+        self.assertEqual(len(second.data), 1382400)
+        self.assertEqual(stream.synced_frames, 2)
 
     def test_header_split_across_chunks(self):
         header, payload = self._frame(8, 8)
@@ -625,20 +644,26 @@ class UvcHeaderTests(unittest.TestCase):
 
 
 class UvcNegotiateTests(unittest.TestCase):
-    """Pi 侧回归：probe 不能沿用 GET_CUR 的残留档位，URB 必须 frameSize+22。"""
+    """Pi 侧回归：默认协商 1280×720(frame 3)，回读确认，失败回退 640×480。"""
+
+    @staticmethod
+    def _probe(frame=4, fmt=1, interval=333333, max_frame=460800,
+               max_payload=16384):
+        cur = bytearray(34)
+        struct.pack_into("<H", cur, 0, 1)
+        cur[2], cur[3] = fmt, frame
+        struct.pack_into("<I", cur, 4, interval)
+        struct.pack_into("<I", cur, 18, max_frame)
+        struct.pack_into("<I", cur, 22, max_payload)
+        return cur
 
     @staticmethod
     def _poisoned_probe():
         # 半坏状态：bFrameIndex=1（1080p）、maxPayload=GET_MAX 全局上限。
-        cur = bytearray(34)
-        struct.pack_into("<H", cur, 0, 1)
-        cur[2], cur[3] = 1, 1
-        struct.pack_into("<I", cur, 4, 333333)
-        struct.pack_into("<I", cur, 18, 460800)
-        struct.pack_into("<I", cur, 22, 19693452)
-        return cur
+        return UvcNegotiateTests._probe(frame=1, max_frame=3110400,
+                                        max_payload=19693452)
 
-    def test_negotiate_overrides_residual_frame_and_urb(self):
+    def test_negotiate_selects_720p_frame3_and_confirms(self):
         state = {"cur": self._poisoned_probe()}
         writes = []
 
@@ -652,6 +677,7 @@ class UvcNegotiateTests(unittest.TestCase):
                 payload = bytes(data_or_length)
                 writes.append((value, payload))
                 if value == uvc.UVC_VS_PROBE:
+                    # 设备接受并回填（和真机一样：回读就是 SET 的值）
                     state["cur"] = bytearray(payload.ljust(34, b"\x00"))
                 return len(payload)
 
@@ -660,15 +686,48 @@ class UvcNegotiateTests(unittest.TestCase):
             SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
         probe = stream.negotiate(fps=30)
         self.assertEqual(probe.format_index, 1)
-        self.assertEqual(probe.frame_index, 4)
+        self.assertEqual(probe.frame_index, 3)          # 720p
         self.assertEqual(probe.interval, 333333)
-        self.assertEqual(stream.frame_size, 460800)
-        self.assertEqual(stream.urb_size, 460822)       # 逻辑帧缓冲（日志用）
+        self.assertEqual(stream.frame_size, 1382400)
+        self.assertEqual(stream.width, 1280)
+        self.assertEqual(stream.height, 720)
+        self.assertEqual(stream.urb_size, 1382422)      # 逻辑帧缓冲（日志用）
         self.assertEqual(stream.chunk_size, 16384)      # 单次 bulk 读 ≤16 KiB
-        self.assertEqual(stream.frame_size + uvc.MAX_HEADER, 460812)
+        self.assertEqual(stream.frame_size + uvc.MAX_HEADER, 1382412)
+        self.assertFalse(stream.negotiated_fallback)
         probe_out = [p for (value, p) in writes if value == uvc.UVC_VS_PROBE][0]
-        self.assertEqual(probe_out[3], 4)                      # bFrameIndex
+        self.assertEqual(probe_out[3], 3)                      # bFrameIndex
+        self.assertEqual(struct.unpack_from("<I", probe_out, 18)[0], 1382400)
         self.assertEqual(struct.unpack_from("<I", probe_out, 22)[0], 16384)
+
+    def test_negotiate_falls_back_to_640x480_when_device_insists(self):
+        # 无论请求什么档位，设备回读都只给 frame 4（640×480）。
+        state = {"cur": self._probe(frame=4)}
+        commits = []
+
+        class FakeDev:
+            def ctrl_transfer(self, request_type, request, value, index,
+                              data_or_length, timeout=0):
+                if request == uvc.UVC_GET_CUR:
+                    return bytes(state["cur"])
+                if request == uvc.UVC_GET_DEF:
+                    raise RuntimeError("no GET_DEF")
+                payload = bytes(data_or_length)
+                if value == uvc.UVC_VS_COMMIT:
+                    commits.append(payload)
+                return len(payload)
+
+        stream = uvc.UvcStream(
+            FakeDev(), SimpleNamespace(bInterfaceNumber=1),
+            SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
+        probe = stream.negotiate(fps=30)
+        self.assertEqual(probe.frame_index, 4)
+        self.assertEqual(stream.frame_size, 460800)
+        self.assertEqual(stream.width, 640)
+        self.assertEqual(stream.height, 480)
+        self.assertTrue(stream.negotiated_fallback)
+        self.assertTrue(commits)
+        self.assertEqual(commits[-1][3], 4)
 
     def test_negotiate_keeps_working_when_get_cur_dies(self):
         class FakeDev:
@@ -681,8 +740,48 @@ class UvcNegotiateTests(unittest.TestCase):
         stream = uvc.UvcStream(
             FakeDev(), SimpleNamespace(bInterfaceNumber=1),
             SimpleNamespace(bEndpointAddress=0x81), timeout=1000)
-        stream.negotiate(fps=30)  # 不该抛：基底用全 0 也能 commit
-        self.assertEqual(stream.urb_size, 460822)
+        stream.negotiate(fps=30)  # 不该抛：GET_CUR 死了就盲 commit 目标档位
+        self.assertEqual(stream.frame_size, 1382400)
+        self.assertEqual(stream.urb_size, 1382422)
+        self.assertTrue(stream.negotiated_unverified)
+
+
+class UvcFrameModeTests(unittest.TestCase):
+    """VS 帧描述符解析（bFrameIndex → 分辨率），2026-11-22 Pi 真机数据。"""
+
+    @staticmethod
+    def _descriptor():
+        # config(9) + interface(9) + format(6) + frame 3(26) + frame 4(26)
+        config = bytearray(9)
+        config[0], config[1] = 9, 0x02
+        config[2], config[3] = 0x01, 0x00
+        interface = bytearray(9)
+        interface[0], interface[1] = 9, 0x04
+        interface[2], interface[3] = 1, 0       # if=1 alt=0
+        interface[5], interface[6] = 0x0E, 0x02
+        fmt = bytearray([6, 0x24, 0x04, 1, 2, 0])   # bFormatIndex=1, 2 frames
+        frames = bytearray()
+        for index, (w, h, size) in ((3, (1280, 720, 1382400)),
+                                    (4, (640, 480, 460800))):
+            desc = bytearray(26)
+            desc[0], desc[1], desc[2] = 26, 0x24, 0x05
+            desc[3] = index
+            struct.pack_into("<H", desc, 5, w)
+            struct.pack_into("<H", desc, 7, h)
+            struct.pack_into("<I", desc, 17, size)
+            frames += desc
+        return bytes(config + interface + fmt + frames)
+
+    def test_parse_frame_modes(self):
+        modes = uvc.parse_frame_modes(self._descriptor(), 1)
+        self.assertEqual([m.frame_index for m in modes], [3, 4])
+        self.assertEqual((modes[0].width, modes[0].height), (1280, 720))
+        self.assertEqual(modes[0].frame_size, 1382400)
+        self.assertEqual((modes[1].width, modes[1].height), (640, 480))
+        self.assertEqual(modes[1].frame_size, 460800)
+
+    def test_parse_frame_modes_filters_other_formats(self):
+        self.assertEqual(uvc.parse_frame_modes(self._descriptor(), 2), ())
 
 
 class AltSettingTests(unittest.TestCase):
@@ -1021,6 +1120,26 @@ class LcdRendererTests(unittest.TestCase):
         rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
         image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
         self.assertGreater(int(image[5, 5, 0]), 100)
+
+    def test_720p_cover_render_fills_frame(self):
+        """1280×720 + cover：4×4 抽样 → 填满 320×200，不应出现黑边/偏左。"""
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="cover").render(self._frame(1280, 720))
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
+        for x, y in ((5, 5), (lcd.FRAME_W - 6, 5), (5, lcd.FRAME_H - 6),
+                     (lcd.FRAME_W - 6, lcd.FRAME_H - 6)):
+            self.assertGreater(int(image[y, x, 0]), 100)
+
+    def test_720p_fit_letterboxes_top_bottom(self):
+        """1280×720 + fit：保留全画幅 16:9，上下少量黑边。"""
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="fit").render(self._frame(1280, 720))
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        image = rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)
+        self.assertEqual(tuple(int(v) for v in image[5, 5, :3]),
+                         pipeline.BACKDROP[:3])
+        self.assertGreater(int(image[lcd.FRAME_H // 2, lcd.FRAME_W // 2, 0]), 100)
 
 
 if __name__ == "__main__":

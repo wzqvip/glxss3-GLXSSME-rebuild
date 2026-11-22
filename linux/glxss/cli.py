@@ -124,11 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--format-index", type=int, default=None,
                    help="bFormatIndex（默认 1=YV12，Android 实测值）")
     p.add_argument("--frame-index", type=int, default=None,
-                   help="bFrameIndex（默认 4=640×480@30，Android 实测值）")
+                   help="bFrameIndex（默认按描述符自动选：3=1280×720@30）")
     p.add_argument("--fps", type=float, default=None,
                    help="协商帧率（默认 333333=30fps）")
-    p.add_argument("--width", type=int, default=640, help="帧宽（默认 640）")
-    p.add_argument("--height", type=int, default=480, help="帧高（默认 480）")
+    p.add_argument("--width", type=int, default=1280, help="帧宽（默认 1280）")
+    p.add_argument("--height", type=int, default=720, help="帧高（默认 720）")
+    p.add_argument("--list-modes", action="store_true",
+                   help="只列出设备 VS 帧档位（bFrameIndex→分辨率）后退出")
     p.add_argument("--save", metavar="PNG", help="把第一帧转 RGB 存成 PNG")
     p.add_argument("--probe-only", action="store_true", help="只做 probe/回读，不 commit/读流")
     p.set_defaults(func=cmd_uvc)
@@ -462,31 +464,43 @@ def _last_raw_hint(report) -> bytes:
 # uvc
 # ---------------------------------------------------------------------------
 def cmd_uvc(args) -> int:
-    if args.frames <= 0 and not args.probe_only:
+    if args.frames <= 0 and not args.probe_only and not args.list_modes:
         raise GlxssError("--frames 必须 > 0（或改用 --probe-only）")
     if args.width <= 0 or args.height <= 0:
         raise GlxssError("--width/--height 必须 > 0")
     dev = usb.find_normal()
     print("设备: " + usb.device_label(dev))
     with usb.DeviceSession(dev, detach=args.detach, verbose=args.verbose) as session:
+        if args.list_modes:
+            modes = uvc.read_frame_modes(dev, args.format_index or 1)
+            if not modes:
+                print("  读不到 VS 帧描述符")
+                return 1
+            print("  VS 帧档位（format=%d）：" % (args.format_index or 1))
+            for mode in modes:
+                print("    " + str(mode))
+            return 0
         stream = uvc.UvcStream.open(dev, session, timeout=args.timeout,
                                     verbose=args.verbose)
         stream.set_dimensions(args.width, args.height)
-        frame_size = args.width * args.height * 3 // 2
         probe = stream.negotiate(
             format_index=args.format_index,
             frame_index=args.frame_index,
             fps=args.fps,
-            max_frame=frame_size,
+            max_frame=args.width * args.height * 3 // 2,
         )
+        frame_size = stream.frame_size
         print("  协商结果:")
         for line in probe.format().splitlines():
             print("    " + line.strip())
+        if getattr(stream, "negotiated_fallback", False):
+            print("  警告：1280×720 协商失败，已回退 %dx%d" % (
+                stream.width, stream.height))
         if args.probe_only:
             print("--probe-only：停在 probe，未 commit、未读流。")
             return 0
         print("  读 %d 帧（%d×%d YV12，frameSize=%d）..." % (
-            args.frames, args.width, args.height, frame_size))
+            args.frames, stream.width, stream.height, frame_size))
         count = 0
         first = time.monotonic()
         for frame in stream.read_frames(args.frames, timeout=args.timeout):

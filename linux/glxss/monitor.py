@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
 """相机监看源（monitor）：眼镜 UVC 读帧 → 640×400 → 叠加层 → 发回眼镜。
 
+    默认 1280×720（bFrameIndex=3，全画幅）；`--uvc-half` 时 Y 隔行隔列抽样，
+    解码量约 1/4。cover 裁切（1280×720 → 1152×720，左右各 64 列）是**居中**
+    裁切，不会再像旧 640×480 裁切窗口那样偏左。
+
+    `grab_rgba()` 直接给出带叠加层的 640×400 RGBA。
+
 为什么单独一个源：
   * 眼镜同时是“摄像头”和“显示器”，LCD bulk OUT 与 UVC bulk IN 必须在同一
     `UsbDeviceConnection` 上并发；控制请求 + LCD 帧走 `usb.UsbGate` 串行，
     UVC 读流（bulk IN）不占闸门。
   * UVC 读取/解码放在后台线程，主循环永远取“最新完成的一帧”发送：
     解码慢时自动丢旧帧（10 fps 发送仍是 10 fps，只是画面延迟略高）。
-  * YV12→RGBA 走 `uvc.decode_yv12_rgba` 的 uint32 打包快路径；默认全分辨率
-    cover 裁切（640×480 → 640×400，不缩放），`half=True` 时 320×240 再 2×
-    放大，给 Pi Zero 2 W 留余量。
+  * YV12→RGBA 走 `uvc.decode_yv12_rgba` 的 uint32 打包快路径；默认 cover 居中
+    裁切（1280×720 → 1152×720 再降到 640×400），`half=True` 时再 2× 抽样，
+    给 Pi Zero 2 W 留余量。
 
 叠加层：
   * 三分线（九宫格）；
