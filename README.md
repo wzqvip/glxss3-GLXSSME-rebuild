@@ -23,44 +23,42 @@
 固件**不在眼镜里**：每次上电，它先以 `03e7:2150`（Myriad ROM 引导）出现，主机把 1.5MB 固件灌进 DDR，
 它再重枚举成 `2e09:0030` 正常工作模式。没有主机灌固件，它什么都干不了。
 
-## 硬件
 
 | 项 | 值 |
 |---|---|
-| SoC | Intel Movidius Myriad 2（MA2450），12 个 SHAVE 核 + 2×LEON，RTEMS |
-| 相机 | Sony IMX214，UVC 输出 YV12 640×480@30（实测 20–25fps） |
-| 显示 | 640×400，RGBA8888，16B 帧头，USB bulk 单帧 1,024,016B |
-| 传感器 | 板上 HID 设备（28B 报告），具体字段未完全解出 |
-| 音频 | 标准 USB Audio：扬声器 + 麦克风，Android 自动识别为 usb_headset |
-| 正常模式 USB | VID `0x2E09` / PID `0x0030`（复合设备） |
-| 引导模式 USB | VID `0x03E7` / PID `0x2150`（"Movidius MA2X5X"） |
-| 固件 | `G25_MainFW_1.9.1.img`（1,525,136B，MA2x 容器，2016-06-09） |
-
-USB 接口分布（正常模式）：
-
-| 接口 | 用途 | 端点 |
-|---|---|---|
-| 0 | UVC VideoControl | — |
-| 1 | UVC VideoStreaming | `0x81` bulk IN, mps 512 |
-| 2 | HID | `0x83` interrupt IN, 64 |
-| 3 | 厂商 LCD | `0x01` bulk OUT, 512 |
-| 4 / 5 / 6 | USB Audio | 扬声器 iso `0x02` 256 / 麦克风 iso `0x82` 220 |
+| SoC | Intel Movidius Myriad 2（MA2450），12 个 SHAVE VLIW 核 + 2×LEON，RTEMS；USB 栈为 MCCI（`vsc2.uvc_streamin` 等） |
+| 相机 | Sony IMX214（13MP，最高 4128×3104）；UVC 1.10 bulk 传输，格式 YV12 / MJPEG |
+| 相机档位 | 4128×3104、3264×2448、1920×1080、1280×960、1280×720、640×480；实测稳定出流为 **640×480 YV12，约 20–25fps**（更高档位 probe/commit 能过，但设备不出流） |
+| 变焦 | 宣传的「3x 无损放大」是**数码裁切**（4128/1080≈3.8），无光学变焦；UVC `CT_ZOOM_ABSOLUTE` 待真机验证 |
+| 显示 | 640×400 RGBA8888，16B 帧头，单帧 1,024,016B；bulk OUT EP `0x01`，实测 30ms/帧（≈35MB/s） |
+| 显示控制 | 亮度 `0x01`、屏开关 `0x02`、roll `0x03`、状态 `0x04`、显示模式 `0x05`、EEPROM `0x07`、自动亮度 `0x10`、版本 `0x17`（详见 docs/ch-display.md） |
+| IMU / 传感器 | HID 28B 报告：光照 lux、罗盘 xyz、加速度 xyz（±4g，静止 \|a\|≈8117 counts）、陀螺 xyz（±2000dps）、af/caf、温度 f32 |
+| 按键 | **1 个 Fn 键**（keyCode `0x71`，单击/长按），无触摸；ME 宣传的「手势」靠相机识别 |
+| 音频 | 标准 USB Audio：扬声器 + 麦克风，实测 48kHz，Android 识别为 usb_headset |
+| 正常模式 USB | VID `0x2E09` / PID `0x0030`（复合设备，7 个接口） |
+| 引导模式 USB | VID `0x03E7` / PID `0x2150`（"Movidius MA2X5X"，只有 bulk IN） |
+| 固件 | `G25_MainFW_1.9.1.img`（1,525,136B，MA2x 容器，2016-06-09）；另有旧版 1.7.4（同源，差 2,712B） |
+| 固件加密 | 尾部 512KiB 为 AES-128-ECB，key 由 `llvision.enkey` 经内置 RSA-1024 私钥解出 |
+| 重量/形态 | 公开资料：GLXSS ME（2018）33.4g，USB-C 有线连接手机 |
 
 ## 驱动情况
 
-手机端（Android）目前的状态：
+手机端（Android）目前的进度：
 
 | 子系统 | 状态 | 说明 |
 |---|---|---|
-| 显示投屏 | ✅ | 自研 LCD 驱动，MediaProjection 实时投屏，25fps，裁剪/拉伸/适应 + 画面微调 |
-| UVC 摄像头 | ✅ | 纯 Kotlin 实现，YV12 解码，25fps，内嵌预览 + 拍照 |
-| 音频 | ✅ | 系统 UAC 路由（扬声器/麦克风），App 里可测试 |
-| USB 复合设备 | ✅ | 单例连接，LCD/UVC/HID 各接口独立 claim |
-| 固件加载/恢复 | ✅ | 460ms 灌完 1.5MB，拔插自动恢复 |
-| HID | ⚠️ | 能收 28B 报告，字段只解出一部分 |
-| 人脸检测 | ❌ | 固件里有模块，手机端未实现 |
+| 显示投屏 | ✅ | MediaProjection 实时投屏 25fps；裁剪/拉伸/适应 + 缩放/偏移微调；横屏 cover；软件 180° 翻转 |
+| LCD 控制 | ✅ | 亮度、屏开关、显示模式、roll、状态查询、EEPROM 读取、真实固件版本（`0xA1/0x17`，原厂是硬编码） |
+| UVC 摄像头 | ✅ | 纯 Kotlin 实现，YV12/MJPEG，640×480 @25fps，内嵌预览 + 拍照 |
+| **摄像头变焦** | **🚧 进行中** | 「3x 无损」为数码裁切（非光学）；UVC `CT_ZOOM_ABSOLUTE` 真机验证中 |
+| 录像 | ✅ | H.264/MP4，投屏或 UVC 源；实测 30s / 899 帧 / 0 丢帧 |
+| 音频 | ✅ | 48kHz；强制 USB 麦克风、音量控制、RMS/采样率实测、双向通话 |
+| HID / IMU | ✅ | 28B 全解：Fn 按键（单击/长按）、lux、罗盘、加速度、陀螺、af/caf、温度；300ms 轮询 |
+| 固件加载/恢复 | ✅ | 固件随 APK 分发（assets），首次运行解包校验；460ms 灌完 1.5MB；引导模式自动检测 + 拔插自动恢复 |
+| USB 生命周期 | ✅ | 单例连接；Android 12（华为）闪退修复；拔插自动重连；崩溃取证（crash_last.txt） |
+| 人脸检测 | ❌ | 固件里有模块（`libfacedtr`），手机端未实现 |
 | NPU | ❌ | Myriad 2 的 SHAVE/CNN 未使用 |
-| 录像 | ❌ | 未实现 |
+| 无线 | ❌ | 眼镜无 Wi-Fi/蓝牙，只有 USB 有线 |
 
 眼镜端固件：显示、相机、音频、USB 都是厂商固件自带的，我们不修改固件。
 
@@ -131,4 +129,6 @@ dist/         构建好的 APK
 ## 许可
 
 禁止商业使用，详见 [LICENSE](LICENSE)。分析结论来自对官方 App 的协议分析，不含原始代码。
+
+
 
