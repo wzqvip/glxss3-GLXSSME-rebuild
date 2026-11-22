@@ -21,6 +21,16 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
+ * 录像等旁路消费者：每帧解码完成后额外回调一次。
+ *
+ * 在 UVC 收流线程上调用（Bitmap 是 A/B 双缓冲复用的，下一帧会被覆盖）
+ * 实现必须快速返回，需要保留请自行拷贝像素。
+ */
+fun interface UvcFrameTap {
+    fun onUvcFrame(bitmap: Bitmap, width: Int, height: Int, ptsUs: Long)
+}
+
+/**
  * 纯 Kotlin 的 UVC 摄像头（GLXSS G25）实现 —— **不依赖任何 native 库**。
  *
  * 数据通路：
@@ -205,6 +215,9 @@ class UvcCamera(private val ctx: Context) {
 
     @Volatile var listener: Listener? = null
 
+    /** 录像旁路（与 [listener] 并存，预览不受影响）；null = 不录像 */
+    @Volatile var frameTap: UvcFrameTap? = null
+
     // ---- 帧缓冲/统计 ----
     private var frameBuf = ByteArray(0)
     private var frameLen = 0
@@ -228,6 +241,8 @@ class UvcCamera(private val ctx: Context) {
     private var framesInWindow = 0
     private var windowStart = 0L
     @Volatile private var fps = 0f
+    /** 累计出帧数（压力测试统计用） */
+    @Volatile private var totalFrames = 0L
 
     // 双缓冲：每帧不再新建 Bitmap（createBitmap 每帧 1.2MB 分配 + 拷贝）
     private var bmpA: Bitmap? = null
@@ -236,6 +251,19 @@ class UvcCamera(private val ctx: Context) {
 
     val isOpen: Boolean get() = conn != null
     val isRunning: Boolean get() = running
+
+    /** 最近一秒的出流帧率（压力测试 / 状态栏显示） */
+    fun currentFps(): Float = fps
+
+    /** 累计出帧数 */
+    fun frameCount(): Long = totalFrames
+
+    /** 当前画面尺寸：优先用最近一帧，其次协商结果 */
+    fun currentSize(): Pair<Int, Int> {
+        lastBitmap?.let { return it.width to it.height }
+        selectedOption?.let { return it.width to it.height }
+        return frameWidth to frameHeight
+    }
 
     /** 诊断字符串：本次协商到的格式/帧/带宽 */
     fun negotiatedInfo(): String {
@@ -1039,6 +1067,7 @@ class UvcCamera(private val ctx: Context) {
             return
         }
         framesInWindow++
+        totalFrames++
         val now = System.currentTimeMillis()
         if (now - windowStart >= 1000) {
             fps = framesInWindow * 1000f / (now - windowStart)
@@ -1047,6 +1076,11 @@ class UvcCamera(private val ctx: Context) {
             Log.i(TAG, "fps=${String.format(Locale.US, "%.1f", fps)} (${f.name} ${w}x${h})")
         }
         lastBitmap = bmp
+        try {
+            frameTap?.onUvcFrame(bmp, w, h, System.nanoTime() / 1000)
+        } catch (t: Throwable) {
+            Log.w(TAG, "frameTap failed", t)
+        }
         listener?.onFrame(bmp, len, fps)
     }
 

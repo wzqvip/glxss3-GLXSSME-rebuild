@@ -28,6 +28,16 @@ import com.wzqvip.glxsscast.usb.UsbLink
 import java.nio.ByteBuffer
 
 /**
+ * 录像等旁路消费者：拿到投屏**映射之后、USB 组包之前**的 640×400 RGBA 帧。
+ *
+ * 调用发生在 cast 线程上，实现必须**立刻返回**（1MB/帧，不能阻塞 USB 发送）；
+ * `rgba` 缓冲下一帧就会被复用，需要保留请自行拷贝。
+ */
+fun interface CastFrameTap {
+    fun onCastFrame(rgba: ByteArray, width: Int, height: Int, ptsUs: Long)
+}
+
+/**
  * 实时投屏：MediaProjection → VirtualDisplay（宽高比 = 当前屏幕方向）→ ImageReader(RGBA)
  * → 映射到 640×400 → 16B 头 + 1,024,000B → USB bulk。
  *
@@ -71,6 +81,9 @@ class CastService : Service() {
 
         /** 当前抓取尺寸，UI 展示 / 排障用 */
         @Volatile var captureDesc = ""; private set
+
+        /** 录像旁路（Activity 直接挂到服务上，不用 bind；null = 不录像） */
+        @Volatile var frameTap: CastFrameTap? = null
 
         // ---- 画面调整（静态字段，UI 直接改，下一帧映射生效，不用重启投屏）----
         /** 缩放 1.0–2.0（1.0 = cover 原始裁切） */
@@ -446,6 +459,16 @@ class CastService : Service() {
                 MODE_STRETCH -> mapStretch(buf, w, h, rowStride, pixelStride, dst)
                 MODE_FIT -> mapFit(buf, w, h, rowStride, pixelStride, dst)
                 else -> mapCover(buf, w, h, rowStride, pixelStride, dst)
+            }
+
+            // 录像旁路：在组装 USB 帧（16B 头 + payload）之前把这一帧 640×400 RGBA 交出去。
+            // 消费者只做一次拷贝就返回（满了就丢帧），不会拖慢 USB 发送。
+            frameTap?.let { tap ->
+                try {
+                    tap.onCastFrame(dst, LcdProtocol.WIDTH, LcdProtocol.HEIGHT, System.nanoTime() / 1000)
+                } catch (e: Exception) {
+                    Log.w(TAG, "frameTap error", e)
+                }
             }
 
             val fb = frameBuf ?: return

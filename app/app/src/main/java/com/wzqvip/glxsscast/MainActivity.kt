@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,7 +21,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -36,27 +39,35 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import com.wzqvip.glxsscast.audio.AudioEnh
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.lcd.ProductInfo
+import com.wzqvip.glxsscast.record.RecordSource
+import com.wzqvip.glxsscast.record.VideoRecorder
 import com.wzqvip.glxsscast.settings.Prefs
+import com.wzqvip.glxsscast.stress.CpuSampler
 import com.wzqvip.glxsscast.usb.Peripherals
 import com.wzqvip.glxsscast.usb.UsbLink
 import com.wzqvip.glxsscast.uvc.UvcCamera
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 /**
  * 单页控制台。功能分区：
@@ -107,6 +118,26 @@ class MainActivity : ComponentActivity() {
     private var uvcSelected by mutableStateOf<UvcCamera.StreamOption?>(null)
     private var uvcMenuOpen by mutableStateOf(false)
     private var uvcErr by mutableStateOf("")
+
+    // ---- 录像 ----
+    private val recorder by lazy { VideoRecorder(this) }
+    private var recSource by mutableStateOf(RecordSource.CAST)
+    private var recInfo by mutableStateOf("未录像")
+    private var recPath by mutableStateOf("")
+
+    // ---- 音频增强 ----
+    private var micDevices by mutableStateOf<List<String>>(emptyList())
+    private var audioInfo by mutableStateOf("音频：未测试")
+    private var volume by mutableStateOf(AudioEnh.Volume(0, 0))
+
+    // ---- 三路并发压力测试 ----
+    private var stressRunning by mutableStateOf(false)
+    private var stressInfo by mutableStateOf("")
+    private var stressJob: Job? = null
+    private var stressCancelled = false
+
+    /** Compose 里 rememberUvcCamera 创建的实例，录像/压力测试需要直接拿它挂旁路 */
+    private var activeUvc: UvcCamera? = null
 
     /** USB 打开/重连串行化，避免自动重连循环和手动操作打架 */
     private val usbMutex = Mutex()
@@ -202,6 +233,8 @@ class MainActivity : ComponentActivity() {
         autoBrightness = prefs.autoBrightness
         autoReconnect = prefs.autoReconnect
         hidOn = prefs.hidEnabled && Peripherals.hidRunning
+        volume = AudioEnh.volume(this)
+        refreshAudioDevices()
 
         // UVC 设备需要 CAMERA 权限才会授予 USB 访问
         if (androidx.core.content.ContextCompat.checkSelfPermission(
@@ -245,6 +278,16 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         unregisterReceiver(permissionReceiver)
         unregisterReceiver(attachReceiver)
+        // 录像要在进程里收尾，否则 muxer 的 mp4 索引写不完
+        try {
+            if (com.wzqvip.glxsscast.cast.CastService.frameTap === recorder) {
+                com.wzqvip.glxsscast.cast.CastService.frameTap = null
+            }
+            activeUvc?.let { if (it.frameTap === recorder) it.frameTap = null }
+            if (recorder.isRecording) recorder.stop()
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "stop recorder on destroy failed", t)
+        }
         // 连接是进程内共享的（CastService 可能还在用），这里不关闭
         super.onDestroy()
     }
@@ -638,6 +681,230 @@ class MainActivity : ComponentActivity() {
     }
 
     // ==================================================================
+    // 录像
+    // ==================================================================
+
+    /** 录像分辨率：投屏固定 640×400（LCD 输出同一帧）；UVC 用当前出帧尺寸 */
+    private fun recordSize(src: RecordSource): Pair<Int, Int> {
+        if (src == RecordSource.CAST) {
+            return LcdProtocol.WIDTH to LcdProtocol.HEIGHT
+        }
+        val sz = activeUvc?.currentSize() ?: (640 to 480)
+        // H.264 要求偶数
+        return (sz.first / 2 * 2).coerceAtLeast(16) to (sz.second / 2 * 2).coerceAtLeast(16)
+    }
+
+    private fun startRecording() {
+        if (recorder.isRecording) return
+        val src = recSource
+        val (w, h) = recordSize(src)
+        if (src == RecordSource.CAST && !com.wzqvip.glxsscast.cast.CastService.running) {
+            status = "投屏未运行：录像会开始但没有帧（先「开始投屏」）"
+        }
+        if (src == RecordSource.UVC && activeUvc?.isRunning != true) {
+            status = "UVC 未出流：录像会开始但没有帧（先「打开摄像头 / 枚举启动」）"
+        }
+        val err = recorder.start(src, w, h)
+        if (err != null) {
+            recInfo = "录像启动失败: $err"
+            status = "录像启动失败: $err"
+            return
+        }
+        if (src == RecordSource.CAST) {
+            com.wzqvip.glxsscast.cast.CastService.frameTap = recorder
+        } else {
+            activeUvc?.frameTap = recorder
+        }
+        recPath = recorder.outputFile?.absolutePath ?: ""
+        recInfo = "● REC 0.0s"
+        status = "开始录像：${src.label} ${w}×$h"
+    }
+
+    private fun stopRecording() {
+        if (com.wzqvip.glxsscast.cast.CastService.frameTap === recorder) {
+            com.wzqvip.glxsscast.cast.CastService.frameTap = null
+        }
+        activeUvc?.let { if (it.frameTap === recorder) it.frameTap = null }
+        recorder.stop()
+        val f = recorder.outputFile
+        val size = f?.length() ?: 0L
+        recPath = f?.absolutePath ?: ""
+        recInfo = if (size > 0) {
+            String.format(
+                Locale.US, "已停止: %d 帧 · %.1fs · %.1f fps · %.2f MB",
+                recorder.framesWritten, recorder.videoDurationUs / 1e6,
+                recorder.encodedFps, size / 1048576.0
+            )
+        } else {
+            "未产生文件: " + recorder.lastError.ifEmpty { "没有帧" }
+        }
+        status = if (size > 0) "录像已保存：$recPath（${size / 1024} KB）" else recInfo
+    }
+
+    /** 录像状态栏文字（UI 每 300ms 轮询） */
+    private fun recordStatusLine(): String {
+        if (!recorder.isRecording) return recInfo
+        return String.format(
+            Locale.US, "● REC %.1fs · %.1f fps · %d kbps · %.2f MB · 丢 %d",
+            recorder.elapsedMs / 1000.0, recorder.encodedFps, recorder.bitrateKbps,
+            recorder.bytesWritten / 1048576.0, recorder.framesDropped
+        )
+    }
+
+    // ==================================================================
+    // 音频增强
+    // ==================================================================
+
+    private fun refreshAudioDevices() {
+        lifecycleScope.launch {
+            val list = withContext(Dispatchers.IO) {
+                AudioEnh.inputDevices(this@MainActivity).map { it.line() }
+            }
+            micDevices = list
+        }
+    }
+
+    private fun runAudioProbe() {
+        status = "音频实测中（1 秒，强制 USB 麦克风）…"
+        lifecycleScope.launch {
+            val p = withContext(Dispatchers.IO) { AudioEnh.probe(this@MainActivity, 1.0) }
+            audioInfo = p.line() + if (p.usbFound) "" else " · 没有 USB 输入设备"
+            status = if (p.ok) "音频实测完成" else "音频实测失败"
+            refreshAudioDevices()
+        }
+    }
+
+    private fun runDuplexTest() {
+        status = "双向通话测试中（2 秒：播放 440Hz + 录音）…"
+        lifecycleScope.launch {
+            val p = withContext(Dispatchers.IO) { AudioEnh.duplex(this@MainActivity, 2.0) }
+            audioInfo = if (!p.ok) {
+                "双向测试失败: ${p.error}"
+            } else {
+                String.format(
+                    Locale.US,
+                    "双向通话 OK：扬声器播放 440Hz %dms + 麦克风（%s）录到 RMS %d / 峰值 %.1f dBFS · 采样率 %d Hz",
+                    p.tonePlayedMs, p.deviceName, p.rms, p.peakDbfs, p.sampleRate
+                )
+            }
+            status = if (p.ok) "双向通话测试完成" else "双向通话测试失败"
+            refreshAudioDevices()
+        }
+    }
+
+    // ==================================================================
+    // 三重并发压力测试（投屏 + UVC + 录像 30s）
+    // ==================================================================
+
+    private fun startStress() {
+        if (stressRunning) {
+            stressCancelled = true
+            stressJob?.cancel()
+            return
+        }
+        val castOn = com.wzqvip.glxsscast.cast.CastService.running
+        val cam = activeUvc
+        val uvcOn = cam?.isRunning == true
+        val autoRec = !recorder.isRecording
+        if (autoRec) {
+            recSource = if (castOn) RecordSource.CAST else RecordSource.UVC
+            startRecording()
+            if (!recorder.isRecording) {
+                stressInfo = "压力测试未启动：" + recorder.lastError.ifEmpty { "录像启动失败" }
+                return
+            }
+        }
+        stressCancelled = false
+        stressRunning = true
+        stressInfo = "压力测试中… 投屏${if (castOn) "运行" else "未运行"} · " +
+            "UVC${if (uvcOn) "运行" else "无流"} · 录像中"
+        val rec0 = recorder.framesWritten
+        val uvc0 = cam?.frameCount() ?: 0L
+        val cores = CpuSampler.cores()
+        val cpu0 = CpuSampler.cpuMs()
+        stressJob = lifecycleScope.launch {
+            val t0 = System.currentTimeMillis()
+            var castSum = 0.0
+            var castN = 0
+            var uvcSum = 0.0
+            var uvcN = 0
+            var lastRec = rec0
+            val rows = StringBuilder()
+            try {
+                for (i in 1..30) {
+                    delay(1000)
+                    val now = System.currentTimeMillis()
+                    val cf = com.wzqvip.glxsscast.cast.CastService.fps
+                    val uf = cam?.currentFps() ?: 0f
+                    castSum += cf
+                    castN++
+                    uvcSum += uf
+                    uvcN++
+                    val dWall = (now - t0).coerceAtLeast(1)
+                    val cpuPct = (CpuSampler.cpuMs() - cpu0) * 100.0 / (dWall * cores)
+                    val dRec = recorder.framesWritten - lastRec
+                    lastRec = recorder.framesWritten
+                    rows.append(
+                        String.format(
+                            Locale.US, "%02ds cast=%.1ffps uvc=%.1ffps rec=+%d cpu=%.0f%%\n",
+                            i, cf, uf, dRec, cpuPct
+                        )
+                    )
+                    stressInfo = String.format(
+                        Locale.US,
+                        "压力测试 %2ds/30s · 投屏 %.1f fps · UVC %.1f fps · 录像 %d 帧 · CPU %.0f%%",
+                        i, cf, uf, recorder.framesWritten - rec0, cpuPct
+                    )
+                    android.util.Log.i("Stress", rows.lineSequence().last())
+                    if (!isActive) break
+                }
+            } finally {
+                if (autoRec) {
+                    runCatching { stopRecording() }
+                }
+                if (stressCancelled) {
+                    stressInfo = "压力测试已取消（已录帧数 ${recorder.framesWritten - rec0}）"
+                } else {
+                    val wall = (System.currentTimeMillis() - t0).coerceAtLeast(1)
+                    val cpuMs = CpuSampler.cpuMs() - cpu0
+                    val cpuPct = cpuMs * 100.0 / (wall * cores)
+                    val cpuTotalPct = cpuMs * 100.0 / wall
+                    val recFrames = recorder.framesWritten - rec0
+                    val size = recorder.outputFile?.length() ?: 0L
+                    val durS = recorder.videoDurationUs / 1e6
+                    val avgCast = if (castN > 0) castSum / castN else 0.0
+                    val avgUvc = if (uvcN > 0) uvcSum / uvcN else 0.0
+                    val uvcFrames = (cam?.frameCount() ?: 0L) - uvc0
+                    val lines = String.format(
+                        Locale.US,
+                        "三重并发 %.1fs（%d 核）\n" +
+                            "投屏: %.1f fps（%s）\n" +
+                            "UVC: %.1f fps（%s，累计 +%d 帧）\n" +
+                            "录像: %d 帧 / %.1fs / %.1f fps / %.2f MB\n" +
+                            "CPU: %.0f%%（%d 核归一）· %.0f%% 累计",
+                        wall / 1000.0, cores,
+                        avgCast, if (castOn) "运行" else "未运行",
+                        avgUvc, if (uvcOn) "运行" else "无流", uvcFrames,
+                        recFrames, durS, recorder.encodedFps, size / 1048576.0,
+                        cpuPct, cores, cpuTotalPct
+                    ) + if (recorder.lastError.isNotEmpty()) "\n备注: " + recorder.lastError else ""
+                    stressInfo = lines
+                    android.util.Log.i("Stress", "=== triple concurrency 30s ===\n$rows$lines")
+                    // 落盘一份，adb pull 取证用
+                    runCatching {
+                        val dir = getExternalFilesDir(null) ?: filesDir
+                        java.io.File(dir, "stress_last.txt")
+                            .writeText(rows.toString() + lines + "\n")
+                    }
+                }
+                stressRunning = false
+                stressJob = null
+            }
+        }
+    }
+
+
+    // ==================================================================
     // UI
     // ==================================================================
 
@@ -686,7 +953,7 @@ class MainActivity : ComponentActivity() {
             }
 
             Scaffold(
-                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.1") }) }
+                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.2") }) }
             ) { pad ->
                 Column(
                     Modifier
@@ -758,6 +1025,11 @@ class MainActivity : ComponentActivity() {
 
                     if (showUvc) {
                         val cam = com.wzqvip.glxsscast.uvc.rememberUvcCamera()
+                        // 录像 / 压力测试要直接挂到这台相机上（预览监听器不受影响）
+                        DisposableEffect(cam) {
+                            activeUvc = cam
+                            onDispose { if (activeUvc === cam) activeUvc = null }
+                        }
                         Column(Modifier.fillMaxWidth().padding(4.dp)) {
                             com.wzqvip.glxsscast.uvc.UvcPreview(
                                 cam,
@@ -864,6 +1136,14 @@ class MainActivity : ComponentActivity() {
                             val svcMode = com.wzqvip.glxsscast.cast.CastService.fillMode
                             if (svcMode != fillMode) fillMode = svcMode
                             delay(500)
+                        }
+                    }
+
+                    androidx.compose.runtime.LaunchedEffect(Unit) {
+                        while (true) {
+                            recInfo = recordStatusLine()
+                            volume = AudioEnh.volume(this@MainActivity)
+                            delay(300)
                         }
                     }
 
@@ -1068,6 +1348,130 @@ class MainActivity : ComponentActivity() {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("播放测试音（眼镜扬声器）") }
+
+                    HorizontalDivider()
+                    Text("录像（H.264 → MP4）", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { recSource = RecordSource.CAST },
+                            enabled = !recorder.isRecording,
+                            modifier = Modifier.weight(1f)
+                        ) { Text((if (recSource == RecordSource.CAST) "✓ " else "") + "投屏画面") }
+                        OutlinedButton(
+                            onClick = {
+                                recSource = RecordSource.UVC
+                                if (activeUvc?.isRunning != true) {
+                                    status = "UVC 未出流：先「打开摄像头」；录像会开始但可能没有帧"
+                                }
+                            },
+                            enabled = !recorder.isRecording,
+                            modifier = Modifier.weight(1f)
+                        ) { Text((if (recSource == RecordSource.UVC) "✓ " else "") + "UVC 画面") }
+                    }
+                    Button(
+                        onClick = { if (recorder.isRecording) stopRecording() else startRecording() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (recorder.isRecording) "停止录像" else "开始录像")
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        if (recorder.isRecording) {
+                            Box(
+                                Modifier
+                                    .background(Color.Red, CircleShape)
+                                    .size(10.dp)
+                            )
+                            androidx.compose.foundation.layout.Spacer(Modifier.size(6.dp))
+                        }
+                        Text(
+                            recInfo,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    if (recPath.isNotEmpty()) {
+                        Text(
+                            recPath,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    HorizontalDivider()
+                    Text("音频增强", style = MaterialTheme.typography.titleSmall)
+                    Button(
+                        onClick = { refreshAudioDevices() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("刷新输入设备（USB 麦克风优先）") }
+                    if (micDevices.isNotEmpty()) {
+                        Text(
+                            micDevices.joinToString("\n"),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    } else {
+                        Text(
+                            "未发现输入设备（或 RECORD_AUDIO 未授权）",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = { volume = AudioEnh.stepVolume(this@MainActivity, -1) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("音量 −") }
+                        Text(volume.line(), modifier = Modifier.weight(1f))
+                        Button(
+                            onClick = { volume = AudioEnh.stepVolume(this@MainActivity, +1) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("音量 +") }
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { runAudioProbe() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("实测 1s（采样率/RMS）") }
+                        Button(
+                            onClick = { runDuplexTest() },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("双向通话 2s") }
+                    }
+                    Text(
+                        audioInfo,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+
+                    HorizontalDivider()
+                    Text(
+                        "三重并发压力测试（投屏 + UVC + 录像 30s）",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Button(
+                        onClick = { startStress() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (stressRunning) "中止压力测试" else "开始压力测试（30 秒）") }
+                    if (stressInfo.isNotEmpty()) {
+                        Text(
+                            stressInfo,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
 
                     HorizontalDivider()
                     Text("固件", style = MaterialTheme.typography.titleSmall)
