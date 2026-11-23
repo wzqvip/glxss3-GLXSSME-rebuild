@@ -220,10 +220,22 @@ object CastGeom {
         if (right <= left || bottom <= top) return null
 
         // 网格下标 → 像素坐标（用「单元格边界」，宁大勿小）
-        val l = (left.toLong() * w / cols).toInt()
-        val r = (right.toLong() * w / cols).toInt()
-        val t = (top.toLong() * h / rows).toInt()
-        val b = (bottom.toLong() * h / rows).toInt()
+        var l = (left.toLong() * w / cols).toInt()
+        var r = (right.toLong() * w / cols).toInt()
+        var t = (top.toLong() * h / rows).toInt()
+        var b = (bottom.toLong() * h / rows).toInt()
+
+        // 网格是 1/96 帧宽，边界最多差一格（实测 866 宽 ≈ 9 px），可能内缩也可能越过
+        // 黑边。这里用真实像素把四条边对齐到「第一个亮列/行」—— 否则映射会在内容
+        // 边缘采到几列黑边，眼镜上就是一条细黑缝。
+        while (l > 0 && colDark(buf, l, h, rowStride, pixelStride, limit)) l++
+        while (l > 0 && !colDark(buf, l - 1, h, rowStride, pixelStride, limit)) l--
+        while (r > l + 1 && colDark(buf, r - 1, h, rowStride, pixelStride, limit)) r--
+        while (r < w && !colDark(buf, r, h, rowStride, pixelStride, limit)) r++
+        while (t > 0 && rowDark(buf, t, w, rowStride, pixelStride, limit)) t++
+        while (t > 0 && !rowDark(buf, t - 1, w, rowStride, pixelStride, limit)) t--
+        while (b > t + 1 && rowDark(buf, b - 1, w, rowStride, pixelStride, limit)) b--
+        while (b < h && !rowDark(buf, b, w, rowStride, pixelStride, limit)) b++
 
         val cw = r - l
         val ch = b - t
@@ -232,6 +244,49 @@ object CastGeom {
         val aspect = cw.toFloat() / ch
         if (aspect < MIN_ASPECT || aspect > MAX_ASPECT) return null
         return intArrayOf(l, t, r, b)
+    }
+
+    /** 整列是否都是黑边（抽 64 行采样即可，黑边是纯色） */
+    private fun colDark(
+        buf: ByteBuffer, x: Int, h: Int, rowStride: Int, pixelStride: Int, limit: Int
+    ): Boolean {
+        val step = maxOf(1, h / 64)
+        var y = 0
+        while (y < h) {
+            val o = y * rowStride + x * pixelStride
+            if (o in 0 until limit - 2) {
+                val v = maxOf(
+                    buf.get(o).toInt() and 0xFF,
+                    buf.get(o + 1).toInt() and 0xFF,
+                    buf.get(o + 2).toInt() and 0xFF
+                )
+                if (v > DARK_MAX) return false
+            }
+            y += step
+        }
+        return true
+    }
+
+    /** 整行是否都是黑边 */
+    private fun rowDark(
+        buf: ByteBuffer, y: Int, w: Int, rowStride: Int, pixelStride: Int, limit: Int
+    ): Boolean {
+        val step = maxOf(1, w / 128)
+        val rowOff = y * rowStride
+        var x = 0
+        while (x < w) {
+            val o = rowOff + x * pixelStride
+            if (o in 0 until limit - 2) {
+                val v = maxOf(
+                    buf.get(o).toInt() and 0xFF,
+                    buf.get(o + 1).toInt() and 0xFF,
+                    buf.get(o + 2).toInt() and 0xFF
+                )
+                if (v > DARK_MAX) return false
+            }
+            x += step
+        }
+        return true
     }
 
     // ---- 复用缓冲（只在 cast 线程用；避免每帧 30 次分配 → GC 抖动） ----
