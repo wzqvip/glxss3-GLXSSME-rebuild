@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--nav-bind", default="0.0.0.0",
                    help="导航 UDP 绑定地址（默认 0.0.0.0，手机走 Wi-Fi）")
     p.add_argument("--nav-stale", type=float, default=5.0,
-                   help="多少秒没收到导航包就显示“等待手机…”（默认 5）")
+                   help="多少秒没收到导航包就显示“等待手机导航…”（默认 5）")
     p.add_argument("--no-nav-udp", action="store_true",
                    help="不监听手机导航 UDP（仍可用 glxss ctl nav）")
     p.add_argument("--level-invert-x", dest="level_invert_x",

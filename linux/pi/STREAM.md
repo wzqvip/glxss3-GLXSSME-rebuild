@@ -424,37 +424,45 @@ sudo systemctl start glxss-stream.service
 
 ---
 
-## 6.5 导航 HUD：手机 Wi-Fi UDP → 箭头/距离/动作
+## 6.5 导航 HUD：手机 Google 地图 → UDP → 眼镜箭头
 
-眼镜屏的 HUD 模式现在是**导航 HUD**（`glxss/hud.py`）：
+眼镜屏的 HUD 模式是**导航 HUD**（`glxss/hud.py`）。**不画罗盘**：眼镜没有磁力计，
+箭头只表达“下一个动作是什么”（左转/右转/直行/环岛/掉头/到达），不表达绝对方位。
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
-│ 01:18 LOCAL  HEADING 040°  ● PHONE LINK        2.0 fps    │
+│ 01:18 LOCAL  REMAINING 3 分 · 2.4 km  ● PHONE LINK  2.0fps │
 ├──────────┬───────────────────────────────┬─────────────────┤
-│ LIGHT    │             N                 │ ATTITUDE        │
-│  321 lux │          ╱  ▲  ╲             │  PITCH  -2.2    │
-│ TEMP     │        W │  ARROW  │ E        │  ROLL   +0.7    │
-│  36.5°C  │          ╲       ╱             │  GYRO  +2 -1 0  │
-│ SENSOR OK│             120 m              │                 │
+│ LIGHT    │            ▲                  │ ATTITUDE        │
+│  321 lux │            │  （机动箭头）     │  PITCH  -2.2    │
+│ TEMP     │       ┌────┘                   │  ROLL   +0.7    │
+│  36.5°C  │        320 m                   │  GYRO  +2 -1 0  │
+│ IMU  OK  │                               │                 │
 ├──────────┴───────────────────────────────┴─────────────────┤
-│                     右转（NEXT ACTION）                    │
+│             右转进入 人民路（NEXT ACTION）                  │
 └────────────────────────────────────────────────────────────┘
 ```
 
-* 大箭头旋转角 = `bearing - heading`；手机没给 `heading` 时直接用
-  `bearing`（`ctl nav` 手动测试就是这个语义）；
-* 箭头下方为距离（`120 m` / `1.2 km`），底部为动作文字（中文 UTF-8）；
-* 顶部 heading 优先用手机的 `heading`，否则用眼镜 HID 罗盘；
-* 无数据/超时：中心「等待手机…」，顶部 `WAITING PHONE`。
+* **中心**：按 `maneuver` 画大箭头（`left` / `right` / `slight-left` /
+  `slight-right` / `straight` / `roundabout` / `uturn` / `arrive`）；手机没给
+  `maneuver` 时 Pi 按 `label` 的中英文关键词兜底分类（`nav.classify_maneuver`）。
+* **箭头下方**：到下一个动作的距离（`500 m` / `1.2 km`；到达时显示「到达」）。
+* **底栏**：转向指令原文（`右转进入 人民路` / `Turn right onto Main St`），
+  右侧注明数据来源（`MAPS` / `CTL`）。
+* **顶栏**：剩余时间 · 剩余距离（`eta`/`remain`，手机给了才显示）、手机连接
+  状态、fps；**没有 heading/罗盘**。
+* **左侧**：光感 lux + 温度 + IMU 状态；**右侧**：pitch/roll 姿态仪（保留）。
+* 无数据/超时（`--nav-stale` 默认 5 s）：中心与底栏显示「等待手机导航…」。
+* `bearing` / `heading` 仍会解析（兼容旧手机包/调试），但**不参与画箭头**。
 
 ### 6.5.1 数据链路
 
 ```text
-Android App（导航 HUD 开关）
-  └─ 每秒 1 包 UDP JSON → 192.168.2.128:9999
-        └─ stream: nav.NavListener → nav.LatestNav（线程安全单槽）
-              └─ HudSource._poll_nav()（变化才重绘）→ 640×400 HUD
+Google 地图导航通知（com.google.android.apps.maps）
+  └─ Android NavListenerService → NavParser（title/text/subText/大图标）
+        └─ NavBus：每秒 1 包 UDP JSON → 192.168.2.128:9999
+              └─ Pi: nav.NavListener → nav.LatestNav（线程安全单槽）
+                    └─ HudSource._poll_nav()（变化才重绘）→ 640×400 HUD
 ```
 
 `nav.LatestNav` 与 `pipeline.LatestFrame` 同思路：只保留最新一帧，旧包直接
@@ -463,20 +471,32 @@ Android App（导航 HUD 开关）
 
 ### 6.5.2 JSON 协议
 
+手机每秒一包（UTF-8 JSON，默认 UDP **9999**）：
+
 ```json
-{"bearing": 45, "distance": 120, "label": "右转", "heading": 40}
+{"bearing": null, "heading": null, "distance": 500,
+ "label": "右转进入 人民路", "maneuver": "right",
+ "eta": 120, "remain": 2400, "source": "maps"}
 ```
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `bearing` | number | 目标绝对方位（deg，0=北，顺时针） |
-| `distance` | number | 距离（米） |
-| `label` | string | 下一动作文字，UTF-8，最长 48 字 |
-| `heading` | number? | 手机当前朝向（deg）；省略/`null` 时箭头直接用 bearing |
+| `bearing` | number? | 目标绝对方位（deg，0=北）；**可空，HUD 不用** |
+| `heading` | number? | 手机当前朝向（deg）；**可空，HUD 不显示罗盘** |
+| `distance` | number | 到下一个动作的距离（米） |
+| `label` | string | 转向指令文字，UTF-8，最长 48 字（超长截断） |
+| `maneuver` | string? | 机动类型，见下表；缺省/不认识时按 `label` 兜底 |
+| `eta` | number? | 剩余时间（秒） |
+| `remain` | number? | 剩余路线距离（米） |
+| `source` | string? | 来源标记（`maps`/`ctl`），只用于 HUD 底部显示 |
 
-* 端口默认 **UDP 9999**，绑定 `0.0.0.0`（不需要 root，>1024）；
-* 手机 1 Hz 发包；Pi 端 5 s 没新包就显示等待；
-* 坏包（非 JSON/字段非数字）只丢该包并记 `dropped`，不会清掉上一帧。
+`maneuver` 取值：`left`、`slight-left`、`right`、`slight-right`、
+`straight`、`roundabout`、`uturn`、`arrive`、`unknown`。
+
+* 手机 1 Hz 发包；Pi 端 5 s 没新包就回到「等待手机导航…」；
+* 坏包（非 UTF-8/非 JSON/必填字段非数字）只丢该包并记 `dropped`，不清上一帧；
+  `eta`/`remain` 是可选字段，值坏了只忽略该字段；
+* 包里没有 `bearing`/`distance`/`label` 任意一个字段才算坏包。
 
 ### 6.5.3 启动 / 测试
 
@@ -498,25 +518,33 @@ sudo systemctl daemon-reload && sudo systemctl restart glxss-stream
 > `/run/user/1000/glxssctl.sock`，报“控制服务未启动”。
 
 ```bash
-# 1) 注入一帧：bearing=45，距离 120 m，动作“右转”，手机 heading=40
 export GLXSS_SOCK=/run/glxss/glxssctl.sock
-glxss ctl nav 45 --distance 120 --label 右转 --heading 40
+
+# 1) 只给指令+距离（没有 bearing 也可以）
+glxss ctl nav --label 右转 --distance 500 --eta 120 --remain 2400
 glxss ctl status                 # 应出现“导航 / 导航UDP”两行
 glxss ctl nav-clear
 
-# 2) 模拟手机 UDP（PC 上执行，IP 换成 Pi）
-python3 -c 'import json,socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(json.dumps({"bearing":90,"distance":1200,"label":"右转","heading":80},ensure_ascii=False).encode(),("192.168.2.128",9999))'
+# 2) 模拟手机 UDP（Pi 本机执行；换 PC 时把 127.0.0.1 换成 Pi 的 IP）
+python3 - <<'PY'
+import json, socket
+pkt = {"bearing": None, "heading": None, "distance": 320,
+       "label": "左转进入 解放路", "maneuver": "left",
+       "eta": 240, "remain": 3100, "source": "maps"}
+socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(
+    json.dumps(pkt, ensure_ascii=False).encode("utf-8"), ("127.0.0.1", 9999))
+PY
 
 # 3) 看端口/收包
 ss -lunp | grep 9999
 journalctl -u glxss-stream -f | grep -E '\[nav\]|导航'
 ```
 
-`ctl status` 里的字段：
+`ctl status` 里的字段（实测，2026-11-23）：
 
 ```text
-导航    : bearing=45° distance=120 m heading=40° label='右转' age=0.12s fresh=True
-导航UDP : alive 0.0.0.0:9999，收 12 包，坏包 0
+导航    : maneuver=left distance=320 m eta=240s remain=3100m label='左转进入 解放路' age=1.48s fresh=True
+导航UDP : alive 0.0.0.0:9999，收 1 包，坏包 0
 ```
 
 ### 6.5.4 防火墙 / 字体 / 权限
@@ -526,24 +554,39 @@ journalctl -u glxss-stream -f | grep -E '\[nav\]|导航'
   用 `ss -lunp | grep 9999` 确认进程确实绑定（`nav` 会打印
   `[nav] UDP 导航监听 0.0.0.0:9999`）。
 * **权限**：9999 > 1024，taco 用户即可绑定；不需要 root/cap_net_bind_service。
-* **中文字体**：HUD 动作文字需要 CJK 字体，否则自动降级英文。
+* **中文字体**：HUD 指令/剩余时间需要 CJK 字体，否则自动降级英文。
   ```bash
   sudo apt install fonts-wqy-zenhei     # 约 15 MB，够用
   fc-list :lang=zh | head
   ```
   装完重启 `glxss-stream` 即可（Pillow 每次启动找字体，不需要重启系统）。
+* **同网段杂包**：别的设备偶尔往 9999 打非 JSON 包时，`[nav]` 只记
+  “丢弃坏包”，不影响手机的正常包（实测日志里出现过 1–3 个）。
 
 ### 6.5.5 Android 端入口
 
-App 首页「导航 HUD（Wi-Fi UDP → Pi）」：
+App（`app/`，包名 `com.wzqvip.glxsscast`，0.1.7 起）首页有「导航 HUD
+（Google 地图 → Pi）」一栏：
 
-* 开关：开=启动 GPS heading 监听 + 每秒 UDP；关=停止（Pi 5 s 后回等待）；
-* Pi IP / 端口输入，默认 `192.168.2.128:9999`；
-* bearing 滑块（0..359°）+ 左转/直行/右转/到达快捷键；
-* 距离滑块（0..2000 m）；
-* 手动 heading 开关（无 GPS 或需要固定角度测试时用）；
-* heading 默认来自 `LocationManager` 的 `Location.getBearing()`，
-  未定位/静止没有 bearing 时 JSON 省略 `heading`。
+* **通知使用权**：一键跳到系统设置（Android 11+ 直接进本 App 的详情页）；
+  页面实时显示“已开启/未开启”和 `NotificationListenerService` 是否连上；
+* **目标地址**：Pi IP + UDP 端口，默认 `192.168.2.128:9999`，可关掉发包；
+* **调试卡片**：最近一条地图通知的 `title/text/subText`、解析出的
+  `maneuver/distance/eta/remain`、实际发出的 JSON、发包计数、最近错误；
+* **模拟一条通知**：不开车也能验证“解析 → JSON → UDP”全链路（右转 500 m /
+  左转 120 m / 到达三个按钮）；**图标相似度自检**验证大图标兜底分类；
+* **无 UI 自测**（`DebugReceiver`，不需要解锁屏幕）：
+  ```bash
+  adb shell am broadcast -n com.wzqvip.glxsscast/.diag.DebugReceiver \
+      --es cmd nav_sim --es maneuver right --ei distance 500
+  adb shell am broadcast -n com.wzqvip.glxsscast/.diag.DebugReceiver --es cmd nav_icon_test
+  adb shell am broadcast -n com.wzqvip.glxsscast/.diag.DebugReceiver --es cmd nav_status
+  ```
+
+解析规则（`NavParser`）：标题 = 指令，正文 = 距离，副标题里的
+`12 分钟 · 3.2 公里` 拆成 `eta`/`remain`；机动类型先按中英文关键词判断，
+关键词给不出时才把通知大图标缩成 24×24 剪影与本地 Canvas 模板比相似度
+（IoU，置信度不够就保持 `unknown`）——**不依赖图标资源 id**。
 
 ---
 

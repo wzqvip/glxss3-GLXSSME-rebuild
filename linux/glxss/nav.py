@@ -3,16 +3,27 @@
 
 协议（手机每秒一包，UTF-8 JSON，默认 UDP 9999）::
 
-    {"bearing": 45, "distance": 120, "label": "右转", "heading": 40}
+    {"bearing": null, "distance": 500, "label": "右转",
+     "heading": null, "eta": 120, "source": "maps"}
 
-* ``bearing``  目标绝对方位（deg，0=北，顺时针）
-* ``heading``  手机当前朝向（deg，可选；缺省时 HUD 用眼镜 HID 罗盘）
-* ``distance`` 距离（米）
-* ``label``    下一动作文字（UTF-8，最长 48 字符，例如 右转 / 直行 / 到达）
+* ``label``    转向指令文字（UTF-8，最长 48 字符，例如 右转进入 xx 路 /
+               Turn right onto Main St / 到达）
+* ``distance`` 到下一个动作的距离（米；0/缺省=未知）
+* ``bearing``  目标绝对方位（deg，0=北，顺时针，**可空**）
+* ``heading``  手机当前朝向（deg，**可空**）——眼镜没有磁力计，HUD 不画罗盘，
+               只保留字段给调试/未来使用
+* ``maneuver`` 机动类型（可选，推荐；见 :data:`MANEUVERS`）。手机拿不到图标
+               时可以只发 label，Pi 端会按关键词兜底分类
+* ``eta``      剩余时间（秒）
+* ``remain``   剩余路线距离（米）
+* ``source``   数据来源标记（``maps`` / ``ctl`` / …）
+
+``bearing`` / ``heading`` 允许显式 ``null``（Android 端没有磁力计就发 null）：
+HUD 的箭头按 ``label``（或 ``maneuver``）画机动图标，不再依赖罗盘。
 
 设计对齐 :class:`glxss.pipeline.LatestFrame`：接收线程只写**最新单槽**，HUD
 渲染线程只读最新值；晚到的旧包直接覆盖，不排队、不阻塞。UDP 包带
-``expires_at``，超时后 HUD 显示“等待手机…”，但 ``ctl nav`` 手动注入的帧
+``expires_at``，超时后 HUD 显示“等待手机导航…”，但 ``ctl nav`` 手动注入的帧
 默认持久（直到 ``ctl nav-clear`` 或收到新包）。
 
 没有任何第三方依赖；Pi Zero 2 W + Python 3.11 实测 CPU 可忽略。
@@ -36,6 +47,57 @@ DEFAULT_STALE = 5.0
 MAX_LABEL = 48
 MAX_PACKET = 64 * 1024
 
+# 机动类型：HUD 中心大箭头按这个值选图标（不再用罗盘角度）。
+# 顺序也是“从具体到笼统”的匹配顺序（环岛里的“右转”不能算普通右转）。
+MANEUVERS = (
+    "arrive",        # 到达 / 目的地
+    "roundabout",    # 环岛 / 回旋处
+    "uturn",         # 掉头
+    "slight-right",  # 稍向右 / 靠右 / 右前方
+    "slight-left",   # 稍向左 / 靠左 / 左前方
+    "right",         # 右转
+    "left",          # 左转
+    "straight",      # 直行
+)
+MANEUVER_UNKNOWN = "unknown"
+
+# 手机可以直接发英文枚举（Android 端就是这么发的）。
+_MANEUVER_ALIASES = {
+    "arrive": "arrive", "arrival": "arrive", "destination": "arrive",
+    "到达": "arrive", "抵达": "arrive", "终点": "arrive",
+    "roundabout": "roundabout", "rotary": "roundabout", "环岛": "roundabout",
+    "uturn": "uturn", "u-turn": "uturn", "u_turn": "uturn", "掉头": "uturn",
+    "slight-right": "slight-right", "slight_right": "slight-right",
+    "slightright": "slight-right", "keep-right": "slight-right",
+    "slight-left": "slight-left", "slight_left": "slight-left",
+    "slightleft": "slight-left", "keep-left": "slight-left",
+    "right": "right", "turn-right": "right", "右转": "right",
+    "left": "left", "turn-left": "left", "左转": "left",
+    "straight": "straight", "continue": "straight", "直行": "straight",
+}
+
+# 关键词兜底：Google 地图中/英文转向文案。顺序 = 从具体到笼统。
+_MANEUVER_KEYWORDS = (
+    ("arrive", ("到达", "抵达", "目的地", "终点", "已到", "arrive", "arrival",
+                "destination", "you have arrived")),
+    ("roundabout", ("环岛", "环状交叉", "回旋处", "绕行环岛", "roundabout",
+                    "rotary", "traffic circle")),
+    ("uturn", ("掉头", "调头", "掉頭", "u-turn", "uturn", "u turn",
+               "make a u")),
+    ("slight-right", ("稍向右", "稍微向右", "偏向右", "向右前方", "右前方",
+                      "靠右", "向右靠", "slight right", "bear right",
+                      "keep right", "stay right")),
+    ("slight-left", ("稍向左", "稍微向左", "偏向左", "向左前方", "左前方",
+                     "靠左", "向左靠", "slight left", "bear left",
+                     "keep left", "stay left")),
+    ("right", ("右转", "向右", "右拐", "往右", "turn right", "right turn",
+               "onto the right", "right onto")),
+    ("left", ("左转", "向左", "左拐", "往左", "turn left", "left turn",
+              "onto the left", "left onto")),
+    ("straight", ("直行", "直走", "一直走", "继续直行", "沿路直行", "前方直行",
+                  "straight", "continue", "go straight", "keep straight")),
+)
+
 
 # ---------------------------------------------------------------------------
 # 数据模型 / 解析
@@ -44,10 +106,13 @@ MAX_PACKET = 64 * 1024
 class NavFrame:
     """一帧导航数据（不可变；UDP 线程整体替换，读线程拿到的永远自洽）。"""
 
-    bearing: float
-    distance: float
-    label: str = ""
-    heading: Optional[float] = None
+    bearing: Optional[float] = None      # 目标方位（可空：HUD 不再需要）
+    distance: float = 0.0                # 到下一动作的距离（米）
+    label: str = ""                      # 转向指令文字
+    heading: Optional[float] = None      # 手机朝向（可空；HUD 不显示罗盘）
+    maneuver: str = MANEUVER_UNKNOWN     # 机动类型（HUD 选箭头）
+    eta: Optional[float] = None          # 剩余时间（秒）
+    remain: Optional[float] = None       # 剩余路线距离（米）
     received_at: float = 0.0
     # 0 = 永久有效（ctl 手动测试）；UDP 帧 = received_at + stale。
     expires_at: float = 0.0
@@ -63,22 +128,28 @@ class NavFrame:
             return True
         return (time.monotonic() if now is None else now) < self.expires_at
 
-    def relative_bearing(self) -> float:
-        """相对当前朝向的箭头角度：目标方位 - 当前 heading，归一化 0..360。
+    def relative_bearing(self) -> Optional[float]:
+        """相对当前朝向的箭头角度；没有 bearing 时返回 None。
 
         手机只给了 bearing（没给 heading）时，按“bearing 已经是相对角”处理；
-        这与手动测试模式（手机把滑块角度同时当 bearing 发送）一致。
+        这与手动测试模式一致。HUD 已不再用这个角度画箭头（改按 maneuver），
+        保留接口给调试/以后的距离环。
         """
+        if self.bearing is None:
+            return None
         if self.heading is None:
             return self.bearing % 360.0
         return (self.bearing - self.heading) % 360.0
 
     def as_dict(self) -> dict:
         return {
-            "bearing": round(self.bearing, 1),
+            "bearing": None if self.bearing is None else round(self.bearing, 1),
             "distance": round(self.distance, 1),
             "label": self.label,
             "heading": None if self.heading is None else round(self.heading, 1),
+            "maneuver": self.maneuver,
+            "eta": None if self.eta is None else round(self.eta, 1),
+            "remain": None if self.remain is None else round(self.remain, 1),
             "age": round(max(0.0, time.monotonic() - self.received_at), 2),
             "fresh": self.is_fresh(),
             "persistent": self.persistent,
@@ -100,12 +171,64 @@ def _number(value, name: str) -> float:
     return number
 
 
+def _optional_number(value, name: str) -> Optional[float]:
+    """可选数值：``None`` / ``""`` / 解析失败都返回 None（坏字段不丢整包）。"""
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _normalize_maneuver(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().lower().replace(" ", "-")
+    # 空/unknown 都当作“没给”，让 label 关键词兜底。
+    if not text or text in ("unknown", "none", "null"):
+        return ""
+    if text in _MANEUVER_ALIASES:
+        return _MANEUVER_ALIASES[text]
+    # 手机可能发 "right-turn" / "slight_right" / "Slight Right"
+    compact = text.replace("-", "").replace("_", "")
+    for name in MANEUVERS:
+        if compact == name.replace("-", ""):
+            return name
+    return ""
+
+
+def classify_maneuver(label: str) -> str:
+    """按转向文案猜机动类型（中/英文关键词，从具体到笼统）。
+
+    Android 端拿不到 Maps 的大图标时只发 ``label``，Pi 用这个函数兜底；
+    手机显式发了 ``maneuver`` 时以手机为准（见 :func:`parse_packet`）。
+    """
+    text = str(label or "").strip().lower()
+    if not text:
+        return MANEUVER_UNKNOWN
+    for maneuver, words in _MANEUVER_KEYWORDS:
+        for word in words:
+            if word in text:
+                return maneuver
+    return MANEUVER_UNKNOWN
+
+
+def maneuver_of(value, label: str = "") -> str:
+    """显式 maneuver 优先；没有/不认识时按 label 关键词兜底。"""
+    return _normalize_maneuver(value) or classify_maneuver(label)
+
+
 def parse_packet(data: bytes, *, now: Optional[float] = None,
                  ttl: float = 0.0, source: str = "") -> NavFrame:
     """把一包 UDP 字节解析成 :class:`NavFrame`；坏包抛 ``ValueError``。
 
     ``ttl<=0`` 表示永久有效（ctl 注入）；UDP 监听会传 ``ttl=stale``。
     ``label`` 只做长度截断，不校验语言（手机可以发中文）。
+    ``bearing`` / ``heading`` / ``eta`` / ``remain`` 都允许缺省或 ``null``。
     """
     if not isinstance(data, (bytes, bytearray)):
         raise ValueError("UDP 数据必须是 bytes")
@@ -122,10 +245,16 @@ def parse_packet(data: bytes, *, now: Optional[float] = None,
     if not isinstance(obj, dict):
         raise ValueError("UDP JSON 必须是对象，收到 %s" % type(obj).__name__)
 
-    if "bearing" not in obj:
-        raise ValueError("缺少 bearing 字段")
-    bearing = normalize_angle(_number(obj.get("bearing"), "bearing"))
-    distance = max(0.0, _number(obj.get("distance", 0.0), "distance"))
+    if not any(key in obj for key in ("bearing", "distance", "label",
+                                      "maneuver", "eta", "remain")):
+        raise ValueError("缺少导航字段（bearing/distance/label）")
+
+    bearing: Optional[float] = None
+    if obj.get("bearing") is not None and obj.get("bearing") != "":
+        bearing = normalize_angle(_number(obj.get("bearing"), "bearing"))
+    distance_raw = obj.get("distance")
+    distance = (0.0 if distance_raw in (None, "")
+                else max(0.0, _number(distance_raw, "distance")))
 
     label = obj.get("label", "")
     if label is None:
@@ -135,10 +264,21 @@ def parse_packet(data: bytes, *, now: Optional[float] = None,
     label = " ".join(label.replace("\r", " ").replace("\n", " ").split())
     label = label[:MAX_LABEL]
 
-    heading_raw = obj.get("heading")
     heading: Optional[float] = None
+    heading_raw = obj.get("heading")
     if heading_raw is not None and heading_raw != "":
         heading = normalize_angle(_number(heading_raw, "heading"))
+
+    eta = _optional_number(obj.get("eta"), "eta")
+    remain = _optional_number(obj.get("remain"), "remain")
+    if eta is not None:
+        eta = max(0.0, eta)
+    if remain is not None:
+        remain = max(0.0, remain)
+    maneuver = maneuver_of(obj.get("maneuver"), label)
+
+    origin = obj.get("source")
+    origin = str(origin)[:32] if origin else ""
 
     stamp = time.monotonic() if now is None else float(now)
     expires = (stamp + float(ttl)) if ttl and ttl > 0 else 0.0
@@ -147,9 +287,12 @@ def parse_packet(data: bytes, *, now: Optional[float] = None,
         distance=distance,
         label=label,
         heading=heading,
+        maneuver=maneuver,
+        eta=eta,
+        remain=remain,
         received_at=stamp,
         expires_at=expires,
-        source=str(source or ""),
+        source=origin or str(source or ""),
         raw=text[:200],
     )
 
@@ -170,18 +313,23 @@ class LatestNav:
         self._last_source = ""
 
     # -- 写 ---------------------------------------------------------------
-    def update(self, bearing: float, distance: float, label: str = "",
-               heading: Optional[float] = None, *, ttl: Optional[float] = None,
+    def update(self, bearing: Optional[float], distance: float,
+               label: str = "", heading: Optional[float] = None, *,
+               eta: Optional[float] = None, remain: Optional[float] = None,
+               maneuver: str = "", ttl: Optional[float] = None,
                source: str = "ctl") -> NavFrame:
         """构造并写入一帧；``ttl=None`` 用构造时的 stale，``ttl<=0`` 永久。"""
         now = time.monotonic()
         life = self.stale if ttl is None else float(ttl)
         label = " ".join(str(label or "").replace("\r", " ").split())[:MAX_LABEL]
         frame = NavFrame(
-            bearing=normalize_angle(bearing),
-            distance=max(0.0, float(distance)),
+            bearing=None if bearing is None else normalize_angle(bearing),
+            distance=max(0.0, float(distance or 0.0)),
             label=label,
             heading=None if heading is None else normalize_angle(heading),
+            maneuver=maneuver_of(maneuver, label),
+            eta=None if eta is None else max(0.0, float(eta)),
+            remain=None if remain is None else max(0.0, float(remain)),
             received_at=now,
             expires_at=(now + life) if life > 0 else 0.0,
             source=str(source or "ctl"),
@@ -351,12 +499,17 @@ class NavListener(threading.Thread):
                     except Exception as exc:  # 回调不能弄死接收线程
                         print("[nav] on_frame 回调失败：%r" % (exc,), flush=True)
                 if self.received <= 3 or self.verbose:
-                    print("[nav] #%d bearing=%.0f distance=%.0f heading=%s "
-                          "label=%r ← %s" % (
-                              self.received, frame.bearing, frame.distance,
-                              "--" if frame.heading is None
-                              else "%.0f" % frame.heading,
-                              frame.label, frame.source), flush=True)
+                    print("[nav] #%d distance=%.0f label=%r maneuver=%s "
+                          "eta=%s remain=%s bearing=%s ← %s" % (
+                              self.received, frame.distance, frame.label,
+                              frame.maneuver,
+                              "--" if frame.eta is None
+                              else "%.0fs" % frame.eta,
+                              "--" if frame.remain is None
+                              else "%.0fm" % frame.remain,
+                              "--" if frame.bearing is None
+                              else "%.0f°" % frame.bearing,
+                              frame.source), flush=True)
         finally:
             try:
                 sock.close()
@@ -374,4 +527,3 @@ class NavListener(threading.Thread):
                 pass
         if self.is_alive():
             self.join(timeout=1.0)
-

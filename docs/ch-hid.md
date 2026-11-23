@@ -487,6 +487,32 @@ fun readLightAttr(conn: UsbDeviceConnection): ByteArray {   // 12 B
 
 `acc_fsr` / `gyro_fsr` 就是 §5.3 的 0–3。
 
+### 7.6 导航 HUD 不用罗盘（眼镜没有磁力计）
+
+G25 的 28 B 报告里虽然有 `compass_x/y/z`，但**眼镜没有磁力计**：实测三轴恒为
+0（或只有噪声），`NO MAG` 是常态。所以 0.1.7 起 HUD 的导航页彻底去掉罗盘卡片
+和 heading 数值：
+
+* **箭头只按机动类型画**：`left` / `slight-left` / `right` / `slight-right` /
+  `straight` / `roundabout` / `uturn` / `arrive`，来源是手机解析出的
+  `maneuver`（缺省时 Pi 用 `label` 关键词兜底），**不再算 `bearing - heading`**；
+* **`bearing` / `heading` 字段仍然接收、可空**（旧手机包/调试兼容），只是不参与
+  渲染；`glxss ctl nav --label 右转 --distance 500` 不带 bearing 也能用；
+* 保留的传感器 UI：左侧 lux/温度/IMU 状态，右侧 pitch/roll 姿态仪（加速度
+  来自 `acc_x/y/z`，与磁罗盘无关）；
+* 手机端（`com.wzqvip.glxsscast` 的 `NavListenerService`）从 Google 地图导航
+  通知里取 `title`（指令）、`text`（距离）、`subText`（剩余时间/距离）和
+  大图标，每秒一包 UDP JSON 发给 Pi：
+
+```json
+{"bearing": null, "heading": null, "distance": 500,
+ "label": "右转进入 人民路", "maneuver": "right",
+ "eta": 120, "remain": 2400, "source": "maps"}
+```
+
+  协议/HUD 版式/实测见 `linux/pi/STREAM.md` §6.5，Android 解析细节见
+  `linux/README.md` §5.2。
+
 ---
 
 ## 8. 24 B 产品信息（`0xA1/0x17`）

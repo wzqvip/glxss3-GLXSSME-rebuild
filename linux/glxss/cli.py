@@ -258,9 +258,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "rtsp 切 on|off；button 注入 click|long 便于无硬件测试）")
     p.add_argument("value", nargs="?", help="命令参数（brightness/on/off/度数等）")
     p.add_argument("--distance", type=float, default=0.0, help="nav 的距离（米）")
-    p.add_argument("--label", default="", help="nav 的文字标签")
+    p.add_argument("--label", default="", help="nav 的指令文字（右转 / 直行 / 到达）")
     p.add_argument("--heading", type=float, default=None,
-                   help="nav 的手机当前朝向（度；省略则箭头直接用 bearing）")
+                   help="nav 的手机当前朝向（度；可省略，HUD 不再画罗盘）")
+    p.add_argument("--eta", type=float, default=None,
+                   help="nav 的剩余时间（秒）")
+    p.add_argument("--remain", type=float, default=None,
+                   help="nav 的剩余路线距离（米）")
     p.add_argument("--socket", default=None, help="控制 socket 路径")
     p.add_argument("--timeout", type=int, default=5000,
                    help="socket 超时毫秒（预览启停可能等 LCD 线程退出）")
@@ -937,18 +941,23 @@ def _hud_dry_run(args) -> int:
     state = source.snapshot()
     packet = lcd.build_frame(capture.rgba_bytes(np.asarray(image, dtype=np.uint8)))
     _print_frame_header(packet, "HUD 640×400 RGBA（演示数据）")
-    print("  图层    : 顶栏(heading/连接/fps) + 中心箭头/距离 + 底栏动作 + "
-          "左 lux/温度 + 右姿态")
-    print("  heading : %6.1f deg（罗盘 X/Y 原始值推算）" % state.heading)
+    print("  图层    : 顶栏(剩余时间/距离·连接·fps) + 中心机动箭头/距离 + "
+          "底栏指令 + 左 lux/温度 + 右姿态（无罗盘）")
+    print("  罗盘    : HUD 不显示（眼镜没有磁力计）")
     pitch, roll = state.pitch_roll
     print("  姿态    : pitch=%+.1f° roll=%+.1f°" % (pitch, roll))
-    print("  传感器  : lux=%d 罗盘=%s" % (
-        state.lux, "OK" if state.compass_valid else "NO DATA"))
+    print("  传感器  : lux=%d IMU=%s" % (
+        state.lux, "OK" if state.acc_valid else "NO DATA"))
     if state.nav is not None:
-        print("  导航    : bearing=%.0f° distance=%.0f m heading=%s label=%r" % (
-            state.nav.bearing, state.nav.distance,
-            "--" if state.nav.heading is None else "%.0f°" % state.nav.heading,
-            state.nav.label))
+        nav_info = state.nav
+        print("  导航    : maneuver=%s distance=%.0f m eta=%s remain=%s "
+              "label=%r" % (
+                  nav_info.maneuver_name(), nav_info.distance,
+                  "--" if nav_info.eta is None
+                  else "%.0fs" % nav_info.eta,
+                  "--" if nav_info.remain is None
+                  else "%.0fm" % nav_info.remain,
+                  nav_info.label))
     if args.save_png:
         source.save_png(args.save_png, rotate=args.rotate)
         print("  已保存 640×400 RGBA PNG: " + args.save_png)
@@ -1163,17 +1172,28 @@ def _hud_live(args) -> int:
                 return {"ok": True, "status": status_dict()}
             if cmd == "nav":
                 raw_heading = request.get("heading")
+                raw_bearing = request.get("bearing")
+                raw_eta = request.get("eta")
+                raw_remain = request.get("remain")
                 try:
                     heading = (None if raw_heading in (None, "")
                                else float(raw_heading))
+                    bearing = (None if raw_bearing in (None, "")
+                               else float(raw_bearing))
+                    eta = None if raw_eta in (None, "") else float(raw_eta)
+                    remain = (None if raw_remain in (None, "")
+                              else float(raw_remain))
                     frame = latest_nav.update(
-                        float(request.get("bearing", 0.0)),
+                        bearing,
                         float(request.get("distance", 0.0)),
                         str(request.get("label", "")),
-                        heading, ttl=0.0, source="ctl")
+                        heading, eta=eta, remain=remain,
+                        maneuver=str(request.get("maneuver", "")),
+                        ttl=0.0, source=str(request.get("source", "ctl")))
                 except (TypeError, ValueError):
                     return {"ok": False,
-                            "error": "nav 需要数字 bearing/distance/heading"}
+                            "error": "nav 的 bearing/distance/heading/eta "
+                                     "必须是数字"}
                 return {"ok": True, "nav": frame.as_dict(),
                         "status": status_dict()}
             if cmd == "nav-clear":
@@ -1269,15 +1289,17 @@ def _print_ctl_status(status) -> None:
             ("，%s" % h.get("error")) if h.get("error") else ""))
     if isinstance(status.get("nav"), dict):
         nav_state = status["nav"]
-        if nav_state.get("bearing") is None:
-            print("  导航    : 无数据（HUD 显示“等待手机…”）")
+        if nav_state.get("age") is None:
+            print("  导航    : 无数据（HUD 显示“等待手机导航…”）")
         else:
-            print("  导航    : bearing=%.0f° distance=%.0f m heading=%s "
+            print("  导航    : maneuver=%s distance=%.0f m eta=%s remain=%s "
                   "label=%r age=%ss fresh=%s" % (
-                      float(nav_state.get("bearing", 0.0)),
+                      nav_state.get("maneuver", "unknown"),
                       float(nav_state.get("distance", 0.0)),
-                      "--" if nav_state.get("heading") is None
-                      else "%.0f°" % float(nav_state["heading"]),
+                      "--" if nav_state.get("eta") is None
+                      else "%.0fs" % float(nav_state["eta"]),
+                      "--" if nav_state.get("remain") is None
+                      else "%.0fm" % float(nav_state["remain"]),
                       nav_state.get("label", ""),
                       nav_state.get("age"),
                       bool(nav_state.get("fresh"))))
@@ -1413,16 +1435,20 @@ def cmd_ctl(args) -> int:
         except ValueError as exc:
             raise GlxssError("测试帧时长必须是秒数: %r" % value) from exc
     elif action == "nav":
-        if value is None:
-            raise GlxssError("nav 需要方位角（度）")
-        try:
-            payload["bearing"] = float(value)
-        except ValueError as exc:
-            raise GlxssError("方位角必须是数字: %r" % value) from exc
+        # bearing 可省略：`ctl nav --label 右转 --distance 500`（HUD 不画罗盘）。
+        if value is not None:
+            try:
+                payload["bearing"] = float(value)
+            except ValueError as exc:
+                raise GlxssError("方位角必须是数字: %r" % value) from exc
         payload["distance"] = float(args.distance)
         payload["label"] = args.label
         if args.heading is not None:
             payload["heading"] = float(args.heading)
+        if getattr(args, "eta", None) is not None:
+            payload["eta"] = float(args.eta)
+        if getattr(args, "remain", None) is not None:
+            payload["remain"] = float(args.remain)
 
     response = client.request(action, **payload)
     if args.json:

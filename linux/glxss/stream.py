@@ -1581,27 +1581,42 @@ class Streamer:
         if cmd == "nav":
             # 手动测试：写进与手机 UDP 相同的单槽，ttl=0 持久，直到
             # nav-clear 或下一个 UDP 包覆盖。方便无手机时验证 HUD。
+            # bearing/heading 可省略（眼镜没有磁力计，HUD 只按 label 画箭头）。
             try:
-                bearing = float(request.get("bearing", 0.0))
+                raw_bearing = request.get("bearing")
+                bearing = (None if raw_bearing in (None, "")
+                           else float(raw_bearing))
                 distance = float(request.get("distance", 0.0))
                 raw_heading = request.get("heading")
                 heading = (None if raw_heading in (None, "")
                            else float(raw_heading))
+                raw_eta = request.get("eta")
+                eta = None if raw_eta in (None, "") else float(raw_eta)
+                raw_remain = request.get("remain")
+                remain = (None if raw_remain in (None, "")
+                          else float(raw_remain))
             except (TypeError, ValueError):
                 return {"ok": False,
-                        "error": "nav 需要数字 bearing/distance/heading"}
-            values = [bearing, distance] + (
-                [] if heading is None else [heading])
+                        "error": "nav 的 bearing/distance/heading/eta/"
+                                 "remain 必须是数字"}
+            values = [distance] + [v for v in (bearing, heading, eta, remain)
+                                   if v is not None]
             if not all(math.isfinite(value) for value in values):
                 return {"ok": False,
-                        "error": "nav 的 bearing/distance/heading 必须是有限数字"}
+                        "error": "nav 的 bearing/distance/heading/eta/"
+                                 "remain 必须是有限数字"}
             frame = self._nav.update(
                 bearing, distance, str(request.get("label", "")),
-                heading, ttl=0.0, source="ctl")
+                heading, eta=eta, remain=remain,
+                maneuver=str(request.get("maneuver", "")),
+                ttl=0.0, source=str(request.get("source", "ctl")))
             self._ensure_hud_source()
-            self._print("ctl nav → bearing=%.0f distance=%.0f heading=%s label=%r"
-                        % (frame.bearing, frame.distance,
-                           "--" if frame.heading is None else "%.0f" % frame.heading,
+            self._print("ctl nav → maneuver=%s distance=%.0f m eta=%s "
+                        "remain=%s label=%r"
+                        % (frame.maneuver, frame.distance,
+                           "--" if frame.eta is None else "%.0fs" % frame.eta,
+                           "--" if frame.remain is None
+                           else "%.0fm" % frame.remain,
                            frame.label))
             return {"ok": True, "nav": frame.as_dict(),
                     "status": self._status_dict()}
@@ -1679,8 +1694,8 @@ class Streamer:
                         "`glxss ctl zoom 1.0|1.5|2.0|cycle`）")
         if cfg.nav_udp and int(cfg.nav_port) > 0:
             self._print("导航 HUD：监听 UDP %s:%d（手机每秒 JSON；无数据时 "
-                        "HUD 显示“等待手机…”；手动测试 `glxss ctl nav 45 "
-                        "--distance 120 --label 右转`）" % (
+                        "HUD 显示“等待手机导航…”；手动测试 `glxss ctl nav "
+                        "--label 右转 --distance 500`）" % (
                             cfg.nav_bind, cfg.nav_port))
         if cfg.mirror_fps:
             self._print("眼镜预览 %.1f fps（HUD %.1f fps；同一 LCD 线程切模式，"

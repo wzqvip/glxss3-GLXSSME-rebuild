@@ -4,13 +4,14 @@
 定位（详见 linux/pi/STREAM.md「导航 HUD」）：
   * 眼镜是主显示，LCD HAT 只做状态/控制面板；
   * 导航 HUD（`glxss stream` / `glxss hud` 的 HUD 模式）：
-      - 顶部：当前 heading（手机 GPS 或眼镜罗盘）、手机连接状态、fps
-      - 中心：大箭头（相对 bearing = bearing - heading）+ 罗盘刻度环
-      - 箭头下方：距离（120 m / 1.2 km）
-      - 底部：下一动作文字（右转 / 直行 / 到达）
-      - 左侧：光感 lux + 温度、传感器/罗盘状态
+      - 顶部：剩余时间/剩余距离（有就显示）、手机连接状态、fps
+      - 中心：大号机动箭头（按 label / maneuver 选：左转/右转/直行/环岛/掉头/到达）
+      - 箭头下方：距离（500 m / 1.2 km）
+      - 底部：转向指令文字（右转进入 xx 路）
+      - 左侧：光感 lux + 温度
       - 右侧：加速度姿态（俯仰/横滚）
-      - 没有导航数据时中心显示“等待手机…”
+      - 没有导航数据时中心显示“等待手机导航…”
+  * **不画罗盘**：眼镜没有磁力计，`bearing`/`heading` 可空，箭头只按机动类型选。
   * 数据来自 `glxss.nav` 的线程安全单槽（Wi-Fi UDP JSON，默认 :9999）。
   * HID 300 ms 一包，HUD 默认 2 fps 重绘；导航数据手机 1 Hz 推送。
 
@@ -46,7 +47,7 @@ try:
 except Exception:  # pragma: no cover - 取决于环境
     Image = ImageDraw = ImageFont = None  # type: ignore
 
-from . import __version__, hid
+from . import __version__, hid, nav
 from .capture import LCD_H, LCD_W, ImageSource, TestPatternSource
 from .errors import GlxssError
 
@@ -64,30 +65,33 @@ BAD = (255, 96, 108, 255)
 GRID = (24, 38, 58, 90)
 DIM = (90, 108, 130, 255)
 
-# 罗盘中心/半径（旧的“时钟/罗盘”HUD 版式；保留给 _draw_compass / 测试）。
-COMPASS_CX = 320
-COMPASS_CY = 194
-COMPASS_R = 100
-
-# 导航 HUD 版式：中心刻度环 + 大箭头 + 下方距离。
+# 旧“时钟/罗盘”版式常量已删除：眼镜没有磁力计，HUD 不再画罗盘。
+# 导航 HUD 版式：中心大箭头 + 下方距离；箭头大小/位置见 _draw_nav_scene。
 NAV_CX = 320
-NAV_CY = 176
-NAV_R = 92
+NAV_CY = 172
+NAV_SCALE = 1.95
 
 
 @dataclass
 class NavInfo:
     """HUD 需要的导航信息（``glxss.nav.NavFrame`` 的渲染副本）。
 
-    ``bearing`` 是目标绝对方位还是相对角，由 ``heading`` 决定：
-    ``heading`` 有值时箭头角度 = ``bearing - heading``；没有时直接用
-    ``bearing``（手动测试/``ctl nav`` 的语义）。
+    箭头不再按方位角旋转：``bearing``/``heading`` 只保留给调试与 state 输出，
+    中心图标由 ``maneuver``（左转/右转/直行/环岛/掉头/到达）决定。
     """
 
-    bearing: float = 0.0     # 目标方位（deg，0=北，顺时针）
-    distance: float = 0.0    # 距离（米）
-    label: str = ""          # 例如 "右转" / "Main St" / "到达"
-    heading: Optional[float] = None  # 手机当前朝向（deg）；None=只用 bearing
+    bearing: Optional[float] = None  # 目标方位（deg，可空；不参与箭头）
+    distance: float = 0.0            # 到下一动作的距离（米）
+    label: str = ""                  # 转向指令文字（右转进入 xx 路）
+    heading: Optional[float] = None  # 手机朝向（可空；HUD 不显示罗盘）
+    maneuver: str = ""                  # 机动类型（选箭头用；空=按 label 兜底）
+    eta: Optional[float] = None      # 剩余时间（秒）
+    remain: Optional[float] = None   # 剩余路线距离（米）
+    source: str = ""                 # maps / ctl / …
+
+    def maneuver_name(self) -> str:
+        """机动类型；老数据没有 maneuver 时按 label 关键词兜底。"""
+        return self.maneuver or nav.classify_maneuver(self.label)
 
 
 @dataclass
@@ -148,7 +152,11 @@ def pitch_roll_from_acc(x: int, y: int, z: int) -> Tuple[float, float]:
 
 
 def demo_state() -> HudState:
-    """离线演示数据：用于 `hud --dry-run` / HAT 预览，不接触硬件。"""
+    """离线演示数据：用于 `hud --dry-run` / HAT 预览，不接触硬件。
+
+    导航演示按真实手机包的形状给：只有 label/distance/eta/remain，没有
+    bearing/heading（眼镜没有磁力计）。
+    """
     return HudState(
         connected=True,
         fps=2.0,
@@ -162,7 +170,9 @@ def demo_state() -> HudState:
         sensors_valid=True,
         compass_valid=True,
         acc_valid=True,
-        nav=NavInfo(bearing=72.0, distance=320.0, label="Main St"),
+        nav=NavInfo(distance=320.0, label="右转进入 人民路",
+                    maneuver="right", eta=180.0, remain=2400.0,
+                    source="demo"),
     )
 
 
@@ -250,21 +260,27 @@ class HudSource(ImageSource):
             self.state.updated_at = time.time()
         self._invalidate()
 
-    def set_nav(self, bearing: float, distance: float, label: str = "",
-                heading: Optional[float] = None) -> None:
-        """手动设置导航帧（兼容旧接口）。
+    def set_nav(self, bearing: Optional[float], distance: float,
+                label: str = "", heading: Optional[float] = None, *,
+                maneuver: str = "", eta: Optional[float] = None,
+                remain: Optional[float] = None) -> None:
+        """手动设置导航帧（兼容旧接口；bearing/heading 可传 None）。
 
         有 ``nav_source`` 时写进共享单槽（``ttl=0`` 持久，直到 nav-clear 或
         手机新包覆盖），避免下一次轮询把这里设的值冲掉；没有时直接写 state。
         """
         if self._nav_source is not None:
-            self._nav_source.update(float(bearing), float(distance), str(label),
-                                    heading, ttl=0.0, source="hud")
+            self._nav_source.update(
+                bearing, float(distance), str(label), heading,
+                eta=eta, remain=remain, maneuver=maneuver,
+                ttl=0.0, source="hud")
             self._poll_nav()
             return
         with self._lock:
-            self.state.nav = NavInfo(float(bearing), float(distance),
-                                     str(label), heading)
+            self.state.nav = NavInfo(
+                None if bearing is None else float(bearing),
+                float(distance), str(label), heading,
+                nav.maneuver_of(maneuver, label), eta, remain, "hud")
             self.state.updated_at = time.time()
         self._invalidate()
 
@@ -300,7 +316,8 @@ class HudSource(ImageSource):
             frame = None
         key = None if frame is None else (
             frame.received_at, frame.bearing, frame.distance,
-            frame.label, frame.heading)
+            frame.label, frame.heading, frame.maneuver, frame.eta,
+            frame.remain)
         with self._lock:
             if key == self._nav_key:
                 return False
@@ -309,8 +326,10 @@ class HudSource(ImageSource):
                 self.state.nav = None
             else:
                 self.state.nav = NavInfo(
-                    float(frame.bearing), float(frame.distance),
-                    str(frame.label or ""), frame.heading)
+                    frame.bearing, float(frame.distance),
+                    str(frame.label or ""), frame.heading,
+                    frame.maneuver or nav.classify_maneuver(frame.label),
+                    frame.eta, frame.remain, frame.source)
             self.state.updated_at = time.time()
         self._invalidate()
         return True
@@ -633,26 +652,23 @@ class HudSource(ImageSource):
         draw.text((30, 40), "LOCAL", font=self._font(8), fill=MUTED)
         draw.line((86, 18, 86, 50), fill=CARD_EDGE)
 
-        # 当前 heading：手机 GPS 优先，其次眼镜 HID 罗盘；都没有显示 --。
+        # 剩余时间 / 剩余距离：手机给了才显示，没有就 "--"（不画罗盘/heading）。
         nav = state.nav
-        heading: Optional[float] = None
-        if nav is not None and nav.heading is not None:
-            heading = float(nav.heading)
-        elif state.compass_valid or any(state.compass):
-            heading = state.heading
-        heading_text = ("%03.0f°" % heading) if heading is not None else "--°"
-        draw.text((99, 13), "HEADING", font=self._font(8, bold=True), fill=MUTED)
-        draw.text((98, 26), heading_text, font=self._font(24, bold=True),
-                  fill=ACCENT if heading is not None else MUTED)
-        draw.line((178, 18, 178, 50), fill=CARD_EDGE)
+        remain_text = _format_remaining(nav, self._has_cjk_font()) if nav else "--"
+        draw.text((99, 13), "REMAINING", font=self._font(8, bold=True), fill=MUTED)
+        font = self._text_font(remain_text, 17, bold=True)
+        remain_text = self._fit_text(draw, remain_text, font, 146)
+        draw.text((98, 25), remain_text, font=font,
+                  fill=ACCENT if nav is not None else MUTED)
+        draw.line((250, 18, 250, 50), fill=CARD_EDGE)
 
         link = nav is not None
         dot = OK if link else ACCENT_2
-        draw.ellipse((192, 26, 204, 38), fill=dot)
-        draw.text((212, 16), "PHONE LINK" if link else "WAITING PHONE",
+        draw.ellipse((264, 26, 276, 38), fill=dot)
+        draw.text((284, 16), "PHONE LINK" if link else "WAITING PHONE",
                   font=self._font(12, bold=True), fill=dot)
         glasses = "GLASSES ONLINE" if state.connected else "GLASSES OFFLINE"
-        draw.text((212, 37), "NAV UDP  " + glasses,
+        draw.text((284, 37), "NAV UDP  " + glasses,
                   font=self._font(8), fill=MUTED)
 
         fps_text = "%.1f fps" % state.fps
@@ -682,81 +698,17 @@ class HudSource(ImageSource):
         draw.text((30, 197), "%.1f°C" % state.temperature,
                   font=self._font(19, bold=True), fill=TEXT)
 
+        # 只保留 IMU 有无数据（罗盘一栏已删除：眼镜没有磁力计）。
         draw.line((30, 228, 126, 228), fill=CARD_EDGE)
-        draw.text((30, 236), "SENSOR", font=self._font(9, bold=True), fill=MUTED)
-        draw.text((30, 248), "OK" if state.sensors_valid else "NO DATA",
+        draw.text((30, 236), "IMU", font=self._font(9, bold=True), fill=MUTED)
+        draw.text((30, 248), "OK" if state.acc_valid else "NO DATA",
                   font=self._font(11, bold=True),
-                  fill=OK if state.sensors_valid else BAD)
+                  fill=OK if state.acc_valid else BAD)
+
         draw.line((30, 268, 126, 268), fill=CARD_EDGE)
-        draw.text((30, 276), "MAG", font=self._font(9, bold=True), fill=MUTED)
-        draw.text((30, 288), "OK" if state.compass_valid else "N/A",
-                  font=self._font(11, bold=True),
-                  fill=OK if state.compass_valid else BAD)
-
-    def _draw_compass(self, draw, state: HudState) -> None:
-        cx, cy, r = COMPASS_CX, COMPASS_CY, COMPASS_R
-        draw.ellipse((cx - r - 6, cy - r - 6, cx + r + 6, cy + r + 6),
-                     outline=(40, 62, 88, 150), width=1)
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r),
-                     outline=(66, 112, 158, 210), width=2)
-
-        for deg in range(0, 360, 15):
-            rad = math.radians(deg)
-            major = deg % 90 == 0
-            mid = deg % 45 == 0
-            inner = r - (15 if major else 9 if mid else 5)
-            x1 = cx + math.sin(rad) * inner
-            y1 = cy - math.cos(rad) * inner
-            x2 = cx + math.sin(rad) * r
-            y2 = cy - math.cos(rad) * r
-            color = ACCENT if major else (150, 176, 202, 210) if mid else (90, 116, 142, 170)
-            draw.line((x1, y1, x2, y2), fill=color, width=2 if major else 1)
-
-        labels = (("N", 0), ("E", 90), ("S", 180), ("W", 270))
-        for text, deg in labels:
-            rad = math.radians(deg)
-            lx = cx + math.sin(rad) * (r - 26)
-            ly = cy - math.cos(rad) * (r - 26)
-            font = self._font(15 if text == "N" else 13, bold=True)
-            color = ACCENT if text == "N" else TEXT
-            self._center_text(draw, int(lx), int(ly - 8), text, font, color)
-
-        heading = state.heading
-        valid = state.compass_valid or any(state.compass)
-        # 指针：主针指向 heading，尾针反向；中心圆盘留给数值。
-        self._needle(draw, cx, cy, heading, r - 34, 52, ACCENT, ACCENT_2,
-                     alpha=255 if valid else 80)
-        draw.ellipse((cx - 43, cy - 43, cx + 43, cy + 43),
-                     fill=(10, 18, 30, 236), outline=(54, 82, 112, 220), width=1)
-        # 罗盘无数据时不要伪装成 000°：显示 -- + NO MAG。
-        value_text = "%03.0f" % heading if valid else "--"
-        self._center_text(draw, cx, cy - 20, value_text,
-                          self._font(30 if not valid else 27, bold=True),
-                          TEXT if valid else MUTED)
-        if valid:
-            self._center_text(draw, cx, cy + 9, "deg",
-                              self._font(10, bold=True), MUTED)
-        else:
-            self._center_text(draw, cx, cy + 10, "NO MAG",
-                              self._font(10, bold=True), BAD)
-
-    def _needle(self, draw, cx: int, cy: int, heading: float, outer: int,
-                inner: int, color_front, color_back, alpha: int = 255) -> None:
-        rad = math.radians(heading)
-        sin, cos = math.sin(rad), math.cos(rad)
-        # 垂直方向（用于三角形底边）。
-        px, py = cos, -sin
-
-        def point(radius: float, side: float = 0.0):
-            return (cx + sin * radius + px * side,
-                    cy - cos * radius + py * side)
-
-        front = color_front[:3] + (alpha,)
-        back = color_back[:3] + (max(30, alpha // 2),)
-        # 先画尾针，再画主针，避免暗色尾针盖住主针根部。
-        draw.polygon([point(inner + 4), point(-inner + 6, 7),
-                      point(-inner + 6, -7)], fill=back)
-        draw.polygon([point(outer), point(inner, 9), point(inner, -9)], fill=front)
+        draw.text((30, 276), "HUD", font=self._font(9, bold=True), fill=MUTED)
+        draw.text((30, 288), "%d" % state.brightness,
+                  font=self._font(11, bold=True), fill=TEXT)
 
     def _draw_attitude(self, draw, state: HudState) -> None:
         draw.rounded_rectangle((500, 86, LCD_W - 16, 306), radius=12,
@@ -806,161 +758,122 @@ class HudSource(ImageSource):
                          self._font(9), MUTED if not valid else TEXT)
 
     def _draw_nav_scene(self, draw, state: HudState) -> None:
-        """中心导航层：罗盘刻度环 + 大箭头 + 距离；无数据时显示等待手机。"""
-        cx, cy, r = NAV_CX, NAV_CY, NAV_R
+        """中心导航层：按机动类型画大箭头 + 箭头下方距离；无数据时显示等待。
+
+        这里**没有罗盘刻度环/方位角旋转**：眼镜没有磁力计，箭头只表达“左转/
+        右转/直行/环岛/掉头/到达”，不表达绝对方向。
+        """
+        cx, cy = NAV_CX, NAV_CY
         nav = state.nav
-        # 刻度环按当前朝向旋转：N 始终指向真实北方。无 nav.heading 时按 0
-        # 处理（ctl nav 手动测试），箭头就是 bearing 本身。
-        ring_heading = 0.0
-        if nav is not None and nav.heading is not None:
-            ring_heading = float(nav.heading)
-
-        draw.ellipse((cx - r - 7, cy - r - 7, cx + r + 7, cy + r + 7),
-                     outline=(38, 58, 84, 120), width=1)
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r),
-                     outline=(66, 112, 158, 230 if nav is not None else 150),
-                     width=2)
-
-        for deg in range(0, 360, 15):
-            rad = math.radians(deg - ring_heading)
-            major = deg % 90 == 0
-            mid = deg % 45 == 0
-            inner = r - (13 if major else 8 if mid else 4)
-            x1 = cx + math.sin(rad) * inner
-            y1 = cy - math.cos(rad) * inner
-            x2 = cx + math.sin(rad) * r
-            y2 = cy - math.cos(rad) * r
-            if major:
-                color = ACCENT
-            elif mid:
-                color = (150, 176, 202, 200)
-            else:
-                color = (90, 116, 142, 150)
-            draw.line((x1, y1, x2, y2), fill=color, width=2 if major else 1)
-
-        for text, deg in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
-            rad = math.radians(deg - ring_heading)
-            lx = cx + math.sin(rad) * (r - 20)
-            ly = cy - math.cos(rad) * (r - 20)
-            font = self._font(12 if text == "N" else 10,
-                              bold=(text == "N"))
-            color = ACCENT if text == "N" else (176, 196, 216, 220)
-            self._center_text(draw, int(lx), int(ly - 7), text, font, color)
-
-        # 正上方的小三角 = 当前朝向（环随 heading 旋转后，N 在真实方位上）。
-        draw.polygon([(cx, cy - r - 3), (cx - 6, cy - r - 13),
-                      (cx + 6, cy - r - 13)], fill=ACCENT)
-
         if nav is None:
             self._draw_waiting(draw, cx, cy)
-            self._center_text(draw, cx, 268, "--",
+            self._center_text(draw, cx, 262, "--",
                               self._font(30, bold=True), MUTED)
             return
 
-        relative = ((nav.bearing - nav.heading) % 360.0
-                    if nav.heading is not None else nav.bearing % 360.0)
-        self._draw_nav_arrow(draw, cx, cy, relative)
+        maneuver = nav.maneuver_name()
+        # 柔和背光：让箭头在明亮环境下也有对比，但不画成罗盘。
+        # 用不透明深色（老版 Pillow 的 ImageDraw 不做 alpha 混合，半透明大色块
+        # 在 PNG 里会变成灰片；LCD 端也只用 RGB）。
+        draw.ellipse((cx - 108, cy - 104, cx + 108, cy + 104),
+                     fill=(15, 25, 44, 255))
+        self._draw_maneuver(draw, cx, cy, NAV_SCALE, maneuver)
 
         distance = _format_distance(nav.distance)
-        font = self._font(36, bold=True)
+        if nav.distance <= 0:
+            # 到达时距离通常为 0，用“到达/--”比“0 m”合理。
+            distance = (_maneuver_word("arrive", self._has_cjk_font())
+                        if maneuver == "arrive" else "--")
+        font = self._font(40 if len(distance) <= 6 else 30, bold=True)
         width = self._text_width(draw, distance, font)
-        draw.rounded_rectangle((cx - width // 2 - 12, 258,
-                                cx + width // 2 + 12, 310),
-                               radius=9, fill=(6, 10, 20, 218))
-        self._center_text(draw, cx, 264, distance, font, TEXT)
+        draw.rounded_rectangle((cx - width // 2 - 16, 248,
+                                cx + width // 2 + 16, 306),
+                               radius=10, fill=(6, 10, 20, 222),
+                               outline=CARD_EDGE, width=1)
+        self._center_text(draw, cx, 254, distance, font, TEXT)
 
-    def _draw_nav_arrow(self, draw, cx: int, cy: int, relative: float) -> None:
-        """大箭头：0° 指向正上，顺时针旋转。带一层半透明辉光。"""
-        rad = math.radians(relative)
-        sin, cos = math.sin(rad), math.cos(rad)
+    def _draw_maneuver(self, draw, cx: int, cy: int, scale: float,
+                       maneuver: str) -> None:
+        """把单位坐标里的机动图标缩放/居中画到 (cx, cy)。"""
+        shapes, points = _maneuver_shapes(maneuver)
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        ox = (min(xs) + max(xs)) / 2.0
+        oy = (min(ys) + max(ys)) / 2.0
 
-        def point(forward: float, side: float):
-            return (cx + sin * forward + cos * side,
-                    cy - cos * forward + sin * side)
+        def place(point):
+            return (cx + (point[0] - ox) * scale,
+                    cy + (point[1] - oy) * scale)
 
-        glow = [point(74, 0), point(-28, 34), point(-8, 0), point(-28, -34)]
-        arrow = [point(66, 0), point(-22, 28), point(-4, 0), point(-22, -28)]
-        draw.polygon(glow, fill=ACCENT[:3] + (48,))
-        draw.polygon(arrow, fill=ACCENT)
-        draw.line(arrow + [arrow[0]], fill=TEXT, width=2, joint="curve")
-        draw.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=ACCENT)
+        color = _maneuver_color(maneuver)
+        for shape in shapes:
+            kind = shape[0]
+            if kind == "line":
+                pts = [place(p) for p in shape[1]]
+                width = max(2, int(round(shape[2] * scale)))
+                draw.line(pts, fill=color, width=width, joint="curve")
+                # 线端补圆，避免粗线在转折处露直角。
+                for x, y in (pts[0], pts[-1]):
+                    r = width / 2.0
+                    draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
+            elif kind == "poly":
+                pts = [place(p) for p in shape[1]]
+                draw.polygon(pts, fill=color)
+                draw.line(pts + [pts[0]], fill=TEXT, width=2, joint="curve")
+            elif kind == "ellipse":
+                ex, ey, rx, ry = shape[1]
+                width = max(2, int(round(shape[2] * scale)))
+                p0 = place((ex - rx, ey - ry))
+                p1 = place((ex + rx, ey + ry))
+                draw.ellipse((min(p0[0], p1[0]), min(p0[1], p1[1]),
+                              max(p0[0], p1[0]), max(p0[1], p1[1])),
+                             outline=color, width=width)
 
     def _draw_waiting(self, draw, cx: int, cy: int) -> None:
         if self._has_cjk_font():
-            text = "等待手机…"
+            text = "等待手机导航…"
         else:
             text = "WAITING FOR PHONE…"
         font = self._text_font(text, 24, bold=True)
-        # 暗色药丸压住刻度环/网格，等待文字在眼镜上更清楚。
-        draw.rounded_rectangle((cx - 132, cy - 36, cx + 132, cy + 38),
-                               radius=10, fill=(4, 8, 16, 212))
-        self._center_text(draw, cx, cy - 20, text, font, ACCENT_2)
-        self._center_text(draw, cx, cy + 18, "Wi-Fi UDP  JSON  1 Hz",
+        # 暗色药丸压住网格，等待文字在眼镜上更清楚。
+        draw.rounded_rectangle((cx - 148, cy - 38, cx + 148, cy + 40),
+                               radius=10, fill=(4, 8, 16, 214),
+                               outline=(40, 60, 86, 180), width=1)
+        self._center_text(draw, cx, cy - 22, text, font, ACCENT_2)
+        self._center_text(draw, cx, cy + 18, "Wi-Fi UDP JSON 1 Hz  :9999",
                           self._font(10), MUTED)
 
     def _draw_bottom(self, draw, state: HudState) -> None:
-        """底部动作条：大号“下一动作”文字（右转/直行/到达）。"""
+        """底部指令条：大号转向指令文字（右转进入 xx 路）+ 来源/亮度。"""
         draw.rounded_rectangle((16, 316, LCD_W - 16, 388), radius=10,
                                fill=(14, 24, 40, 224), outline=CARD_EDGE, width=1)
         nav = state.nav
         if nav is None:
-            text = "等待手机…" if self._has_cjk_font() else "WAITING FOR PHONE…"
+            text = "等待手机导航…" if self._has_cjk_font() else "WAITING FOR PHONE…"
             font = self._text_font(text, 20, bold=True)
             self._center_text(draw, LCD_W // 2, 322, text, font, ACCENT_2)
-            self._center_text(draw, LCD_W // 2, 356, "NAV DATA · UDP :9999",
+            self._center_text(draw, LCD_W // 2, 356,
+                              "NAV DATA · UDP :9999 · glxss ctl nav",
                               self._font(9), MUTED)
             return
 
+        maneuver = nav.maneuver_name()
         label = (nav.label or "").strip()
         if not label:
-            label = self._direction_word(nav)
+            label = _maneuver_word(maneuver, self._has_cjk_font())
         if not self._has_cjk_font() and any(ord(ch) > 127 for ch in label):
-            label = self._fallback_action(label)
-        font = self._text_font(label, 30, bold=True)
+            label = _maneuver_word(maneuver, False)
+        font = self._text_font(label, 29, bold=True)
         label = self._fit_text(draw, label, font, LCD_W - 80)
-        self._center_text(draw, LCD_W // 2, 318, label, font, ACCENT_2)
+        self._center_text(draw, LCD_W // 2, 320, label, font, ACCENT_2)
 
-        draw.text((30, 368), "BRT %3d" % state.brightness,
+        draw.text((30, 366), "BRT %d" % state.brightness,
                   font=self._font(9), fill=MUTED)
-        self._center_text(draw, LCD_W // 2, 368, "NEXT ACTION",
+        self._center_text(draw, LCD_W // 2, 366, "NEXT ACTION",
                           self._font(8, bold=True), MUTED)
-        self._right_text(draw, LCD_W - 30, 368, "BRG %03.0f°" % nav.bearing,
+        source = (nav.source or "").upper().split(":")[0] or "NAV"
+        self._right_text(draw, LCD_W - 30, 366, source[:14],
                          self._font(9), MUTED)
-
-    def _direction_word(self, nav: NavInfo) -> str:
-        """label 为空时按相对方位给一个动作词（中文字体缺失时用英文）。"""
-        if nav.heading is None:
-            relative = nav.bearing % 360.0
-        else:
-            relative = (nav.bearing - nav.heading) % 360.0
-        if relative < 20 or relative >= 340:
-            zh, en = "直行", "STRAIGHT"
-        elif relative < 160:
-            zh, en = "右转", "RIGHT"
-        elif relative < 200:
-            zh, en = "掉头", "U TURN"
-        elif relative < 340:
-            zh, en = "左转", "LEFT"
-        else:
-            zh, en = "直行", "STRAIGHT"
-        return zh if self._has_cjk_font() else en
-
-    @staticmethod
-    def _fallback_action(label: str) -> str:
-        """没有中文字体时，把常见动作词映射成短英文，避免显示方框。"""
-        mapping = {
-            "右转": "RIGHT", "左转": "LEFT", "直行": "STRAIGHT",
-            "到达": "ARRIVE", "抵达": "ARRIVE", "掉头": "U TURN",
-            "稍向右": "SLIGHT RIGHT", "稍向左": "SLIGHT LEFT",
-            "靠右": "KEEP RIGHT", "靠左": "KEEP LEFT",
-            "进入环岛": "ROUNDABOUT", "上坡": "UPHILL", "下坡": "DOWNHILL",
-        }
-        text = mapping.get(label.strip())
-        if text:
-            return text
-        if all(ord(ch) < 128 for ch in label):
-            return label
-        return "NAV"
 
     def _draw_paused(self, image, draw, state: HudState, clock: str) -> None:
         draw.rounded_rectangle((60, 52, LCD_W - 60, 348), radius=16,
@@ -988,3 +901,142 @@ def _format_distance(meters: float) -> str:
     if meters >= 1000:
         return "%.1f km" % (meters / 1000.0)
     return "%.0f m" % max(0.0, meters)
+
+
+def _format_eta(seconds: float, cjk: bool = True) -> str:
+    """剩余秒数 → “2 分” / “1 小时 5 分” / “2 min” / “1 h 5 min”。"""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return "<1 分" if cjk else "<1 min"
+    minutes = int(round(seconds / 60.0))
+    if minutes < 60:
+        return ("%d 分" % minutes) if cjk else ("%d min" % minutes)
+    hours, rest = divmod(minutes, 60)
+    if cjk:
+        return "%d 小时 %d 分" % (hours, rest) if rest else "%d 小时" % hours
+    return "%d h %d min" % (hours, rest) if rest else "%d h" % hours
+
+
+def _format_remaining(nav: "NavInfo", cjk: bool = True) -> str:
+    """顶部“剩余时间 · 剩余距离”；都没有返回 --。"""
+    parts = []
+    if nav.eta is not None and nav.eta > 0:
+        parts.append(_format_eta(nav.eta, cjk))
+    if nav.remain is not None and nav.remain > 0:
+        parts.append(_format_distance(nav.remain))
+    return " · ".join(parts) if parts else "--"
+
+
+_MANEUVER_WORDS = {
+    "left": ("左转", "LEFT"),
+    "right": ("右转", "RIGHT"),
+    "slight-left": ("稍向左", "SLIGHT LEFT"),
+    "slight-right": ("稍向右", "SLIGHT RIGHT"),
+    "straight": ("直行", "STRAIGHT"),
+    "roundabout": ("环岛", "ROUNDABOUT"),
+    "uturn": ("掉头", "U TURN"),
+    "arrive": ("到达", "ARRIVE"),
+    "unknown": ("", ""),
+}
+
+
+def _maneuver_word(maneuver: str, cjk: bool = True) -> str:
+    zh, en = _MANEUVER_WORDS.get(maneuver, ("", ""))
+    if cjk:
+        return zh or en or ""
+    return en or zh or ""
+
+
+def _maneuver_color(maneuver: str):
+    if maneuver == "arrive":
+        return OK
+    if maneuver in ("roundabout", "uturn"):
+        return ACCENT_2
+    return ACCENT
+
+
+def _arrow_head(tip, direction, length: float = 20.0,
+                half: float = 16.0):
+    """箭头的三角形（tip=尖端，direction=指向，length/half=长/半宽）。"""
+    tx, ty = float(tip[0]), float(tip[1])
+    dx, dy = float(direction[0]), float(direction[1])
+    norm = math.hypot(dx, dy) or 1.0
+    dx, dy = dx / norm, dy / norm
+    bx, by = tx - dx * length, ty - dy * length
+    px, py = -dy, dx
+    return [(tx, ty), (bx + px * half, by + py * half),
+            (bx - px * half, by - py * half)]
+
+
+def _uturn_arc():
+    """掉头图标的半圆弧（屏幕坐标，y 向下；从右端绕上方到左端）。"""
+    points = []
+    for step in range(0, 13):
+        angle = math.radians(-180.0 * step / 12.0)
+        points.append((14.0 * math.cos(angle),
+                       -4.0 + 14.0 * math.sin(angle)))
+    return points
+
+
+def _roundabout_ring():
+    """环岛圆弧：底部入口，逆时针绕到正上方缺口（末端接箭头）。"""
+    points = []
+    for step in range(0, 16):
+        angle = math.radians(240.0 - 300.0 * step / 15.0)
+        points.append((20.0 * math.cos(angle),
+                       2.0 + 20.0 * math.sin(angle)))
+    return points
+
+
+def _maneuver_shapes(maneuver: str):
+    """单位坐标（约 -50..50，y 向下）里的机动图标。
+
+    返回 ``(shapes, bbox_points)``；shapes 里每条是
+    ``("line", points, width)`` / ``("poly", points)`` /
+    ``("ellipse", (cx, cy, rx, ry), width)``。不依赖任何图标资源，
+    全部用几何图形画，肉眼可辨左转/右转/直行/环岛/掉头/到达。
+    """
+    if maneuver in ("left", "right"):
+        right = maneuver == "right"
+        sign = 1.0 if right else -1.0
+        stem = [(0.0, 34.0), (0.0, -10.0), (20.0 * sign, -10.0)]
+        head = _arrow_head((40.0 * sign, -10.0), (sign, 0.0), 20.0, 17.0)
+        shapes = [("line", stem, 14.0), ("poly", head)]
+        points = stem + head
+    elif maneuver in ("slight-left", "slight-right"):
+        right = maneuver == "slight-right"
+        sign = 1.0 if right else -1.0
+        stem = [(0.0, 34.0), (0.0, 10.0), (24.0 * sign, -14.0)]
+        head = _arrow_head((30.0 * sign, -20.0), (sign, -1.0), 20.0, 16.0)
+        shapes = [("line", stem, 14.0), ("poly", head)]
+        points = stem + head
+    elif maneuver == "uturn":
+        stem = [(14.0, 34.0), (14.0, -4.0)]
+        arc = _uturn_arc()
+        tail = [(-14.0, -4.0), (-14.0, 14.0)]
+        head = _arrow_head((-14.0, 32.0), (0.0, 1.0), 20.0, 16.0)
+        shapes = [("line", stem, 14.0), ("line", arc, 14.0),
+                  ("line", tail, 14.0), ("poly", head)]
+        points = stem + arc + tail + head
+    elif maneuver == "roundabout":
+        # 环岛：底部入口 + 逆时针圆弧，缺口在正上方，箭头从缺口左侧绕出。
+        ring = _roundabout_ring()
+        stem = [(0.0, 44.0), (0.0, 22.0)]
+        head = _arrow_head((-2.0, -23.0), (-1.0, -0.6), 17.0, 14.0)
+        shapes = [("line", ring, 9.0), ("line", stem, 9.0),
+                  ("poly", head)]
+        points = [(-20.0, -18.0), (20.0, 22.0), (0.0, 44.0),
+                  (-2.0, -23.0), (14.0, -28.0), (-16.0, -14.0)]
+    elif maneuver == "arrive":
+        pole = [(-14.0, 36.0), (-14.0, -36.0)]
+        flag = [(-14.0, -36.0), (30.0, -24.0), (-14.0, -12.0)]
+        ground = [(-30.0, 36.0), (-2.0, 36.0)]
+        shapes = [("line", pole, 7.0), ("poly", flag), ("line", ground, 6.0)]
+        points = pole + flag + ground
+    else:  # 直行 / 未知
+        arrow = [(-9.0, 34.0), (9.0, 34.0), (9.0, -6.0), (22.0, -6.0),
+                 (0.0, -36.0), (-22.0, -6.0), (-9.0, -6.0)]
+        shapes = [("poly", arrow)]
+        points = arrow
+    return shapes, points
+
