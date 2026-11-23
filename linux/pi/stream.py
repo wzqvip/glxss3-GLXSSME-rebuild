@@ -88,21 +88,46 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hid-poll", type=float, default=0.1,
                    help="HID/Fn 轮询间隔秒（默认 0.1；设备报告周期 300ms）")
     p.add_argument("--no-fn", dest="fn_keys", action="store_false", default=True,
-                   help="禁用 Fn 按键（单击切显示 / 长按切 RTSP）")
+                   help="禁用 Fn 按键（长按切 video/HUD，短按循环变焦；RTSP 用 ctl）")
     p.add_argument("--fn-long-press", type=float, default=0.9,
-                   help="Fn 长按阈值秒（默认 0.9，且至少 4 个按下包）")
+                   help="Fn 长按阈值秒（默认 0.9；只看按住时间，不要求包数）")
     p.add_argument("--fn-long-packets", type=int, default=4,
-                   help="Fn 长按所需连续按下包数（默认 4）")
+                   help="已废弃：长按不再要求按下包数（保留只为兼容旧脚本）")
     p.add_argument("--ctl-socket", default=None,
                    help="控制 socket 路径（默认 glxss 的默认路径；--no-ctl 关闭）")
     p.add_argument("--no-ctl", action="store_true",
                    help="不启动控制 socket（只靠状态行/日志）")
     p.add_argument("--mirror-fps", type=float, default=0.0,
-                   help="启动即投眼镜屏的帧率（0=不投，Fn 单击打开）")
+                   help="启动即投眼镜屏的帧率（0=不投，长按 Fn 打开）")
     p.add_argument("--preview-fps", type=float, default=0.0,
-                   help="Fn 打开眼镜预览时用的帧率（0=mirror-fps 或 10）")
+                   help="长按 Fn 打开眼镜预览时用的帧率（0=mirror-fps 或 10）")
+    p.add_argument("--zoom", type=float, default=1.0, choices=(1.0, 1.5, 2.0),
+                   help="启动时的数字变焦档位（只影响眼镜预览；运行中短按 Fn "
+                        "或 ctl zoom 切换；重启回到这里，不落盘）")
     p.add_argument("--mirror-rotate", type=int, choices=(0, 180), default=0,
                    help="眼镜预览旋转：0=正常 / 180=画面上下颠倒时用")
+    p.add_argument("--hud-fps", type=float, default=2.0,
+                   help="长按 Fn 切到 HUD 后的重绘/发送帧率（默认 2）")
+    p.add_argument("--nav-port", type=int, default=9999,
+                   help="手机导航 UDP 监听端口（默认 9999；0=关闭）")
+    p.add_argument("--nav-bind", default="0.0.0.0",
+                   help="导航 UDP 绑定地址（默认 0.0.0.0，手机走 Wi-Fi）")
+    p.add_argument("--nav-stale", type=float, default=5.0,
+                   help="多少秒没收到导航包就显示“等待手机…”（默认 5）")
+    p.add_argument("--no-nav-udp", action="store_true",
+                   help="不监听手机导航 UDP（仍可用 glxss ctl nav）")
+    p.add_argument("--level-invert-x", dest="level_invert_x",
+                   action="store_const", const=True, default=None,
+                   help="强制取反水平仪 roll（左右倾）；默认 180 旋转下取反")
+    p.add_argument("--no-level-invert-x", dest="level_invert_x",
+                   action="store_const", const=False,
+                   help="强制不取反水平仪 roll（0 旋转默认）")
+    p.add_argument("--level-invert-y", dest="level_invert_y",
+                   action="store_const", const=True, default=None,
+                   help="强制取反水平仪 pitch（上下）；默认 180 旋转下取反")
+    p.add_argument("--no-level-invert-y", dest="level_invert_y",
+                   action="store_const", const=False,
+                   help="强制不取反水平仪 pitch（0 旋转默认）")
     p.add_argument("--mirror-fit", default="fit",
                    choices=["fit", "cover", "crop", "stretch"], help="眼镜预览的映射方式")
     p.add_argument("--mirror-level", dest="mirror_level", action="store_true",

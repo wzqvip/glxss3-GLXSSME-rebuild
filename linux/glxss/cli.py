@@ -18,7 +18,8 @@ import sys
 import time
 from typing import Optional, Tuple
 
-from . import __version__, capture, control, firmware, hid, hud, lcd, monitor, usb, uvc
+from . import (__version__, capture, control, firmware, hid, hud, lcd,
+               monitor, nav, usb, uvc)
 from .app import CastApp, stats_summary
 from .errors import GlxssError
 from .util import hexdump, hexs, now_str
@@ -220,6 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--heading-offset", type=float, default=0.0,
                    help="罗盘 heading 校准偏移（度）")
     p.add_argument("--save-png", metavar="PNG", help="保存一张 640×400 RGBA HUD PNG")
+    p.add_argument("--nav-port", type=int, default=9999,
+                   help="手机导航 UDP 监听端口（默认 9999；0=关闭）")
+    p.add_argument("--nav-bind", default="0.0.0.0",
+                   help="导航 UDP 绑定地址（默认 0.0.0.0）")
+    p.add_argument("--nav-stale", type=float, default=5.0,
+                   help="多少秒没收到导航包就显示“等待手机…”（默认 5）")
+    p.add_argument("--no-nav-udp", action="store_true",
+                   help="不监听手机导航 UDP（仍可用 glxss ctl nav）")
     p.add_argument("--listen", action="store_true",
                    help="启动 Unix socket 控制服务（LCD HAT 用）")
     p.add_argument("--socket", default=None, help="控制 socket 路径")
@@ -241,14 +250,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ctl", help="通过 Unix socket 控制正在运行的 HUD 主进程")
     p.add_argument("action",
                    choices=("status", "ping", "bright", "screen", "mode",
-                            "view", "display", "rtsp", "stream", "button",
-                            "rec", "hud", "test", "nav", "nav-clear", "quit"),
+                            "view", "display", "zoom", "rtsp", "stream",
+                            "button", "rec", "hud", "test", "nav", "nav-clear",
+                            "quit"),
                    help="要发送的命令（view/mode 切 hud|monitor；"
-                        "display 切 preview|hud；rtsp 切 on|off；"
-                        "button 注入 click|long 便于无硬件测试）")
+                        "display 切 preview|hud；zoom 切 1.0|1.5|2.0|cycle；"
+                        "rtsp 切 on|off；button 注入 click|long 便于无硬件测试）")
     p.add_argument("value", nargs="?", help="命令参数（brightness/on/off/度数等）")
     p.add_argument("--distance", type=float, default=0.0, help="nav 的距离（米）")
     p.add_argument("--label", default="", help="nav 的文字标签")
+    p.add_argument("--heading", type=float, default=None,
+                   help="nav 的手机当前朝向（度；省略则箭头直接用 bearing）")
     p.add_argument("--socket", default=None, help="控制 socket 路径")
     p.add_argument("--timeout", type=int, default=5000,
                    help="socket 超时毫秒（预览启停可能等 LCD 线程退出）")
@@ -542,7 +554,10 @@ def _resolve_frame_source(args):
         return rgb, "纯色 #%02x%02x%02x" % color
     if kind == "hud":
         import numpy as np
-        image = hud.HudSource(demo=True).render()
+        # 整张图稍后会被 rotate180；姿态小地平线先在绘制时取反补偿。
+        rotate = int(getattr(args, "rotate", 0) or 0) % 360 == 180
+        image = hud.HudSource(demo=True, horizon_invert_x=rotate,
+                              horizon_invert_y=False).render()
         return np.asarray(image.convert("RGB"), dtype=np.uint8), "HUD 图层（演示数据）"
     if kind in ("image", "png"):
         if not args.path:
@@ -882,7 +897,9 @@ def _hud_defaults(args) -> None:
                           ("socket", None), ("save_png", None),
                           ("view", "hud"), ("rec", False),
                           ("camera_fps", 30.0), ("uvc_half", False),
-                          ("monitor_fit", "cover"), ("rotate", 0)):
+                          ("monitor_fit", "cover"), ("rotate", 0),
+                          ("nav_port", 9999), ("nav_bind", "0.0.0.0"),
+                          ("nav_stale", 5.0), ("no_nav_udp", False)):
         if not hasattr(args, name):
             setattr(args, name, default)
 
@@ -895,6 +912,10 @@ def cmd_hud(args) -> int:
         raise GlxssError("亮度必须在 0..255（实测有效范围 100..254）")
     if args.duration < 0:
         raise GlxssError("--duration 不能为负")
+    if not 0 <= args.nav_port <= 65535:
+        raise GlxssError("--nav-port 必须在 0..65535")
+    if args.nav_stale <= 0:
+        raise GlxssError("--nav-stale 必须 > 0 秒")
     if args.dry_run:
         return _hud_dry_run(args)
     return _hud_live(args)
@@ -904,8 +925,11 @@ def _hud_dry_run(args) -> int:
     """离线渲染一张 HUD：覆盖图层、字体降级、RGBA 打包和 PNG 保存。"""
     import numpy as np
 
+    rotate180 = int(getattr(args, "rotate", 0) or 0) % 360 == 180
     source = hud.HudSource(brightness=args.brightness, demo=True,
-                           heading_offset=args.heading_offset)
+                           heading_offset=args.heading_offset,
+                           horizon_invert_x=rotate180,
+                           horizon_invert_y=False)
     source.set_fps(args.fps)
     image = source.render()
     if int(getattr(args, "rotate", 0) or 0) % 360 == 180:
@@ -913,15 +937,18 @@ def _hud_dry_run(args) -> int:
     state = source.snapshot()
     packet = lcd.build_frame(capture.rgba_bytes(np.asarray(image, dtype=np.uint8)))
     _print_frame_header(packet, "HUD 640×400 RGBA（演示数据）")
-    print("  图层    : 顶栏(时间/连接/fps) + 罗盘 + lux/传感器 + 姿态 + 底栏(亮度/固件)")
+    print("  图层    : 顶栏(heading/连接/fps) + 中心箭头/距离 + 底栏动作 + "
+          "左 lux/温度 + 右姿态")
     print("  heading : %6.1f deg（罗盘 X/Y 原始值推算）" % state.heading)
     pitch, roll = state.pitch_roll
     print("  姿态    : pitch=%+.1f° roll=%+.1f°" % (pitch, roll))
     print("  传感器  : lux=%d 罗盘=%s" % (
         state.lux, "OK" if state.compass_valid else "NO DATA"))
     if state.nav is not None:
-        print("  导航占位: bearing=%.0f° distance=%.0f m label=%r" % (
-            state.nav.bearing, state.nav.distance, state.nav.label))
+        print("  导航    : bearing=%.0f° distance=%.0f m heading=%s label=%r" % (
+            state.nav.bearing, state.nav.distance,
+            "--" if state.nav.heading is None else "%.0f°" % state.nav.heading,
+            state.nav.label))
     if args.save_png:
         source.save_png(args.save_png, rotate=args.rotate)
         print("  已保存 640×400 RGBA PNG: " + args.save_png)
@@ -932,14 +959,20 @@ def _hud_dry_run(args) -> int:
 def _hud_live(args) -> int:
     """HUD 主进程：claim LCD + HID，按 --fps 发帧；可随时切相机监看。"""
     render_interval = (1.0 / args.fps) if args.fps > 0 else 0.05
+    rotate180 = int(getattr(args, "rotate", 0) or 0) % 360 == 180
+    latest_nav = nav.LatestNav(stale=args.nav_stale)
     hud_source = hud.HudSource(brightness=args.brightness, demo=args.demo,
                                heading_offset=args.heading_offset,
-                               render_interval=max(0.05, render_interval))
+                               render_interval=max(0.05, render_interval),
+                               horizon_invert_x=rotate180,
+                               horizon_invert_y=False,
+                               nav_source=latest_nav)
     hud_source.set_fps(args.fps)
     session = None
     server = None
     app = None
     mode_source = None
+    nav_listener = None
     gate = usb.UsbGate(verbose=args.verbose)
     mode = {"value": 2}
     screen = {"value": True}
@@ -960,6 +993,9 @@ def _hud_live(args) -> int:
             "source": mode_source.mode if mode_source is not None else "hud",
             "rotate": args.rotate,
             "socket": sock_path or "",
+            "nav": latest_nav.status(),
+            "nav_udp": (nav_listener.status()
+                        if nav_listener is not None else None),
             "error": hud_source.hid_error,
         }
         if mode_source is not None:
@@ -992,6 +1028,20 @@ def _hud_live(args) -> int:
         print("[%s] Fn 键单击：视图 → %s" % (time.strftime("%H:%M:%S"), target))
 
     try:
+        if not args.no_nav_udp and int(args.nav_port) > 0:
+            listener = nav.NavListener(
+                latest_nav, host=args.nav_bind, port=int(args.nav_port),
+                stale=args.nav_stale)
+            listener.start()
+            listener.wait_ready(1.0)
+            nav_listener = listener
+            if listener.error:
+                print("[警告] 导航 UDP 监听失败（ctl nav 仍可用）：%s"
+                      % listener.error, file=sys.stderr)
+            else:
+                print("导航 HUD：UDP %s:%d 已监听（手机每秒 JSON；"
+                      "无数据时显示等待手机…）" % (
+                          args.nav_bind, listener.bound_port or args.nav_port))
         dev = usb.find_normal()
         print("设备: " + usb.device_label(dev))
         session = usb.DeviceSession(dev, detach=args.detach, verbose=args.verbose)
@@ -1112,12 +1162,22 @@ def _hud_live(args) -> int:
                 hud_source.flash_test(max(0.2, seconds))
                 return {"ok": True, "status": status_dict()}
             if cmd == "nav":
-                hud_source.set_nav(float(request.get("bearing", 0.0)),
-                                   float(request.get("distance", 0.0)),
-                                   str(request.get("label", "")))
-                return {"ok": True, "status": status_dict()}
+                raw_heading = request.get("heading")
+                try:
+                    heading = (None if raw_heading in (None, "")
+                               else float(raw_heading))
+                    frame = latest_nav.update(
+                        float(request.get("bearing", 0.0)),
+                        float(request.get("distance", 0.0)),
+                        str(request.get("label", "")),
+                        heading, ttl=0.0, source="ctl")
+                except (TypeError, ValueError):
+                    return {"ok": False,
+                            "error": "nav 需要数字 bearing/distance/heading"}
+                return {"ok": True, "nav": frame.as_dict(),
+                        "status": status_dict()}
             if cmd == "nav-clear":
-                hud_source.clear_nav()
+                latest_nav.clear()
                 return {"ok": True, "status": status_dict()}
             if cmd == "quit":
                 if app is not None:
@@ -1145,6 +1205,9 @@ def _hud_live(args) -> int:
         print(stats_summary(stats))
         return 0
     finally:
+        if nav_listener is not None:
+            nav_listener.stop()
+            nav_listener = None
         if server is not None:
             server.stop()
         if mode_source is not None:
@@ -1169,11 +1232,64 @@ def _print_ctl_status(status) -> None:
     print("  显示模式: %s" % status.get("mode"))
     if "display" in status:
         last = status.get("last_button") or ""
+        lcd_mode = status.get("lcd_mode")
+        if lcd_mode is not None:
+            shown = ("camera preview" if lcd_mode == "preview"
+                     else "HUD（stream 内渲染，LCD 保持占用）" if lcd_mode == "hud"
+                     else "未占 LCD")
+        else:
+            shown = ("camera preview" if status.get("display") == "preview"
+                     else "HUD")
         print("  显示    : %s%s" % (
-            "camera preview" if status.get("display") == "preview" else "HUD/不占屏",
-            ("（最近按键 %s）" % last) if last else "（按 Fn 单击切换）"))
+            shown,
+            ("（最近按键 %s）" % last) if last else "（长按 Fn 切换）"))
+    if "zoom" in status:
+        zoom = float(status.get("zoom") or 1.0)
+        crop = status.get("zoom_crop")
+        crop_text = ""
+        if isinstance(crop, (list, tuple)) and len(crop) == 2:
+            crop_text = "，源中心裁切 %dx%d" % (int(crop[0]), int(crop[1]))
+        print("  变焦    : %.1fx%s（短按 Fn 在 video 下循环；ctl zoom cycle）"
+              % (zoom, crop_text))
+    if isinstance(status.get("level"), dict):
+        level = status["level"]
+        invert = status.get("level_invert") or {}
+        print("  水平仪  : pitch=%+.1f° roll=%+.1f°（取反 x=%s y=%s）" % (
+            float(level.get("pitch", 0.0)), float(level.get("roll", 0.0)),
+            bool(invert.get("x")), bool(invert.get("y"))))
+    if isinstance(status.get("hid"), dict):
+        h = status["hid"]
+        code = h.get("key_code")
+        print("  HID     : %s 轮询 %.0f ms，key=%s/%s，按键=%s%s" % (
+            "alive" if h.get("alive") else "dead",
+            float(h.get("poll_ms", 0.0)),
+            ("0x%02x" % int(code)) if code is not None else "--",
+            h.get("key_status") if h.get("key_status") is not None else "--",
+            "DOWN" if h.get("key_down") else "up",
+            ("，%s" % h.get("error")) if h.get("error") else ""))
+    if isinstance(status.get("nav"), dict):
+        nav_state = status["nav"]
+        if nav_state.get("bearing") is None:
+            print("  导航    : 无数据（HUD 显示“等待手机…”）")
+        else:
+            print("  导航    : bearing=%.0f° distance=%.0f m heading=%s "
+                  "label=%r age=%ss fresh=%s" % (
+                      float(nav_state.get("bearing", 0.0)),
+                      float(nav_state.get("distance", 0.0)),
+                      "--" if nav_state.get("heading") is None
+                      else "%.0f°" % float(nav_state["heading"]),
+                      nav_state.get("label", ""),
+                      nav_state.get("age"),
+                      bool(nav_state.get("fresh"))))
+        udp = status.get("nav_udp")
+        if isinstance(udp, dict):
+            print("  导航UDP : %s %s:%s，收 %d 包，坏包 %d%s" % (
+                "alive" if udp.get("alive") else "dead",
+                udp.get("bind"), udp.get("port"),
+                int(udp.get("received", 0)), int(udp.get("dropped", 0)),
+                ("，错误 " + str(udp.get("error"))) if udp.get("error") else ""))
     if "rtsp" in status:
-        print("  RTSP    : %s（长按 Fn 切换）" % (
+        print("  RTSP    : %s（ctl rtsp on|off，已不绑 Fn）" % (
             "ON" if status.get("rtsp") else "OFF"))
     if isinstance(status.get("async"), dict) and status["async"]:
         a = status["async"]
@@ -1251,6 +1367,23 @@ def cmd_ctl(args) -> int:
             payload["value"] = "hud"
         else:
             raise GlxssError("display 需要 preview/hud/toggle，收到 %r" % value)
+    elif action == "zoom":
+        # 1.0 / 1.5 / 2.0 / cycle（也接受 1x、1.5x、2x 写法）
+        text = str(value).strip().lower() if value is not None else "cycle"
+        if text.endswith("x"):
+            text = text[:-1]
+        if text in ("", "cycle", "next"):
+            payload["value"] = "cycle"
+        else:
+            try:
+                zoom = float(text)
+            except ValueError as exc:
+                raise GlxssError(
+                    "zoom 需要 1.0/1.5/2.0/cycle，收到 %r" % value) from exc
+            if zoom not in (1.0, 1.5, 2.0):
+                raise GlxssError(
+                    "zoom 需要 1.0/1.5/2.0/cycle，收到 %r" % value)
+            payload["value"] = zoom
     elif action == "button":
         text = str(value).strip().lower() if value is not None else "click"
         if text not in ("click", "long"):
@@ -1288,6 +1421,8 @@ def cmd_ctl(args) -> int:
             raise GlxssError("方位角必须是数字: %r" % value) from exc
         payload["distance"] = float(args.distance)
         payload["label"] = args.label
+        if args.heading is not None:
+            payload["heading"] = float(args.heading)
 
     response = client.request(action, **payload)
     if args.json:

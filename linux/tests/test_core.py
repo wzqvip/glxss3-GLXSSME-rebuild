@@ -97,10 +97,18 @@ class FnWatcherTests(unittest.TestCase):
         events = watcher.feed(self._report(1), 0.9)
         self.assertEqual([e.kind for e in events], ["long"])
 
-    def test_held_without_enough_packets_is_click(self):
-        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
+    def test_release_after_threshold_without_extra_down_packets_is_long(self):
+        """只看时间：按住 1.5 s 但期间只采到一个按下包，松开也判长按。"""
+        watcher = hid.FnWatcher(long_seconds=0.9, long_packets=99)
         watcher.feed(self._report(1), 0.0)
         events = watcher.feed(self._report(0, 0), 1.5)
+        self.assertEqual([e.kind for e in events], ["release", "long"])
+        self.assertAlmostEqual(events[-1].duration, 1.5, places=3)
+
+    def test_release_before_threshold_is_click(self):
+        watcher = hid.FnWatcher(long_seconds=0.9)
+        watcher.feed(self._report(1), 0.0)
+        events = watcher.feed(self._report(0, 0), 0.85)
         self.assertEqual([e.kind for e in events], ["release", "click"])
 
     def test_other_key_does_not_count_as_fn(self):
@@ -1202,10 +1210,155 @@ class LcdRendererTests(unittest.TestCase):
         # 有线的地方应该偏青（B > R）
         self.assertGreater(int(left_b[2]), int(left_b[0]))
 
+    @staticmethod
+    def _level_line_rows(renderer, xs=(10, lcd.FRAME_W - 11)):
+        """取水平仪青色线在给定 x 列上的平均 y（没有则 None）。"""
+        np = __import__("numpy")
+        packet = renderer.render(LcdRendererTests._frame())
+        image = np.frombuffer(bytes(packet), np.uint8,
+                              offset=lcd.FRAME_HEADER).reshape(
+                                  lcd.FRAME_H, lcd.FRAME_W, 4)
+        rows = {}
+        for x in xs:
+            col = image[:, x, :3].astype(np.int16)
+            mask = (col[:, 2] - col[:, 0]) > 30     # 青色线；灰底/网格不会过阈值
+            ys = np.flatnonzero(mask)
+            rows[x] = float(ys.mean()) if ys.size else None
+        return rows
+
+    def test_level_180_inverts_pitch_and_roll(self):
+        """180 旋转下默认把 pitch/roll 都取反（面板/叠加层坐标整体翻 180°）。"""
+        center = lcd.FRAME_H // 2
+        # 只看 pitch（roll=0）：0 下移 +40 px，180 取反后上移 40 px
+        r0 = pipeline.LcdRenderer(
+            fit="cover", level=lambda: (20.0, 0.0), rotate=0)
+        r180 = pipeline.LcdRenderer(
+            fit="cover", level=lambda: (20.0, 0.0), rotate=180)
+        rows0 = self._level_line_rows(r0, xs=(100,))
+        rows180 = self._level_line_rows(r180, xs=(100,))
+        self.assertIsNotNone(rows0[100])
+        self.assertAlmostEqual(rows0[100], center + 40, delta=3)
+        self.assertAlmostEqual(rows180[100], center - 40, delta=3)
+        # 只看 roll（pitch=0）：0 下左端更低，180 取反后左端更高
+        a = self._level_line_rows(pipeline.LcdRenderer(
+            fit="cover", level=lambda: (0.0, 20.0), rotate=0))
+        b = self._level_line_rows(pipeline.LcdRenderer(
+            fit="cover", level=lambda: (0.0, 20.0), rotate=180))
+        self.assertIsNotNone(a[10])
+        self.assertIsNotNone(a[lcd.FRAME_W - 11])
+        self.assertGreater(a[10], a[lcd.FRAME_W - 11])
+        self.assertLess(b[10], b[lcd.FRAME_W - 11])
+
+    def test_level_invert_flags_override_rotation(self):
+        center = lcd.FRAME_H // 2
+        pitch = lambda: (20.0, 0.0)  # noqa: E731
+        base = self._level_line_rows(
+            pipeline.LcdRenderer(fit="cover", level=pitch, rotate=180), xs=(100,))
+        no_invert = self._level_line_rows(
+            pipeline.LcdRenderer(fit="cover", level=pitch, rotate=180,
+                                 invert_x=False, invert_y=False), xs=(100,))
+        self.assertAlmostEqual(base[100], center - 40, delta=3)
+        self.assertAlmostEqual(no_invert[100], center + 40, delta=3)
+        roll = lambda: (0.0, 20.0)  # noqa: E731
+        no_x = self._level_line_rows(
+            pipeline.LcdRenderer(fit="cover", level=roll, rotate=180,
+                                 invert_x=False))
+        self.assertGreater(no_x[10], no_x[lcd.FRAME_W - 11])
+
+    def test_render_hud_packet_and_rotate(self):
+        np = __import__("numpy")
+        rgba = np.zeros((lcd.FRAME_H, lcd.FRAME_W, 4), dtype=np.uint8)
+        rgba[..., 3] = 255
+        rgba[0, 0] = (1, 2, 3, 255)
+        rgba[lcd.FRAME_H - 1, lcd.FRAME_W - 1] = (4, 5, 6, 255)
+        packet = pipeline.LcdRenderer().render_hud(rgba)
+        image = np.frombuffer(bytes(packet), np.uint8,
+                              offset=lcd.FRAME_HEADER).reshape(
+                                  lcd.FRAME_H, lcd.FRAME_W, 4)
+        self.assertEqual(tuple(int(v) for v in image[0, 0]), (1, 2, 3, 255))
+        self.assertEqual(tuple(int(v) for v in image[-1, -1]), (4, 5, 6, 255))
+        # 180：整张 HUD 翻转，左上角来自原图右下角
+        packet = pipeline.LcdRenderer(rotate=180).render_hud(rgba)
+        image = np.frombuffer(bytes(packet), np.uint8,
+                              offset=lcd.FRAME_HEADER).reshape(
+                                  lcd.FRAME_H, lcd.FRAME_W, 4)
+        self.assertEqual(tuple(int(v) for v in image[0, 0]), (4, 5, 6, 255))
+        self.assertEqual(tuple(int(v) for v in image[-1, -1]), (1, 2, 3, 255))
+
     def test_cover_box_for_640x480(self):
         self.assertEqual(pipeline.cover_box(640, 480), (640, 400))
         # 1280×720 要填满 640×400 → 按高度放大、左右各裁 64 列
         self.assertEqual(pipeline.cover_box(1280, 720), (1152, 720))
+
+    def test_zoom_box_15_and_20(self):
+        """数字变焦的源裁切窗口：1.5x=853×480，2.0x=640×360（居中）。"""
+        self.assertEqual(pipeline.zoom_box(1280, 720, 1.0), (1280, 720))
+        self.assertEqual(pipeline.zoom_box(1280, 720, 1.5), (853, 480))
+        self.assertEqual(pipeline.zoom_box(1280, 720, 2.0), (640, 360))
+        with self.assertRaises(GlxssError):
+            pipeline.zoom_box(1280, 720, 1.3)
+
+    def _edge_pixel(self, renderer, x, y):
+        np = __import__("numpy")
+        packet = renderer.render(self._striped_frame())
+        image = np.frombuffer(bytes(packet), np.uint8,
+                              offset=lcd.FRAME_HEADER).reshape(
+                                  lcd.FRAME_H, lcd.FRAME_W, 4)
+        return tuple(int(v) for v in image[y, x, :3])
+
+    @staticmethod
+    def _striped_frame(w=1280, h=720):
+        """中间 640 列亮（Y=230）、两侧暗（Y=30）的 720p YV12 帧。"""
+        np = __import__("numpy")
+        y = np.full((h, w), 30, dtype=np.uint8)
+        y[:, 320:960] = 230
+        c = np.full((h // 2, w // 2), 128, dtype=np.uint8)
+        # YV12 = Y | V | U
+        return stream.StreamFrame(1, y.tobytes() + c.tobytes() + c.tobytes(), w, h)
+
+    def test_zoom_center_crop_changes_fov(self):
+        """x=100 的同一像素：1.0x 暗（全画幅左缘），1.5x 亮，2.0x 更亮。
+
+        1.0x 能看到整幅 1280 宽；1.5x 只取中心 853 列（源 x 214..1066），
+        2.0x 只取中心 640 列（源 x 320..960），所以画面确实被放大。
+        """
+        zoom1 = pipeline.LcdRenderer(fit="fit")
+        zoom15 = pipeline.LcdRenderer(fit="fit", zoom=1.5)
+        zoom2 = pipeline.LcdRenderer(fit="fit", zoom=2.0)
+        self.assertEqual(zoom1.zoom, 1.0)
+        dark = self._edge_pixel(zoom1, 100, 200)[0]
+        mid = self._edge_pixel(zoom15, 100, 200)[0]
+        bright = self._edge_pixel(zoom2, 100, 200)[0]
+        self.assertLess(dark, 80)
+        self.assertGreater(mid, 150)
+        self.assertGreater(bright, 150)
+        # 2.0x 的整行都来自中间亮区（源 x 320..960）
+        self.assertGreater(self._edge_pixel(zoom2, 5, 200)[0], 150)
+
+    def test_set_zoom_validation_and_next_frame(self):
+        renderer = pipeline.LcdRenderer(fit="fit")
+        self.assertEqual(renderer.set_zoom(1.5), 1.0)
+        self.assertEqual(renderer.zoom, 1.5)
+        self.assertEqual(renderer.set_zoom(2.0), 1.5)
+        with self.assertRaises(GlxssError):
+            renderer.set_zoom(1.3)
+        packet = renderer.render(self._frame(1280, 720))
+        self.assertEqual(len(packet), lcd.FRAME_TOTAL)
+        np = __import__("numpy")
+        rgba = np.frombuffer(bytes(packet), np.uint8, offset=lcd.FRAME_HEADER)
+        self.assertTrue((rgba.reshape(lcd.FRAME_H, lcd.FRAME_W, 4)[:, :, 3]
+                         == 255).all())
+
+    def test_cover_zoom_2_no_black_bars(self):
+        """cover + 2.0x：裁 640×360 → cover 576×360 → 320×200 无黑边。"""
+        np = __import__("numpy")
+        packet = pipeline.LcdRenderer(fit="cover", zoom=2.0).render(
+            self._frame(1280, 720))
+        image = np.frombuffer(bytes(packet), np.uint8,
+                              offset=lcd.FRAME_HEADER).reshape(
+                                  lcd.FRAME_H, lcd.FRAME_W, 4)
+        for x, y in ((5, 5), (lcd.FRAME_W - 6, 5), (5, lcd.FRAME_H - 6)):
+            self.assertGreater(int(image[y, x, 0]), 100)
 
     def test_renderer_rejects_bad_fit(self):
         with self.assertRaises(GlxssError):
@@ -1237,6 +1390,202 @@ class LcdRendererTests(unittest.TestCase):
         self.assertEqual(tuple(int(v) for v in image[5, 5, :3]),
                          pipeline.BACKDROP[:3])
         self.assertGreater(int(image[lcd.FRAME_H // 2, lcd.FRAME_W // 2, 0]), 100)
+
+
+class StreamDisplayModeTests(unittest.TestCase):
+    """长按 Fn 只切 LcdSink 模式，不能 release LCD（否则面板冻结）。"""
+
+    class _Hid:
+        alive = True
+        error = ""
+        last_report = None
+        key_down = False
+
+        def level_snapshot(self):
+            return (0.0, 0.0)
+
+        def drain_events(self):
+            return []
+
+        def inject_event(self, event):
+            pass
+
+    class _Hud:
+        def update_report(self, report):
+            pass
+
+        def set_connected(self, value):
+            pass
+
+        def set_fps(self, value):
+            pass
+
+        def set_firmware(self, value):
+            pass
+
+        def close(self):
+            pass
+
+    class _Sink:
+        def __init__(self):
+            self.mode = "preview"
+            self.started = False
+            self.released = False
+            self.zoom = 1.0
+
+        @property
+        def alive(self):
+            return self.started and not self.released
+
+        def start(self):
+            self.started = True
+
+        def set_mode(self, mode):
+            if mode not in ("preview", "hud"):
+                raise AssertionError(mode)
+            self.mode = mode
+
+        def set_zoom(self, zoom):
+            self.zoom = zoom
+
+        def release(self):
+            self.released = True
+
+    class _Source:
+        def __init__(self):
+            self.sink = None
+
+        def create_lcd_sink(self, config, hub, level_poller=None,
+                            hud_source=None, hud_fps=2.0):
+            self.sink = StreamDisplayModeTests._Sink()
+            return self.sink
+
+    def test_click_switches_lcd_mode_without_release(self):
+        cfg = stream.StreamConfig(mirror_fps=10.0, fn_keys=True)
+        runner = stream.Streamer(cfg)
+        runner._hid = self._Hid()
+        runner._hud = self._Hud()
+        source = self._Source()
+        runner._source = source
+        self.assertTrue(runner._start_preview())
+        sink = source.sink
+        self.assertEqual(sink.mode, "preview")
+        self.assertTrue(runner._toggle_display())        # preview -> hud
+        self.assertEqual(sink.mode, "hud")
+        self.assertFalse(sink.released)
+        self.assertEqual(runner.stats.display, "hud")
+        self.assertTrue(runner._toggle_display())        # hud -> preview
+        self.assertEqual(sink.mode, "preview")
+        self.assertFalse(sink.released)
+
+
+class StreamFnZoomTests(unittest.TestCase):
+    """新 Fn 映射 + 数字变焦（不碰硬件）。
+
+    * 短按（preview）→ zoom 1.0 → 1.5 → 2.0 → 1.0；
+    * 短按（HUD）    → 忽略；
+    * 长按           → display toggle（排队给 worker）；
+    * ``ctl zoom``   → 1.0/1.5/2.0/cycle，并在 status 里回显。
+    """
+
+    class _Hid:
+        alive = True
+        error = ""
+        last_report = None
+        key_down = False
+
+        def __init__(self, events=()):
+            self.events = list(events)
+
+        def level_snapshot(self):
+            return (0.0, 0.0)
+
+        def drain_events(self):
+            events, self.events = self.events, []
+            return events
+
+        def inject_event(self, event):
+            self.events.append(event)
+
+    def _runner(self, mode="preview"):
+        cfg = stream.StreamConfig(mirror_fps=10.0, fn_keys=True)
+        runner = stream.Streamer(cfg)
+        sink = StreamDisplayModeTests._Sink()
+        sink.mode = mode
+        sink.started = True
+        runner._lcd = sink
+        runner._hid = self._Hid()
+        return runner, sink
+
+    def _click(self, runner):
+        runner._hid.events.append(
+            hid.FnEvent("click", time.monotonic(), 0.25, 3))
+
+    def test_click_preview_cycles_zoom(self):
+        runner, sink = self._runner("preview")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            for expected in (1.5, 2.0, 1.0, 1.5):
+                self._click(runner)
+                runner._drain_buttons()
+                self.assertEqual(runner.stats.zoom, expected)
+                self.assertEqual(sink.zoom, expected)
+        text = out.getvalue()
+        self.assertIn("zoom 1.5x", text)
+        self.assertIn("源中心 853x480", text)
+        self.assertIn("zoom 2.0x", text)
+        self.assertIn("源中心 640x360", text)
+
+    def test_click_in_hud_is_ignored(self):
+        runner, sink = self._runner("hud")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self._click(runner)
+            runner._drain_buttons()
+        self.assertEqual(runner.stats.zoom, 1.0)
+        self.assertEqual(sink.zoom, 1.0)
+        self.assertIn("忽略", out.getvalue())
+        self.assertIn("长按 Fn 切回视频", out.getvalue())
+
+    def test_long_press_queues_display_toggle(self):
+        runner, sink = self._runner("preview")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            runner._hid.events.append(
+                hid.FnEvent("long", time.monotonic(), 1.2, 13))
+            runner._drain_buttons()
+        self.assertEqual(runner._actions.get_nowait(), "display")
+        self.assertIn("display toggle", out.getvalue())
+        self.assertTrue(runner._toggle_display())
+        self.assertEqual(sink.mode, "hud")
+
+    def test_ctl_zoom_and_status(self):
+        runner, sink = self._runner("preview")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            response = runner._handle_ctl({"cmd": "zoom", "value": "1.5"})
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["status"]["zoom"], 1.5)
+            self.assertEqual(response["status"]["zoom_crop"], [853, 480])
+            self.assertEqual(sink.zoom, 1.5)
+            response = runner._handle_ctl({"cmd": "zoom", "value": "cycle"})
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["zoom"], 2.0)
+            response = runner._handle_ctl({"cmd": "zoom", "value": "1.3"})
+            self.assertFalse(response["ok"])
+            self.assertIn("1.5", response["error"])
+            status = runner._handle_ctl({"cmd": "status"})["status"]
+            self.assertEqual(status["zoom"], 2.0)
+            self.assertEqual(status["zoom_levels"], [1.0, 1.5, 2.0])
+        # status 在 HUD/无 LCD 时也应保留档位（切回视频立即生效）
+        runner._lcd.mode = "hud"
+        self.assertEqual(runner._handle_ctl({"cmd": "status"})["status"]["zoom"],
+                         2.0)
+
+    def test_zoom_config_validation(self):
+        stream.StreamConfig(zoom=1.5).validate()
+        with self.assertRaises(GlxssError):
+            stream.StreamConfig(zoom=1.3).validate()
 
 
 if __name__ == "__main__":

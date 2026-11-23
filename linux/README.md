@@ -21,7 +21,8 @@ linux/
 │  ├─ hid.py       # 300ms 轮询 28B 报告、版本串、传感器使能
 │  ├─ firmware.py  # AES-128-ECB 尾部解密 + 03e7:2150 灌写（默认 dry-run）
 │  ├─ capture.py   # ImageSource / TestPatternSource / mss 屏幕采集 / 三种映射
-│  ├─ hud.py       # HUD 渲染源：时间/罗盘/姿态/lux/亮度/固件/导航占位
+│  ├─ hud.py       # 导航 HUD 渲染源：箭头/距离/动作 + heading/姿态/lux/温度
+│  ├─ nav.py       # 手机 → Pi Wi-Fi UDP JSON → LatestNav 线程安全单槽
 │  ├─ monitor.py   # 相机监看源：UVC 读帧 → 640×400 → 九宫格/水平仪/REC → 眼镜
 │  ├─ pipeline.py  # 一次采集多消费者：最新帧槽 / YV12→yuv420p 零拷贝 / LCD 渲染线程
 │  ├─ control.py   # 与 LCD HAT 的 JSON over Unix socket 控制通道
@@ -51,6 +52,7 @@ linux/
 | HUD 渲染源（默认） | ✅ 已实现：Pillow 640×400 RGBA，2 fps 级别重绘 |
 | 相机监看（monitor） | ✅ `cast --source uvc` / `hud --view monitor`；九宫格 + 水平仪 + 可选 REC；合成帧 10 fps 实测 |
 | 直播 + 眼镜预览（共享帧） | ✅ `pi/stream.py --mirror-fps 10`：一次采集分发两路，真机 采集 30 / 编码 25 / 眼镜 10 fps，总 CPU 65–69% |
+| 直播中的 Fn 键 | ✅ 长按 ≥0.9 s = preview ↔ HUD（stream 进程内渲染，不 release LCD）/ 短按（preview）= 循环变焦 1.0/1.5/2.0x（HUD 下忽略）；补 `[hid] key 0x71 down/up` 日志、`ctl button click/long` 注入、`ctl zoom` |
 | Pi LCD HAT 状态页/菜单 | ✅ 已实现：状态页 + 7 项菜单（含 VIEW）+ Unix socket |
 | PyInstaller 三端打包 | ✅ 脚本/spec 完成；Windows onedir 实测可运行 |
 | 屏幕采集 | ✅ `mss`（可选依赖）；无桌面用 HUD/test |
@@ -58,7 +60,8 @@ linux/
 | 写 EEPROM | ❌ 故意不实现（危险，会改 SN/BOM） |
 
 > 用户定位：**LCD HAT = 状态/控制面板，眼镜 = 主显示，内容用 HUD 渲染**，
-> 不是完整桌面镜像。`glxss hud` 是默认推荐入口。
+> 不是完整桌面镜像。`pi/stream.py` 运行时 HUD 由它自己渲染（长按 Fn 切换）；
+> 不跑直播时用 `glxss hud --listen` 作独立 HUD 主进程。两者不要同时占眼镜屏。
 
 ---
 
@@ -229,7 +232,7 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 | `flash` | 03e7:2150 灌写；默认 dry-run，`--yes` 真写 |
 | `cast` | 连续投屏；`--source hud`（默认）/`uvc`（相机监看）/`screen`/`test` |
 | `hud` | HUD 主进程；`--dry-run` 离线出 PNG，`--listen` 开控制 socket，`--view monitor` 直接进监看 |
-| `ctl` | 通过 socket 控制 HUD 主进程（status/bright/screen/view/mode/rec/hud/test/nav/quit） |
+| `ctl` | 通过 socket 控制 HUD/直播进程（status/bright/screen/view/mode/display/zoom/rtsp/button/rec/hud/test/nav/quit） |
 
 `--fit` 支持：
 
@@ -243,29 +246,36 @@ payload：640×400×4 = 1,024,000 B 裸 RGBA8888
 
 ## 5. HUD 渲染源
 
-`glxss/hud.py` 用 Pillow 画 **640×400 RGBA**，组合以下图层：
+`glxss/hud.py` 用 Pillow 画 **640×400 RGBA**，已经从「时钟/罗盘页」改成
+**导航 HUD**；数据来自手机（Wi-Fi UDP，见 §5.3）：
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
-│ 01:18 LOCAL   ● GLASSES ONLINE          2.0 fps   HUD ON  │
+│ 01:18 LOCAL  HEADING 040°  ● PHONE LINK        2.0 fps    │
 ├──────────┬───────────────────────────────┬─────────────────┤
 │ LIGHT    │             N                 │ ATTITUDE        │
-│  321 lux │        ╭───────────╮          │   ────────      │
-│ SENSOR   │      W │   036 deg  │ E        │  PITCH  -2.2    │
-│  OK      │        ╰───────────╯          │  ROLL   +0.7    │
-│ MAG  OK  │             S                 │  GYRO  +2 -1 0  │
+│  321 lux │          ╱  ▲  ╲             │   ────────      │
+│ TEMP     │        W │  ARROW  │ E        │  PITCH  -2.2    │
+│  36.5°C  │          ╲       ╱             │  ROLL   +0.7    │
+│ SENSOR OK│             120 m              │  GYRO  +2 -1 0  │
 ├──────────┴───────────────────────────────┴─────────────────┤
-│ BRIGHT 185 ████████      FW G25_MainFW_1.9.1   HUD ON LIVE │
+│                     右转（NEXT ACTION）                    │
 └────────────────────────────────────────────────────────────┘
 ```
 
-* 顶部：本地时间、连接状态、fps；
-* 中心：磁罗盘刻度环（N/E/S/W + 15° 刻度）、heading 指针、数值；
-  **罗盘无数据时显示 `--` + `NO MAG`**，不再显示误导性的 000°；
-* 左侧：光感 lux、传感器/罗盘状态；**不显示温度**（用户实测温度高、无参考价值）；
+* 顶部：当前 heading（手机 GPS，缺省时用眼镜 HID 罗盘）、手机连接状态、fps；
+* 中心：大箭头按 `bearing - heading` 旋转（**手机没给 heading 时直接用
+  bearing**，方便 `ctl nav` 手动测试）；刻度环随 heading 旋转，N 始终指真北；
+* 箭头下方：距离（`120 m` / `1.2 km`）；
+* 底部：下一动作文字（`右转` / `直行` / `到达`，手机 UTF-8 label）；
+* 左侧：光感 lux + 温度（用户要求保留）、传感器/罗盘状态；
 * 右侧：加速度姿态仪（pitch/roll）、陀螺数值（保留）；
-* 底部：亮度条、固件版本、HUD/连接状态；
-* 罗盘下方：可选导航占位（相对方位箭头 + 距离 + 标签）。
+* **没有导航数据时**：中心显示「等待手机…」，顶部 `WAITING PHONE`，
+  5 s（`--nav-stale`）没收到新包也回到这个状态。
+
+> 中文动作文字需要 CJK 字体；Pi 上建议安装
+> `sudo apt install fonts-wqy-zenhei`（约 15 MB）或 `fonts-noto-cjk`。
+> 没有 CJK 字体时 HUD 自动退回英文映射（RIGHT/STRAIGHT/ARRIVE），不会显示方框。
 
 ### 5.1 使用方式
 
@@ -293,26 +303,77 @@ glxss hud --demo --fps 2
 * 发送频率由 `--fps` 控制，默认 2 fps；HUD 是静态信息，不需要 25 fps；
 * `--fps 0` 表示不限速（只建议调试）。
 
-### 5.3 导航占位接口
+### 5.3 导航 HUD：手机 Wi-Fi UDP
 
-不实现真实导航协议，只留接口：
+Pi 端 `glxss/nav.py` 在 `0.0.0.0:9999`（UDP）收手机 JSON，写进线程安全的
+`LatestNav` 单槽（和 `LatestFrame` 同思路：旧包直接覆盖，不排队）。`stream`
+进程和 `hud` 进程都会启动接收线程，HUD 每次取帧前轮询单槽。
 
-```python
-source.set_nav(bearing=72, distance=320, label="Main St")
-source.clear_nav()
+协议（手机每秒一包，UTF-8 JSON）：
+
+```json
+{"bearing": 45, "distance": 120, "label": "右转", "heading": 40}
 ```
 
-或通过 CLI：
+| 字段 | 含义 |
+|---|---|
+| `bearing` | 目标绝对方位（deg，0=北，顺时针） |
+| `heading` | 手机当前朝向（deg，可选；省略时箭头角直接用 bearing） |
+| `distance` | 距离（米） |
+| `label` | 下一动作文字（UTF-8，最长 48 字） |
+
+* 绑定 `0.0.0.0:9999` 不需要 root（>1024）；有防火墙时放行 UDP 9999；
+* 手机 1 Hz 发包；**5 s 没收到新包**（`--nav-stale`）HUD 回到「等待手机…」；
+* `ctl nav` 注入的帧默认持久（`ttl=0`），直到 `ctl nav-clear` 或手机新包覆盖，
+  方便无手机时做桌面测试。
+
+命令行测试（不依赖手机）：
 
 ```bash
-glxss ctl nav 72 --distance 320 --label "Main St"
+# Pi 上：注入一帧（bearing=45，距离 120 m，动作“右转”，手机 heading=40）
+glxss ctl nav 45 --distance 120 --label 右转 --heading 40
+glxss ctl status            # 看 导航 / 导航UDP 两行
 glxss ctl nav-clear
+
+# PC 上：直接模拟手机 UDP（把 IP 换成 Pi）
+python3 -c 'import json,socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(json.dumps({"bearing":45,"distance":120,"label":"右转","heading":40},ensure_ascii=False).encode(),("192.168.2.128",9999))'
+
+# Pi 上确认端口和收包：
+ss -lunp | grep 9999
+journalctl -u glxss-stream -f | grep -E '\[nav\]|导航'
+```
+
+stream 的启动参数（systemd 里可加）：
+
+```bash
+--nav-port 9999        # 0=不监听
+--nav-bind 0.0.0.0     # 只想本机测试可改 127.0.0.1
+--nav-stale 5.0        # 无数据超时（秒）
+--no-nav-udp           # 完全关闭 UDP（ctl nav 仍可用）
+```
+
+`glxss hud` 子命令也有同样的 `--nav-port/--nav-bind/--nav-stale/--no-nav-udp`。
+
+Android 端入口：App 首页「导航 HUD（Wi-Fi UDP → Pi）」——
+开关、Pi IP/端口（默认 `192.168.2.128:9999`）、bearing/距离滑块、
+左转/直行/右转/到达按钮、手动 heading 开关；heading 默认取
+`LocationManager` 的 `Location.getBearing()`。
+
+代码里也可以直接操作单槽：
+
+```python
+from glxss import hud, nav
+state = nav.LatestNav(stale=5.0)
+source = hud.HudSource(nav_source=state)      # HUD 自动轮询
+state.update(bearing=45, distance=120, label="右转", heading=40)
 ```
 
 ### 5.4 字体与校准
 
-* 字体优先系统 Noto/DejaVu/Arial/Consolas，找不到才退回 Pillow 内置字体；
-  仓库不自带字体文件；HUD/HAT 文本保持 ASCII，避免 Pi 缺中文字形。
+* 英文/数字优先系统 Noto/DejaVu/Arial/Consolas；**中文动作文字**优先
+  Noto CJK / 文泉驿 / 微软雅黑 / 苹方。Pi 上装一款即可：
+  `sudo apt install fonts-wqy-zenhei`，用 `fc-list :lang=zh | head` 验证。
+  没有 CJK 字体时 HUD 自动把常见动作映射成英文，不会显示方框。
 * heading 约定 +X=北、+Y=东，`--heading-offset` 可整体旋转校准。
 * 磁罗盘硬铁/软铁校准**未实现**，只显示原始值；姿态公式按
   `docs/ch-hid.md §5.3`，未在真机标定。
@@ -410,19 +471,51 @@ Pi Zero 2 W 实测（合成 YV12 640×480，CPU 1 GHz，performance governor；
 UVC 读线程（异步 16 URB / 16 KiB 分块组帧；单路 29.7–30.7 fps）
   → LatestFrame.publish()                  # 一个槽，旧的直接丢，不排队
        ├─ EncoderSink 线程 → ffmpeg stdin（YV12→yuv420p 只换写入顺序，零拷贝）
-       └─ LcdSink 线程   → 4×4 抽样 288×180/320×180 → YUV→RGB(C) → 640×400
-                          → OSD → 暂停 UVC → 1 MB bulk OUT → 恢复 UVC
+       └─ LcdSink 线程（同一 LCD 链路两种模式）
+            preview：按 zoom 居中裁切（1.0x 整幅 / 1.5x 853×480 / 2.0x 640×360）
+                     → 4×4～2×2 抽样 → YUV→RGB(C) → 640×400
+                     → 三分线/水平仪 → 暂停 UVC → 1 MB bulk OUT → 恢复
+            hud    ：HudSource.grab_rgba() → 640×400 导航 HUD
+                     （箭头/距离/动作 + heading/连接/fps + lux/温度 + 姿态）
+                     → 同一个 1 MB packet → 2 fps bulk OUT
+
+手机 Wi-Fi UDP JSON :9999 → nav.NavListener → nav.LatestNav（单槽）
+  → HudSource._poll_nav()（变化才重绘）→ 上面的 hud 分支
 ```
 
 * 读线程只「读 + 发布」，**任何消费者慢都不会拖慢采集**；
 * 异步 reader（`uvc_async.AsyncBulkReader`）用独立 libusb handle claim VS，
   保持 16 个 16 KiB URB 在途；`usb1` 缺失/claim 失败自动回退同步读；
 * LCD 线程按 `--mirror-fps` 睡到截止时间再取当时最新帧，叠加三分线 + 水平仪；
-* Fn 按键在独立 HID 线程轮询（100 ms）：**单击**切 HUD ↔ 相机预览，**长按 ≥0.9 s**
-  停/恢复 RTSP；动作再交给独立 worker，**UVC 读线程只取事件、不执行启停**；
-  `glxss ctl display/rtsp/status` 同效，事件写日志；
-* 眼镜这一路的额外成本：渲染 22–28 ms 墙钟 + 1 MB bulk OUT 29–39 ms（发送期间
-  UVC 暂停，10 fps 时总暂停约 0.3 s/s）。
+* **Fn 长按 ≥0.9 s = 眼镜 camera preview ↔ HUD**：只调用 `LcdSink.set_mode()`，
+  同一个 1 MB packet、**不 release/claim LCD 接口**。旧实现切 HUD 时只停预览并
+  释放接口，等外部 `glxss hud` 进程接管；Pi 上没有该进程，面板停在最后一帧
+  （用户实测的“冻结”）。现在 HUD 由 stream 进程内渲染（`--hud-fps`，默认
+  2.0），实测单帧渲染 ~110–120 ms + 发送 ~30–40 ms；
+* **Fn 短按（preview 下）= 循环数字变焦 1.0x → 1.5x → 2.0x**：
+  `LcdRenderer` 先在 720p 源图上**居中裁切**（1.5x → 853×480，2.0x →
+  640×360），再按 `--mirror-fit` 映射到 640×400；三分线/水平仪在裁切后绘制，
+  始终正立。抽样步长跟着裁切窗口重算（720p 1.0x 是 4×4，1.5x/2.0x 变 2×2），
+  1.5x 单帧渲染比 1.0x 多约 3 ms。**HUD 下短按忽略**；RTSP 开关改由
+  `glxss ctl rtsp on|off`（不再绑键），变焦也有
+  `glxss ctl zoom 1.0|1.5|2.0|cycle`，`ctl status` 显示当前档位与源裁切窗口；
+* **长按判定只看时间**（0.9 s），不再要求“连续 4 个按下包”（100 ms 轮询下，
+  1 s 按压只有 ~10 包，包数条件会造成边缘误判）；松开时若实际按住 ≥0.9 s 也
+  补发长按。动作交给独立 worker，**UVC 读线程只取事件、不执行切换**；每次
+  `keyStatus` 变化打 `[hid] key 0x71 down/up（按住 x.xx s）`，动作打
+  `[stream] Fn 按键：…`，`glxss ctl status` 增加 `view/lcd_mode/zoom/level/hid`；
+* **水平仪方向**：`--mirror-rotate 180` 下面板/叠加层坐标整体翻 180°，preview
+  默认把 pitch/roll 都取反（`--level-invert-x` = roll 左右倾，`--level-invert-y`
+  = pitch 上下）。HUD 的整张图翻转 180° 后由面板再翻一次，用户看到的是未旋转
+  HUD 图，所以 HUD 小地平线只补偿 roll，pitch 保持真实方向。验收：头左倾 →
+  地平线右倾；头低下 → 地平线上移。`--mirror-rotate 0` 默认不取反；
+* 眼镜这一路的额外成本：preview 渲染 22–28 ms 墙钟 + 1 MB bulk OUT 29–39 ms
+  （发送期间 UVC 暂停，10 fps 时总暂停约 0.3 s/s）；HUD 模式 2 fps，CPU 占用
+  更低但单帧 Pillow 渲染 ~110 ms（约 0.22 核）；
+* **不按键的等价控制**（服务里 `GLXSS_SOCK=/run/glxss/glxssctl.sock`）：
+  `glxss ctl display preview|hud|toggle`、`glxss ctl zoom 1.5`（或 `cycle`）、
+  `glxss ctl rtsp off|on`、`glxss ctl button click|long`（把事件注入同一队列，
+  无硬件也能走完整路径）。变焦重启回 `--zoom`（默认 1.0），不落盘。
 
 Pi Zero 2 W 真机（同一台设备，20 s 以上稳态）：
 

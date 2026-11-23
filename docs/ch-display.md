@@ -346,6 +346,42 @@ EEPROM 256 B 产品信息（只读，安全）：
 LCD 10 fps 稳定；提高预览帧率不会缩短单帧窗口。彻底消除需要设备端页面翻转/
 局部刷新命令（未发现）。详见 [ch-uvc.md §7.6](ch-uvc.md#76-眼镜预览撕裂排查与修法2026-11-22-晚)。
 
+### 6.2 Linux：Fn 短按切 HUD 与水平仪方向（2026-11-23 实机修正）
+
+**短按“冻结”的根因**：旧 `stream.py` 切到 HUD 时只做
+`LcdSink.release()`（停线程 + 释放 LCD 接口），等外部 `glxss hud` 进程接管；
+但 Pi 上只跑 `glxss-stream.service`，没有 HUD 进程，面板就一直停着最后一帧。
+现在眼镜屏由**同一个 `LcdSink`** 负责两种模式：
+
+* `preview`：从共享最新帧槽取相机帧 → 叠加三分线/水平仪 → 发送（`--mirror-fps`）；
+* `hud`：`hud.HudSource.grab_rgba()` 渲染 640×400 RGBA（时间/罗盘/姿态/lux），
+  直接写进复用的 1 MB packet，按 `--hud-fps`（默认 2 fps）发送。
+
+Fn 短按只调用 `LcdSink.set_mode("hud"/"preview")`，**不 release、不重新
+claim** LCD 接口，所以不会再出现“屏上停住”。`glxss ctl status` 的
+`view` / `lcd_mode` 会同步显示 `hud` / `preview`；`ctl display hud|preview|toggle`
+与 Fn 等效。实测：preview 10.0 fps；HUD 2.0 fps，单帧渲染 ~110–120 ms +
+发送 ~30–40 ms（Pi Zero 2 W）。
+
+> 注意：HUD 模式下 LCD 接口仍被 stream 占用，**不要同时运行**
+> `glxss hud` / `glxss-cast.service`（会 claim 失败）。
+
+**水平仪方向**：面板是 180° 安装的，帧缓冲到用户视角还要再翻 180°，而叠加层
+画在翻转后的帧缓冲里；因此 `--mirror-rotate 180` 下默认把 preview 叠加层的
+pitch/roll 都取反（`LcdRenderer` 的 `invert_x` / `invert_y`）。HUD 的整张图在
+`render_hud()` 里翻转 180°、面板再翻一次，用户看到的是未旋转的 HUD 图，所以
+HUD 姿态小地平线只补偿 roll（左右倾），pitch 保持真实方向。`--mirror-rotate 0`
+默认不取反。可用：
+
+```bash
+# x = roll（左右倾），y = pitch（上下）；默认 180 下两者都取反
+python3 pi/stream.py ... --level-invert-x --no-level-invert-y
+```
+
+验收标准（航空地平仪惯例）：头往**左**倾 → 地平线向**右**倾；头往**下**低 →
+地平线向**上**移。`ctl status` 会打印
+`水平仪: pitch=+x.x° roll=+x.x°（取反 x=True y=True）` 便于核对。
+
 ---
 
 ## 7. 坑与注意事项

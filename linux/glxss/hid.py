@@ -25,10 +25,11 @@ HID_REPORT_LEN = 28
 HID_PRODUCT_LEN = 24
 SENSOR_POLL_INTERVAL = 0.3
 KEY_CODE_FN = 0x71
-# 长按判定：至少 4 个连续“按下”报告（300 ms 轮询时≈0.9 s）+ 0.9 s 时间阈值。
-# 100 ms 轮询时第 10 个包才到 0.9 s，所以两个条件必须同时满足，不能只看包数。
+# 长按判定：只看按住时长（默认 0.9 s），不要求按下包数。
+# 100 ms 轮询时 1 s 的按压只有 ~10 个包；如果同时要求包数/时间，边缘抖动
+# （某个按下包落在 0.89 s）会让“按满 1 秒”被误判成单击。包数仅用于日志。
 FN_LONG_PRESS_SECONDS = 0.9
-FN_LONG_PRESS_PACKETS = 4
+FN_LONG_PRESS_PACKETS = 4  # 兼容旧调用方；不再参与判定
 
 
 @dataclass
@@ -98,19 +99,22 @@ class FnWatcher:
     """把 28 B HID 报告流解析成 Fn 单击/长按事件（纯逻辑，便于离线单测）。
 
     设备在按住 Fn 时每个轮询包都是 ``keyStatus=1, keyCode=0x71``；松开后是
-    ``keyStatus=0``。长按必须同时满足：
+    ``keyStatus=0``。**长按只按时间判**：按住时长 ≥ ``long_seconds``（默认
+    0.9 s）即触发，不再要求“连续 N 个按下包”。
 
-      * 连续按下包数 ≥ ``long_packets``（默认 4）；
-      * 按住时长 ≥ ``long_seconds``（默认 0.9 s）。
+    为什么去掉包数：100 ms 轮询时，1 s 的按压只有 ~10 个包；若某个按下包
+    落在 0.89 s、下一个包之前就松开，旧逻辑（时间 AND 包数）会判成单击。
+    现在只要松开时 ``duration >= long_seconds``，即使按住期间没有包落在
+    阈值之后，也会补发 ``long`` 而不是 ``click``。
 
-    300 ms 轮询时第 4 个包正好 ≈0.9 s；100 ms 轮询时第 4 个包只有 0.3 s，
-    所以还要等时间阈值，否则“快速点一下”会被误判成长按。
+    ``long_packets`` 参数仅为兼容旧调用方保留，不参与判定；包数仍写进
+    ``FnEvent`` 便于日志排查。
     """
 
     def __init__(self, long_seconds: float = FN_LONG_PRESS_SECONDS,
                  long_packets: int = FN_LONG_PRESS_PACKETS):
         self.long_seconds = max(0.2, float(long_seconds))
-        self.long_packets = max(2, int(long_packets))
+        self.long_packets = max(0, int(long_packets))  # 兼容字段，不参与判定
         self._down = False
         self._down_at = 0.0
         self._packets = 0
@@ -141,9 +145,7 @@ class FnWatcher:
             else:
                 self._packets += 1
                 elapsed = at - self._down_at
-                if (not self._long_fired
-                        and self._packets >= self.long_packets
-                        and elapsed >= self.long_seconds):
+                if not self._long_fired and elapsed >= self.long_seconds:
                     self._long_fired = True
                     events.append(FnEvent("long", at, elapsed, self._packets))
             return events
@@ -155,7 +157,12 @@ class FnWatcher:
         self._down_at = 0.0
         self._packets = 0
         events.append(FnEvent("release", at, duration, packets))
-        if not self._long_fired:
+        if not self._long_fired and duration >= self.long_seconds:
+            # 松开前的最后一个按下包还没到阈值（轮询间隔边缘），但实际按住
+            # 时间已经够了 —— 按长按处理，避免“按满 1 秒却只算单击”。
+            self._long_fired = True
+            events.append(FnEvent("long", at, duration, packets))
+        elif not self._long_fired:
             events.append(FnEvent("click", at, duration, packets))
         self._long_fired = False
         return events

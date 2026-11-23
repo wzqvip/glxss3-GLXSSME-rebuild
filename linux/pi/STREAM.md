@@ -16,8 +16,8 @@
 | 推荐拓扑 | **A**：mediamtx 跑在 Pi 上（`rtsp://<pi>:8554/glxss`），OBS 直接拉 |
 | 备选 | Pi 上 mediamtx 换成 PC 上（Pi 直推到 PC，省 Pi 内存） |
 | 兜底 | **MJPEG HTTP**：`http://<pi>:8080/stream`，不需要 mediamtx/ffmpeg |
-| 眼镜预览 | `--mirror-fps N`：**同一帧共享**给编码线程和 LCD 线程；**Fn 单击**可随时在 HUD ↔ preview 间切换 |
-| Fn 按键 | 单击 = 显示 HUD/相机预览切换；长按 ≥0.9 s = 停止/恢复 RTSP；见 §8.6 |
+| 眼镜预览 | `--mirror-fps N`：**同一帧共享**给编码线程和 LCD 线程；**长按 Fn** 在 camera preview ↔ HUD 间切换（HUD 由 stream 进程内渲染，不释放 LCD）；短按循环数字变焦 |
+| Fn 按键 | 长按 ≥0.9 s（只看时间）= camera preview ↔ HUD；短按（preview 下）= 数字变焦 1.0x/1.5x/2.0x 循环，HUD 下忽略；RTSP 开关改用 `ctl rtsp on\|off`；见 §8.6.2 |
 | 延迟（估） | 0.3–0.6 s（局域网、OBS 网络缓冲 1–2 MB） |
 | Pi 负载（实测） | 720p30 只推流 **python ~1.28 核 + ffmpeg ~0.31 核**；再加 10 fps 眼镜预览 **python ~1.08 核 + ffmpeg ~0.23 核**（GIL 是双路瓶颈，见 §7.2） |
 | 带宽 | USB 侧 720p30 **~40–42 MB/s**（YUV 原始帧）；局域网 H.264 ~0.9–3 Mbps |
@@ -30,7 +30,7 @@ sudo apt install -y ffmpeg python3-usb1
 python3 pi/stream.py --check                    # 先确认 UVC 能读（异步 16 URB，实测 30.7 fps）
 python3 pi/stream.py --fps 30 --bitrate 2M      # 推 rtsp://127.0.0.1:8554/glxss
 # PC OBS：来源 → 媒体源 → 取消“本地文件” → 输入 rtsp://<pi-ip>:8554/glxss
-# 眼镜预览：Fn 单击（或 python3 -m glxss ctl display preview）
+# 眼镜预览：长按 Fn ≥0.9 s（或 python3 -m glxss ctl display preview）
 ```
 
 ---
@@ -47,7 +47,8 @@ python3 pi/stream.py --fps 30 --bitrate 2M      # 推 rtsp://127.0.0.1:8554/glxs
   YV12 裸帧，再喂给 ffmpeg。好处：
   * 不依赖 `/dev/video0`，**同一套代码在 PC/Windows/macOS 也能跑**；
   * 采集、编码、推流分层，编码器崩了自动重启，UVC 掉线自动重连；
-  * 可以和 HUD（只占 LCD 接口）同时工作；需要时还能把画面低帧率投回眼镜。
+  * 可以和独立 HUD 进程同时工作；开 `--mirror-fps` 后眼镜屏由本进程接管
+    （preview ↔ HUD，长按 Fn 切换），不要再同时跑 `glxss hud`。
 * 编码用 Pi 的硬件 H.264（`/dev/video11`，`h264_v4l2m2m`），比 `libx264` 省一半
   CPU（实测 640×480@20：硬编约 0.1–0.2 核，`libx264 ultrafast` 约 0.7 核；
   720p 硬编实测 ffmpeg 只占 ~6–9%，瓶颈在 USB 采集）。
@@ -250,16 +251,22 @@ python3 pi/stream.py --no-rtsp --mjpeg-port 8080
 # RTSP + MJPEG 同时开
 python3 pi/stream.py --mjpeg-port 8080
 
-# 同时把画面投到眼镜（会占用 LCD 接口，和 HUD 冲突）
+# 同时把画面投到眼镜（本进程接管 LCD；长按 Fn 在 preview/HUD 间切换）
 # 同一帧共享给编码线程 + LCD 线程；LCD 发送时暂停 UVC，单帧 29–39 ms
 python3 pi/stream.py --fps 30 --async-urb 16 --mirror-fps 10
 python3 pi/stream.py --mirror-fps 5              # 5 fps 预览换 23.7 fps 采集
 python3 pi/stream.py --mirror-fps 10 --mirror-fit cover --no-mirror-level
+python3 pi/stream.py --mirror-fps 10 --zoom 1.5   # 启动即 1.5x（853×480 居中裁切）
 python3 pi/stream.py --mirror-fps 10 --mirror-rotate 180   # 画面上下颠倒时
+# 水平仪方向调试（默认 180 下 preview 的 pitch/roll 都取反）
+python3 pi/stream.py --mirror-fps 10 --mirror-rotate 180 \
+    --level-invert-x --no-level-invert-y
 
-# Fn 按键 / 状态：默认启动控制 socket；单击切 HUD↔preview，长按切 RTSP
+# Fn 按键 / 状态：默认启动控制 socket
+#   长按 = preview ↔ HUD；短按 = 循环 1.0/1.5/2.0x（HUD 下忽略）；RTSP 不绑键
 python3 -m glxss ctl status
 python3 -m glxss ctl display preview     # 也可 hud/toggle
+python3 -m glxss ctl zoom 1.5            # 也可 1.0/2.0/cycle
 python3 -m glxss ctl rtsp off            # 也可 on/toggle
 python3 -m glxss ctl button click        # 无硬件时注入 click/long（调试）
 
@@ -280,10 +287,15 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 | `--async-urb` | `16` | libusb1 异步 URB 数；0=同步 16 KiB 读；实测 2 个就够纯读 40 MB/s，16 个在 HID/ffmpeg 并发下更稳 |
 | `--async-timeout` | `1000` | 单个异步 URB 超时毫秒 |
 | `--hid-poll` | `0.1` | HID/Fn 轮询间隔（设备报告周期 300 ms） |
-| `--no-fn` | 关 | 禁用 Fn 按键（仍可用 `ctl display/rtsp`） |
-| `--fn-long-press` / `--fn-long-packets` | `0.9` / `4` | 长按阈值：时间 + 连续按下包数同时满足（100 ms 轮询时约第 10 包） |
+| `--no-fn` | 关 | 禁用 Fn 按键（长按切显示 / 短按变焦；仍可用 `ctl display/zoom`） |
+| `--fn-long-press` / `--fn-long-packets` | `0.9` / 废弃 | 长按**只看按住时间**（≥0.9 s）；`--fn-long-packets` 仅为兼容旧脚本保留 |
+| `--hud-fps` | `2` | 长按 Fn 切到 HUD 后的重绘/发送帧率 |
+| `--nav-port` | `9999` | 手机导航 UDP 端口（0=不监听）；`--nav-bind` 默认 `0.0.0.0` |
+| `--nav-stale` | `5` | 多少秒没收到导航包就回「等待手机…」 |
+| `--no-nav-udp` | 关 | 不监听手机 UDP；`glxss ctl nav` 手动注入仍可用 |
 | `--ctl-socket` / `--no-ctl` | 自动 | 控制 socket 路径；`--no-ctl` 关闭（只靠状态行/日志） |
-| `--preview-fps` | 0 | Fn 打开预览时的帧率；0=使用 `--mirror-fps` 或 10 |
+| `--preview-fps` | 0 | 长按 Fn 打开预览时的帧率；0=使用 `--mirror-fps` 或 10 |
+| `--zoom` | `1.0` | 启动档位 `1.0/1.5/2.0`；只影响眼镜预览（RTSP 始终全画幅）。运行中短按 Fn 或 `ctl zoom` 切换，重启回该值（不落盘） |
 | `--bitrate` | `1500k` | 代码默认 1500k；720p 运动画面建议 2–3M |
 | `--codec` | `h264_v4l2m2m` | 备选 `libx264`（CPU 高，但兼容性最好） |
 | `--transport` | `tcp` | 局域网稳定优先 |
@@ -291,9 +303,10 @@ python3 pi/stream.py --rtsp rtsp://192.168.2.10:8554/glxss
 | `--frame-index` | 自动 | 按 VS 描述符选；720p=**3**，480p=4（`glxss uvc --list-modes` 可列） |
 | `--detach` / `--no-detach` | detach | 摘 `uvcvideo`；纯直播用 v4l2 时可关 |
 | `--mjpeg-port` | 0（关） | 同时开 MJPEG HTTP |
-| `--mirror-fps` | 0（关） | 启动即投眼镜的帧率；0=不投，Fn 单击打开（默认 10 fps）。共享帧，不额外读 UVC |
+| `--mirror-fps` | 0（关） | 启动即投眼镜的帧率；0=不投，长按 Fn 打开（默认 10 fps）。共享帧，不额外读 UVC |
 | `--mirror-fit` | `fit` | `cover`（居中裁满、无黑边）/ `fit`（等比、上下黑边）/ `stretch` |
-| `--mirror-rotate` | `0` | `180` = 画面上下颠倒时翻转（叠加层保持正立） |
+| `--mirror-rotate` | `0` | `180` = 画面上下颠倒时翻转；preview 水平仪默认同时取反 pitch/roll |
+| `--level-invert-x` / `--level-invert-y` | 自动 | 强制取反 roll（左右倾）/ pitch（上下）；`--no-level-invert-x/y` 强制不取反 |
 | `--mirror-level` | 开 | 读 HID 加速度计画水平仪；`--no-mirror-level` 只画三分线 + 准星 |
 | `--no-lcd-pause` | 关 | LCD 发送时不暂停 UVC（对照用：发送窗口 37–43 ms、采集 19.9–21.9 fps；默认暂停 32–39 ms） |
 | `--api-url` | 自动 | 推本机时用 `http://127.0.0.1:9997` 读实测码率；`--api-url ""` 可关 |
@@ -380,16 +393,17 @@ OBS 实际解码出的画面（测试图案，640×480 4:3）：
 
 ## 6. 与「相机监看 / HUD」共存
 
-**UVC 接口是独占的**：同一时间只能有一个进程读相机。HUD 只用 LCD 接口，
-可以和直播同时跑（前提是直播没开 `--mirror-fps`）。
+**UVC 接口是独占的**：同一时间只能有一个进程读相机。不开 `--mirror-fps` 时
+直播不碰 LCD，独立 HUD 进程可以同时跑；开了 `--mirror-fps` 后眼镜屏由 stream
+接管（preview ↔ HUD 由 Fn 短按切换），**不要**再同时跑 `glxss hud`。
 
 | 想做的事 | 命令 | 冲突 |
 |---|---|---|
 | 直播（本方案） | `python3 pi/stream.py` | 占用 UVC；和监看/`glxss uvc` 互斥 |
 | 相机监看 | `glxss cast --source uvc` | 占用 UVC；和直播互斥 |
 | 读帧调试 | `glxss uvc --detach` | 占用 UVC；和直播互斥 |
-| HUD 显示 | `glxss hud --listen` | 只占 LCD，可与直播共存 |
-| 直播 + 眼镜预览 | `pi/stream.py --mirror-fps 10` | 额外占 LCD，**不能**和 HUD 同开；共享帧，不额外读 UVC |
+| HUD 显示（独立） | `glxss hud --listen` | 只占 LCD；直播开 `--mirror-fps` 时不能同开 |
+| 直播 + 眼镜预览/HUD | `pi/stream.py --mirror-fps 10` | 占用 LCD；HUD 由 stream 自己渲染；共享帧，不额外读 UVC |
 
 切换方式（服务化运行）：
 
@@ -407,6 +421,123 @@ sudo systemctl start glxss-stream.service
 
 > 如果直播进程被 `kill -9`，`uvcvideo` 可能不会自动 attach；拔插眼镜或
 > `sudo modprobe -r uvcvideo && sudo modprobe uvcvideo` 可恢复。
+
+---
+
+## 6.5 导航 HUD：手机 Wi-Fi UDP → 箭头/距离/动作
+
+眼镜屏的 HUD 模式现在是**导航 HUD**（`glxss/hud.py`）：
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│ 01:18 LOCAL  HEADING 040°  ● PHONE LINK        2.0 fps    │
+├──────────┬───────────────────────────────┬─────────────────┤
+│ LIGHT    │             N                 │ ATTITUDE        │
+│  321 lux │          ╱  ▲  ╲             │  PITCH  -2.2    │
+│ TEMP     │        W │  ARROW  │ E        │  ROLL   +0.7    │
+│  36.5°C  │          ╲       ╱             │  GYRO  +2 -1 0  │
+│ SENSOR OK│             120 m              │                 │
+├──────────┴───────────────────────────────┴─────────────────┤
+│                     右转（NEXT ACTION）                    │
+└────────────────────────────────────────────────────────────┘
+```
+
+* 大箭头旋转角 = `bearing - heading`；手机没给 `heading` 时直接用
+  `bearing`（`ctl nav` 手动测试就是这个语义）；
+* 箭头下方为距离（`120 m` / `1.2 km`），底部为动作文字（中文 UTF-8）；
+* 顶部 heading 优先用手机的 `heading`，否则用眼镜 HID 罗盘；
+* 无数据/超时：中心「等待手机…」，顶部 `WAITING PHONE`。
+
+### 6.5.1 数据链路
+
+```text
+Android App（导航 HUD 开关）
+  └─ 每秒 1 包 UDP JSON → 192.168.2.128:9999
+        └─ stream: nav.NavListener → nav.LatestNav（线程安全单槽）
+              └─ HudSource._poll_nav()（变化才重绘）→ 640×400 HUD
+```
+
+`nav.LatestNav` 与 `pipeline.LatestFrame` 同思路：只保留最新一帧，旧包直接
+覆盖，不排队、不阻塞 UVC 读线程。UDP 帧带 `expires_at = now + --nav-stale`；
+`ctl nav` 注入的帧 `ttl=0` 持久，直到 `ctl nav-clear` 或手机新包覆盖。
+
+### 6.5.2 JSON 协议
+
+```json
+{"bearing": 45, "distance": 120, "label": "右转", "heading": 40}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `bearing` | number | 目标绝对方位（deg，0=北，顺时针） |
+| `distance` | number | 距离（米） |
+| `label` | string | 下一动作文字，UTF-8，最长 48 字 |
+| `heading` | number? | 手机当前朝向（deg）；省略/`null` 时箭头直接用 bearing |
+
+* 端口默认 **UDP 9999**，绑定 `0.0.0.0`（不需要 root，>1024）；
+* 手机 1 Hz 发包；Pi 端 5 s 没新包就显示等待；
+* 坏包（非 JSON/字段非数字）只丢该包并记 `dropped`，不会清掉上一帧。
+
+### 6.5.3 启动 / 测试
+
+systemd 的 `glxss-stream.service` 默认就会监听 9999；需要改端口/关闭时：
+
+```bash
+# /etc/systemd/system/glxss-stream.service 的 ExecStart 追加：
+--nav-port 9999 --nav-bind 0.0.0.0 --nav-stale 5
+# 或完全关闭 UDP（仍可用 ctl nav）
+--no-nav-udp
+sudo systemctl daemon-reload && sudo systemctl restart glxss-stream
+```
+
+无手机时命令行验证（Pi 本地）：
+
+```bash
+# 1) 注入一帧：bearing=45，距离 120 m，动作“右转”，手机 heading=40
+glxss ctl nav 45 --distance 120 --label 右转 --heading 40
+glxss ctl status                 # 应出现“导航 / 导航UDP”两行
+glxss ctl nav-clear
+
+# 2) 模拟手机 UDP（PC 上执行，IP 换成 Pi）
+python3 -c 'import json,socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(json.dumps({"bearing":90,"distance":1200,"label":"右转","heading":80},ensure_ascii=False).encode(),("192.168.2.128",9999))'
+
+# 3) 看端口/收包
+ss -lunp | grep 9999
+journalctl -u glxss-stream -f | grep -E '\[nav\]|导航'
+```
+
+`ctl status` 里的字段：
+
+```text
+导航    : bearing=45° distance=120 m heading=40° label='右转' age=0.12s fresh=True
+导航UDP : alive 0.0.0.0:9999，收 12 包，坏包 0
+```
+
+### 6.5.4 防火墙 / 字体 / 权限
+
+* **防火墙**：Debian 默认无 ufw；如果装了，放行 UDP：
+  `sudo ufw allow 9999/udp` 或 nftables 加 `udp dport 9999 accept`。
+  用 `ss -lunp | grep 9999` 确认进程确实绑定（`nav` 会打印
+  `[nav] UDP 导航监听 0.0.0.0:9999`）。
+* **权限**：9999 > 1024，taco 用户即可绑定；不需要 root/cap_net_bind_service。
+* **中文字体**：HUD 动作文字需要 CJK 字体，否则自动降级英文。
+  ```bash
+  sudo apt install fonts-wqy-zenhei     # 约 15 MB，够用
+  fc-list :lang=zh | head
+  ```
+  装完重启 `glxss-stream` 即可（Pillow 每次启动找字体，不需要重启系统）。
+
+### 6.5.5 Android 端入口
+
+App 首页「导航 HUD（Wi-Fi UDP → Pi）」：
+
+* 开关：开=启动 GPS heading 监听 + 每秒 UDP；关=停止（Pi 5 s 后回等待）；
+* Pi IP / 端口输入，默认 `192.168.2.128:9999`；
+* bearing 滑块（0..359°）+ 左转/直行/右转/到达快捷键；
+* 距离滑块（0..2000 m）；
+* 手动 heading 开关（无 GPS 或需要固定角度测试时用）；
+* heading 默认来自 `LocationManager` 的 `Location.getBearing()`，
+  未定位/静止没有 bearing 时 JSON 省略 `heading`。
 
 ---
 
@@ -657,34 +788,53 @@ ffmpeg stdin**：YV12 = Y|V|U、yuv420p = Y|U|V，rawvideo 解复用按字节流
 
 | 操作 | 行为 | 日志 |
 |---|---|---|
-| 单击 Fn（短按松开） | 显示模式 HUD ↔ camera preview；停止预览时释放 LCD 接口 | `Fn 按键：单击（0.12 s，2 包） → 切换显示模式（当前 hud）` |
-| 长按 Fn（≥0.9 s 且 ≥4 个按下包） | 停止/恢复 RTSP 推流（停 ffmpeg；恢复后下一轮启动） | `Fn 按键：长按（1.20 s，7 包） → 切换 RTSP 推流（当前 ON）` |
-| 状态 | 状态行追加 `显示=... 异步=... 推流=... 按键=...`；`glxss ctl status` 有 `显示/RTSP/UVC 读` | — |
-| 无硬件调试 | `glxss ctl button click` / `button long` 注入同一事件队列 | 同上 |
+| 长按 Fn（≥0.9 s，**只看时间**） | camera preview ↔ HUD；**只切 `LcdSink` 模式，不 release LCD**；HUD 由 stream 进程内渲染（时间/罗盘/姿态/lux，`--hud-fps` 默认 2）；松开时若实际按住够 0.9 s 也补发长按 | `[hid] key 0x71 down 00:04:26` / `up（按住 1.34 s）` + `Fn 按键：长按（0.92 s，10 包） → display toggle（当前 hud）` |
+| 短按 Fn（**preview 下**） | 循环数字变焦 `1.0x → 1.5x → 2.0x → 1.0x`：720p 源画面**居中裁切**（1.5x 853×480、2.0x 640×360）再映射到 640×400；三分线/水平仪在裁切后绘制、保持正立；**不重启 LCD/ffmpeg**，双路不冻结 | `[hid] key 0x71 down/up（按住 0.21 s）` + `Fn 按键：单击（0.21 s，2 包） → zoom 1.5x（源中心 853×480；居中裁切后缩放）` |
+| 短按 Fn（**HUD 下**） | **忽略**（只打日志）；要回视频请长按 | `Fn 按键：单击（0.11 s，1 包） → 忽略（当前 HUD 视图，短按不变焦；长按 Fn 切回视频）` |
+| `glxss ctl zoom 1.0\|1.5\|2.0\|cycle` | 与短按同一路径，供无按键/脚本控制；`ctl status` 回显 `zoom/zoom_crop` | `[stream] ctl zoom → 1.5x（源中心 853x480）` |
+| 状态 | 状态行追加 `显示=preview 变焦=1.5x ...`；`glxss ctl status` 有 `view/lcd_mode/zoom/zoom_crop/last_button/level/hid/RTSP` | — |
+| 无硬件调试 | `glxss ctl button click` / `button long` 注入同一事件队列 | `Fn 按键：单击（0.00 s，0 包）…` |
 
-实测（2026-11-22 晚，注入事件验证端到端）：
+**数字变焦实现与成本**：`pipeline.zoom_box()` 只算源裁切窗口，`LcdRenderer.zoom`
+在 `_ycbcr()` 里先裁后采样；抽样步长按裁切窗口重算（720p 1.0x → 4×4 得
+320×180；1.5x → 2×2 得 426×240 再缩到 320×180；2.0x → 2×2 得 320×180）。
+Pi Zero 2 W 上同机 60 帧中位（`process_time`，当时后台还有双路直播）：
+
+| 档位 | 源裁切 | 抽样 | 单帧渲染 CPU | 相对 1.0x |
+|---|---|---|---|---|
+| 1.0x | 1280×720 | 4×4 → 320×180 | 17.7 ms | — |
+| 1.5x | 853×480（对齐后 852×480） | 2×2 → 426×240 | 21.4 ms | **+3.7 ms** |
+| 2.0x | 640×360 | 2×2 → 320×180 | 17.0 ms | −0.7 ms |
+
+变焦只作用在**眼镜预览**，RTSP 始终推全画幅 1280×720；档位不落盘，重启回到
+`--zoom`（默认 1.0，避免上次放大后忘掉、误判为镜头/对焦故障）。
+
+实测（2026-11-23 00:12 UTC，Pi 真机：真实 Fn 按压 + `ctl button` 注入混合）：
 
 ```text
-=== click -> preview ===
-OK：button
-  显示模式: 2
-  显示    : camera preview（最近按键 click）
-  RTSP    : ON
-  UVC 读   : 异步 16 URB，在途 0，队列 0，暂停 58 次/352 ms
-  UVC     : 17.2 fps
-=== click -> hud ===
-OK：button
-  显示    : HUD/不占屏（最近按键 click）
-  UVC     : 29.9 fps
-=== long -> rtsp off / on ===
-OK：button
-  RTSP    : OFF / ON
+=== 真实短按（preview 下）：循环 1.5x / 2.0x / 1.0x ===
+[hid] key 0x71 down  00:12:16
+[hid] key 0x71 up    00:12:16（按住 0.10 s）
+[stream] Fn 按键：单击（0.10 s，1 包） → zoom 1.5x（源中心 853x480；居中裁切后缩放）
+[stream] Fn 按键：单击（0.21 s，2 包） → zoom 2.0x（源中心 640x360；居中裁切后缩放）
+[stream] Fn 按键：单击（0.21 s，2 包） → zoom 1.0x（源中心 1280x720；居中裁切后缩放）
+
+=== 注入 long → HUD；HUD 下真实短按被忽略；再注入 long 回 preview ===
+[stream] Fn 按键：长按（0.00 s，0 包） → display toggle（当前 preview）
+[stream] 显示模式 -> HUD（时间/罗盘/水平仪；LCD 保持占用；长按 Fn 回视频，HUD 下短按 Fn 忽略）
+[stream] Fn 按键：单击（0.22 s，2 包） → 忽略（当前 HUD 视图，短按不变焦；长按 Fn 切回视频）
+[stream] Fn 按键：长按（0.00 s，0 包） → display toggle（当前 hud）
+[stream] 显示模式 -> camera preview（眼镜预览 10.0 fps）
 ```
 
-> **真实按键**：设备 HID 报告里 `keyStatus/keyCode` 是唯一来源；本轮在没有人工
-> 按压的情况下，用 `ctl button` 注入和 `FnWatcher` 单测覆盖了同一代码路径。
-> 人工按下时日志会按上表格式出现；若需要硬件验收，请在运行 `pi/stream.py`
-> 时单击一次、长按 ≥1 s，各看一条 `Fn 按键：…`。
+> 注入事件的 `duration=0.00 s / 0 包` 是 `ctl button` 的正常输出（没有真实按住）；
+> 真实长按的日志形如 `Fn 按键：长按（1.34 s，13 包）`，00:04 已由用户实测。
+> 变焦发生在**双路（RTSP + 预览）运行中**：眼镜始终 9.8–10.0 fps、采集
+> 17.7–19.0 fps、`重启=0/0`，切换档位不重启动 LCD/ffmpeg，未出现冻结/掉帧。
+>
+> **短按“冻结”根因**（2026-11-22 实机反馈）：旧实现在切 HUD 时
+> `LcdSink.release()` 释放 LCD 接口，等一个并不存在的 `glxss hud` 进程接管；
+> 现在 HUD 由 stream 自己渲染，问题消失。
 
 #### 8.6.3 撕裂
 
@@ -716,8 +866,10 @@ python3 pi/stream.py --check --fps 30 --async-urb 16
 python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16
 python3 pi/stream.py --fps 30 --bitrate 2M --async-urb 16 --mirror-fps 10 --mirror-rotate 180
 python3 -m glxss ctl status
-python3 -m glxss ctl button click     # 无硬件时验证显示切换
-python3 -m glxss ctl button long      # 无硬件时验证 RTSP 开关
+python3 -m glxss ctl zoom cycle        # 无硬件时验证变焦
+python3 -m glxss ctl button click     # 无硬件时验证变焦（preview）/忽略（HUD）
+python3 -m glxss ctl button long      # 无硬件时验证 preview ↔ HUD
+python3 -m glxss ctl rtsp off         # RTSP 开关已不绑 Fn
 ```
 
 ---
@@ -782,8 +934,16 @@ python3 -m glxss ctl button long      # 无硬件时验证 RTSP 开关
   仍失败就 `--async-urb 0` 回退同步（18–19 fps）。
 * **`No module named usb1`**：`sudo apt install -y python3-usb1`；或
   `python3 -m pip install libusb1`。
-* **Fn 没反应**：确认日志有 `HID 轮询已启动`；`glxss ctl status` 的
-  `UVC 读/显示` 正常。若 HID 被别的进程 claim，先停掉 `glxss hud` 等。
+* **Fn 没反应**：先看 journal 有没有 `[hid] key 0x71 down/up`。有 down/up 但没
+  `Fn 按键：…` → 看阈值（长按必须 ≥0.9 s；现在只看时间）；完全没有 `[hid]` →
+  `glxss ctl status` 的 `HID` 行是否 `alive`，并确认没有别的进程 claim HID
+  （先停掉 `glxss hud`）。
+* **短按没变焦/画面没放大**：`ctl status` 看 `变焦`（`zoom`）和 `zoom_crop`；
+  HUD 下短按按设计忽略（只打 `→ 忽略（当前 HUD 视图…）`），先长按回 preview；
+  RTSP 观众看到的是全画幅，变焦只影响眼镜这一路。
+* **短按后画面冻结**：确认运行的是 2026-11-23 后的版本；日志应为
+  `显示模式 -> HUD（时间/罗盘/水平仪；LCD 保持占用）`，且状态行
+  `眼镜≈2.0fps ... 显示=hud`。旧版会 release LCD 并等一个不存在的 HUD 进程。
 * **眼镜仍有撕裂**：主机侧已整帧、串行、暂停 UVC；剩余是设备无 vsync 的
   固有限制。把 `--mirror-fps` 降到 5 可换更高采集帧率，但单帧窗口不变（§8.6.3）。
 * **双路只有 17–18 fps**：这是 GIL 限制，不是 USB；单路 30 fps 已达成。
@@ -795,10 +955,10 @@ python3 -m glxss ctl button long      # 无硬件时验证 RTSP 开关
 
 | 文件 | 作用 |
 |---|---|
-| `glxss/pipeline.py` | **共享帧分发**：`LatestFrame` 最新帧槽、`write_yv12_as_i420`（零拷贝）、`LcdRenderer`、`LcdSink`、`LevelPoller`（水平仪 + Fn 按键） |
+| `glxss/pipeline.py` | **共享帧分发**：`LatestFrame` 最新帧槽、`write_yv12_as_i420`（零拷贝）、`LcdRenderer`（含 1.0/1.5/2.0x 数字变焦）、`LcdSink`、`LevelPoller`（水平仪 + Fn 按键） |
 | `glxss/uvc_async.py` | **720p30 异步多 URB**：独立 libusb handle claim VS、16 URB、零拷贝交接、pause/resume |
 | `glxss/uvc.py` | probe/commit、16 KiB 组帧；异步模式下 VS 控制请求委托给 reader |
-| `glxss/stream.py` | 核心：UVC 读帧/发布、`EncoderSink`（ffmpeg + 令牌桶）、Fn 事件、显示/RTSP 开关、控制 socket、重连、MJPEG、统计 |
+| `glxss/stream.py` | 核心：UVC 读帧/发布、`EncoderSink`（ffmpeg + 令牌桶）、Fn 事件（长按切显示/短按变焦）、显示/变焦/RTSP 控制、控制 socket、重连、MJPEG、统计 |
 | `pi/stream.py` | 一键启动 CLI（参数映射、`--check`、打印 OBS 地址） |
 | `tools/uvc_async_exp.py` | 同步/多线程/异步吞吐实验台（不依赖 glxss 包） |
 | `pi/service/glxss-stream.service` | systemd：开机推流、失败重启 |
@@ -814,7 +974,8 @@ python3 -m glxss ctl button long      # 无硬件时验证 RTSP 开关
   不累积延迟；
 * YV12→yuv420p 是**换写入顺序**而不是换 buffer（零像素拷贝、零色彩转换）；
 * LCD 线程按 `--mirror-fps` 用「睡到截止时间」限速，到点取当时最新帧；
-* LCD 渲染按整数步长抽样（720p 4×4、480p 2×2），芯片只解码 288×180 级别的小图；
+* LCD 渲染按整数步长抽样（720p 1.0x 4×4、1.5x/2.0x 2×2、480p 2×2），芯片只解码
+  288×180/426×240 级别的小图；数字变焦只是改**源裁切窗口**，不额外解码整帧；
 * LCD 发送前暂停 UVC 异步读（在途 URB 排空），发送后恢复：1 MB 帧不被 bulk IN
   抢总线，单帧 29–39 ms，控制请求仍走 `UsbGate` 不插帧；
 * UVC 读失败 → 关设备（attach uvcvideo）+ 指数退避重开；ffmpeg 退出 → 独立退避

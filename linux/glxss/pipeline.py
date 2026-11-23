@@ -220,6 +220,30 @@ def cover_box(width: int, height: int) -> Tuple[int, int]:
     return max(2, crop_w), max(2, crop_h)
 
 
+# 数字变焦档位（模拟原厂 1.0x / 1.5x / 2.0x）。用元组而不是闭区间校验，
+# 避免 1.4999 之类的浮点数被悄悄接受。
+ZOOM_LEVELS = (1.0, 1.5, 2.0)
+
+
+def zoom_box(width: int, height: int, zoom: float = 1.0) -> Tuple[int, int]:
+    """数字变焦在**源画面**上的居中裁切尺寸（step 对齐之前）。
+
+    1280×720 基准：1.0x → 1280×720（整幅）；1.5x → 853×480；
+    2.0x → 640×360。注意这是 ``round(w / zoom)`` 而不是等比缩放的
+    640×400 画布尺寸：zoom 只改视野，构图交给 ``cover_box`` /
+    ``_to_lcd_canvas`` 的 fit/cover 逻辑（叠加层永远画在裁切后的画布上）。
+    """
+    try:
+        value = float(zoom)
+    except (TypeError, ValueError) as exc:
+        raise GlxssError("zoom 必须是 1.0 / 1.5 / 2.0，收到 %r" % (zoom,)) from exc
+    if value not in ZOOM_LEVELS:
+        raise GlxssError("zoom 必须是 1.0 / 1.5 / 2.0，收到 %r" % (zoom,))
+    if value == 1.0:
+        return width, height
+    return max(2, int(round(width / value))), max(2, int(round(height / value)))
+
+
 def pitch_roll_from_acc(x: int, y: int, z: int) -> Tuple[float, float]:
     """按 docs/ch-hid.md §5.3 算俯仰/横滚（度，抬头为正）；与 hud.py 同式。"""
     if x == 0 and y == 0 and z == 0:
@@ -295,12 +319,25 @@ class LcdRenderer:
          就要 11 ms（Pi Zero 2 W 实测）。
 
     ``fit`` 语义与 ``--mirror-fit`` 一致：cover/stretch/fit/crop（crop=cover）。
-    ``rotate=180`` 时先翻转源画面再画叠加层（叠加层保持正立）。
+    ``zoom``（1.0/1.5/2.0）先对 720p **源画面做居中裁切**（`zoom_box`：853×480 /
+    640×360），再走 fit/cover 映射；因此视野变小、画面放大，而三分线/水平仪
+    仍画在裁切后的 320×200 画布上，始终正立。抽样步长按裁切后的尺寸重算，
+    zoom 1.5x 时 4×4 会变成 2×2，像素数不会因为裁切而变多。
+    ``rotate=180`` 时先翻转源画面再画叠加层。注意面板本身也是 180° 安装的：
+    叠加层画在“翻转后的帧缓冲”里，用户看到的是再旋转 180° 的结果，所以
+    水平仪的 pitch（上下）和 roll（左右）在 180 下默认都要取反，才能符合
+    “低头 → 地平线向上”“头左倾 → 地平线向右倾”的航空地平仪惯例。
+    ``invert_x`` / ``invert_y`` 可显式覆盖默认值（见 `--level-invert-x/y`）。
     """
 
     def __init__(self, fit: str = "fit", level: Optional[Callable[[], object]] = None,
-                 rotate: int = 0):
+                 rotate: int = 0, invert_x: Optional[bool] = None,
+                 invert_y: Optional[bool] = None, zoom: float = 1.0):
         self.rotate = 180 if int(rotate or 0) % 360 == 180 else 0
+        # --level-invert-x 控制 roll（左右倾），--level-invert-y 控制 pitch（上下）。
+        # 默认：180 旋转下面板/叠加层的坐标都翻了 180°，两者取反；0 保持原式。
+        self.invert_x = (self.rotate == 180) if invert_x is None else bool(invert_x)
+        self.invert_y = (self.rotate == 180) if invert_y is None else bool(invert_y)
         if np is None:
             raise GlxssError("LCD 渲染需要 numpy：sudo apt install -y python3-numpy")
         if Image is None:
@@ -312,6 +349,10 @@ class LcdRenderer:
             raise GlxssError("映射模式必须是 cover / stretch / fit，收到 %r" % (fit,))
         self.fit = fit
         self.level = level
+        # 读屏/渲染线程每帧读一次，控制线程只做一次 float 赋值（CPython 原子），
+        # 所以切换 zoom 不需要加锁，也不会拆出 Y/U 尺寸不一致的半帧。
+        self.zoom = 1.0
+        self.set_zoom(zoom)
         self.packet = array.array("B", bytes(lcd.FRAME_TOTAL))
         self._packet_view = memoryview(self.packet)
         # 16 B 帧头固定（format=1、totalLen、8 B 保留），只写一次。
@@ -324,21 +365,38 @@ class LcdRenderer:
                 np.uint32).reshape(LCD_H, LCD_W)
 
     # -- 采样 --------------------------------------------------------------
+    def set_zoom(self, zoom: float) -> float:
+        """设置数字变焦（1.0/1.5/2.0）；下一帧生效，返回旧档位。"""
+        try:
+            value = float(zoom)
+        except (TypeError, ValueError) as exc:
+            raise GlxssError("zoom 必须是 1.0 / 1.5 / 2.0，收到 %r" % (zoom,)) from exc
+        if value not in ZOOM_LEVELS:
+            raise GlxssError("zoom 必须是 1.0 / 1.5 / 2.0，收到 %r" % (zoom,))
+        previous = self.zoom
+        self.zoom = value
+        return previous
+
     def _ycbcr(self, frame):
         """YV12 → 小尺寸 YCbCr 图（U/V 与抽样后的 Y 1:1 配对）。
 
-        1280×720 + cover：裁 1152×720 → step=4 → 288×180；
-        1280×720 + fit  ：整幅 → step=4 → 320×180（再居中加 10 px 黑边）；
-        640×480  + cover：裁 640×400 → step=2 → 320×200（旧行为）。
+        zoom 先把源画面居中裁小，再按 fit/cover 映射、按裁切尺寸重算步长：
+        1280×720 + fit   + 1.0x → 整幅 → step=4 → 320×180；
+        1280×720 + cover + 1.0x → 裁 1152×720 → step=4 → 288×180；
+        1280×720 + cover + 1.5x → 源裁 853×480 → cover 768×480 → step=2 →
+        384×240（恰好放大到 320×200，无黑边）；
+        1280×720 + fit   + 2.0x → 源裁 640×360 → step=2 → 320×180 → 2× 放大。
+        640×480 + cover + 1.0x → 裁 640×400 → step=2 → 320×200（旧行为）。
         """
         width, height = frame.width, frame.height
         if width <= 0 or height <= 0 or width % 2 or height % 2:
             raise GlxssError("YUV420 宽高必须是正偶数（当前 %dx%d）" % (width, height))
         y_plane, u_plane, v_plane = yv12_planes(frame.data, width, height)
+        # 一帧只读一次 zoom：控件线程中途改档也不会让 Y/U 用不同窗口。
+        zoom = self.zoom
+        crop_w, crop_h = zoom_box(width, height, zoom)
         if self.fit == "cover":
-            crop_w, crop_h = cover_box(width, height)
-        else:
-            crop_w, crop_h = width, height
+            crop_w, crop_h = cover_box(crop_w, crop_h)
         # 整数步长：抽样后的尺寸尽量接近半分辨率画布 320×200。
         # 4:2:0 要求步长为偶数，色度平面才能按 step/2 整除。
         step = max(2, int(round(min(crop_w / LCD_HALF_W, crop_h / LCD_HALF_H))))
@@ -396,9 +454,11 @@ class LcdRenderer:
         if pitch is not None:
             # 半分辨率下 pitch 每度 1 px（放大后 = full 的 2 px/度，和
             # monitor.py 一致），±75 px。
-            center = int(LCD_HALF_H / 2 + max(-75.0, min(75.0, float(pitch))))
+            pitch = float(pitch) * (-1.0 if self.invert_y else 1.0)
+            roll = float(roll) * (-1.0 if self.invert_x else 1.0)
+            center = int(LCD_HALF_H / 2 + max(-75.0, min(75.0, pitch)))
             center = max(10, min(LCD_HALF_H - 10, center))
-            slope = math.tan(math.radians(-float(roll)))
+            slope = math.tan(math.radians(-roll))
             y_left = center + slope * (0 - LCD_HALF_W // 2)
             y_right = center + slope * (LCD_HALF_W - 1 - LCD_HALF_W // 2)
             draw.line([(0, y_left), (LCD_HALF_W - 1, y_right)], fill=LEVEL_COLOR)
@@ -432,6 +492,29 @@ class LcdRenderer:
         dst[1::2, 1::2] = src
         return self.packet
 
+    def render_hud(self, rgba):
+        """把一张 640×400 RGBA HUD 写进**同一个**复用 packet（HUD 模式）。
+
+        相机预览和 HUD 共用 `LcdSink` 的同一个 1 MB packet，切换模式只是换
+        填充方式，不重新分配、不释放 LCD 接口。`rotate=180` 时整张 HUD 也
+        翻转 180°（面板 180° 安装），保证时间/罗盘文字正立。
+        """
+        image = np.asarray(rgba)
+        if image.shape != (LCD_H, LCD_W, 4):
+            raise GlxssError("HUD RGBA 尺寸必须是 %dx%d×4，实际 %r"
+                             % (LCD_W, LCD_H, image.shape))
+        if image.dtype != np.uint8:
+            image = image.astype(np.uint8, copy=False)
+        if self.rotate == 180:
+            image = image[::-1, ::-1]
+        dst = np.frombuffer(self.packet, dtype=np.uint8,
+                            offset=lcd.FRAME_HEADER,
+                            count=lcd.FRAME_PAYLOAD).reshape(LCD_H, LCD_W, 4)
+        # RGB 已经合成好；设备侧不做 alpha 混合，统一写 0xFF（和相机预览一致）。
+        dst[:, :, :3] = image[:, :, :3]
+        dst[:, :, 3] = 255
+        return self.packet
+
 
 # ---------------------------------------------------------------------------
 # 水平仪数据源
@@ -452,7 +535,7 @@ class LevelPoller:
 
     def __init__(self, dev, *, interval: float = 0.1, timeout: int = 1500,
                  gate=None, verbose: bool = False, watcher=None,
-                 enable_accel: bool = True):
+                 enable_accel: bool = True, on_report=None, log_keys: bool = True):
         self.dev = dev
         self.interval = max(0.05, float(interval))
         self.timeout = max(100, int(timeout))
@@ -460,10 +543,17 @@ class LevelPoller:
         self.verbose = verbose
         self.watcher = watcher if watcher is not None else hid.FnWatcher()
         self.enable_accel = enable_accel
+        # 每读到一个 28 B 报告就回调一次（HUD 用它更新时间/罗盘/姿态）。
+        self.on_report = on_report
+        # 按键边沿必打一行：`[hid] key 0x71 down/up`，方便真实按键排查。
+        self.log_keys = bool(log_keys)
         self.error = ""
         self._angles: Optional[Tuple[float, float]] = None
         self._events: list = []
         self._event_lock = threading.Lock()
+        self._last_report = None
+        self._last_key = None
+        self._key_down_at = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -488,6 +578,38 @@ class LevelPoller:
     def alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def last_report(self):
+        """最新一份 HID 报告（可能是 None）；主循环/控制 socket 只读。"""
+        return self._last_report
+
+    @property
+    def key_down(self) -> bool:
+        report = self._last_report
+        return bool(report is not None and report.pressed)
+
+    def level_snapshot(self) -> Optional[Tuple[float, float]]:
+        """最近一次 ``(pitch, roll)``；加速度全 0 时为 None。"""
+        return self._angles
+
+    def _log_key_change(self, report) -> None:
+        """keyStatus/keyCode 每次变化打印一行；同一次按住不重复刷屏。"""
+        current = (int(report.key_code), int(report.key_status))
+        if current == self._last_key:
+            return
+        previous, self._last_key = self._last_key, current
+        if previous is None:
+            return                      # 启动后的第一包只是基准，不算“变化”
+        now = time.monotonic()
+        stamp = time.strftime("%H:%M:%S")
+        if current[1] == 1:
+            self._key_down_at = now
+            print("[hid] key 0x%02x down  %s" % (current[0], stamp), flush=True)
+        else:
+            held = (now - self._key_down_at) if self._key_down_at else 0.0
+            print("[hid] key 0x%02x up    %s（按住 %.2f s）"
+                  % (current[0], stamp, held), flush=True)
+
     def _loop(self) -> None:
         failures = 0
         while not self._stop.is_set():
@@ -495,6 +617,15 @@ class LevelPoller:
                 ctx = self.gate if self.gate is not None else nullcontext()
                 with ctx:
                     report = hid.read_report(self.dev, self.timeout)
+                self._last_report = report
+                if self.log_keys:
+                    self._log_key_change(report)
+                if self.on_report is not None:
+                    try:
+                        self.on_report(report)
+                    except Exception as exc:
+                        if self.verbose:
+                            print("[stream] HID 报告回调失败：%r" % (exc,))
                 acc = (report.acc_x, report.acc_y, report.acc_z)
                 if any(acc):
                     self._angles = pitch_roll_from_acc(*acc)
@@ -569,22 +700,38 @@ class LcdStats:
 
 
 class LcdSink:
-    """LCD 线程：从最新帧槽取帧 → 渲染 → bulk OUT（按 fps 限速，丢旧帧）。"""
+    """LCD 线程：相机预览 / HUD 两种模式共用同一条 LCD 链路。
+
+    * ``preview``：从最新帧槽取相机帧 → 渲染 → bulk OUT（按 ``fps`` 限速）；
+    * ``hud``：直接用 ``hud_source.grab_rgba()`` 的 640×400 RGBA 填包 → 发送
+      （按 ``hud_fps``，默认 2 fps）。
+
+    短按 Fn 只在两种模式间切换，**不 release/claim LCD 接口**：旧实现切到
+    “HUD”时只是停掉预览并释放接口，而 Pi 上并没有另一个 HUD 进程去接管，
+    面板上就一直停着最后一帧（用户看到的“冻结”）。
+    """
 
     def __init__(self, dev, ep_addr: int, config, hub: LatestFrame, *,
                  link=None, level=None, level_poller=None, gate=None,
                  session=None, intf=None, pause_reader=None,
-                 resume_reader=None, owns_level_poller=None):
+                 resume_reader=None, owns_level_poller=None,
+                 hud_source=None, hud_fps: float = 2.0):
         self.dev = dev
         self.hub = hub
         self.gate = gate
         self.fps = max(0.2, float(config.mirror_fps))
+        self.hud_fps = max(0.2, float(hud_fps))
         self.timeout = max(1000, int(getattr(config, "timeout_ms", 5000)))
         self.link = link if link is not None else lcd.LcdLink(
             dev, ep_addr, timeout=self.timeout)
-        self.renderer = LcdRenderer(fit=getattr(config, "mirror_fit", "fit"),
-                                    level=level,
-                                    rotate=getattr(config, "mirror_rotate", 0))
+        self.renderer = LcdRenderer(
+            fit=getattr(config, "mirror_fit", "fit"),
+            level=level,
+            rotate=getattr(config, "mirror_rotate", 0),
+            invert_x=getattr(config, "level_invert_x", None),
+            invert_y=getattr(config, "level_invert_y", None),
+            zoom=getattr(config, "zoom", 1.0))
+        self.hud_source = hud_source
         self._level_poller = level_poller
         self.session = session
         self.intf = intf
@@ -595,6 +742,8 @@ class LcdSink:
                                    else bool(owns_level_poller))
         self.stats = LcdStats()
         self._lock = threading.Lock()
+        self._mode_lock = threading.Lock()
+        self._mode = "preview"
         # 1 MB bulk OUT 必须串行：同一时刻只允许一个线程在写帧，否则设备端
         # 会看到两帧交错（撕裂/花屏）。LcdSink 自己只有一个发送线程，这把锁
         # 是给“外部也调 send”时的保险。
@@ -603,6 +752,30 @@ class LcdSink:
         self._thread: Optional[threading.Thread] = None
         self._count_at = time.monotonic()
         self._count_frames = 0
+
+    # -- 显示模式 ----------------------------------------------------------
+    @property
+    def mode(self) -> str:
+        with self._mode_lock:
+            return self._mode
+
+    @property
+    def zoom(self) -> float:
+        return self.renderer.zoom
+
+    def set_zoom(self, zoom: float) -> float:
+        """换数字变焦档位；只改渲染参数，不动 LCD 接口/线程。"""
+        return self.renderer.set_zoom(zoom)
+
+    def set_mode(self, mode: str) -> None:
+        """切换 ``preview`` / ``hud``；下一帧生效，不重启线程、不释放接口。"""
+        mode = str(mode or "").strip().lower()
+        if mode not in ("preview", "hud"):
+            raise GlxssError("显示模式只能是 preview/hud，收到 %r" % (mode,))
+        if mode == "hud" and self.hud_source is None:
+            raise GlxssError("没有 HUD 渲染源，无法切到 HUD 模式")
+        with self._mode_lock:
+            self._mode = mode
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self) -> None:
@@ -641,11 +814,33 @@ class LcdSink:
         return self._thread is not None and self._thread.is_alive()
 
     # -- 主循环 ------------------------------------------------------------
+    def _render_hud(self):
+        """HUD 模式取一张 RGBA 写进复用 packet；失败返回 None（不弄死线程）。"""
+        source = self.hud_source
+        if source is None:
+            return None
+        try:
+            return self.renderer.render_hud(source.grab_rgba())
+        except Exception as exc:
+            with self._lock:
+                self.stats.errors += 1
+                self.stats.last_error = "HUD 渲染失败: %s" % (
+                    str(exc).splitlines()[0] if str(exc) else exc)
+            return None
+
     def _loop(self) -> None:
         next_at = 0.0
-        period = 1.0 / self.fps
         last_seq = -1
+        last_mode = None
         while not self._stop.is_set():
+            mode = self.mode
+            if mode != last_mode:
+                # 模式切换立即出下一帧；last_seq 重置，避免把 HUD 期间的
+                # 相机帧算成“丢弃”。
+                last_mode = mode
+                last_seq = -1
+                next_at = 0.0
+            period = 1.0 / (self.hud_fps if mode == "hud" else self.fps)
             now = time.monotonic()
             if now < next_at:
                 # 精确睡到下一帧时刻，再取**当时最新**的一帧。不能用
@@ -653,34 +848,42 @@ class LcdSink:
                 # 十几毫秒到，周期会被拖长（实测把 10 fps 拖成 8.7 fps）。
                 self._stop.wait(min(next_at - now, 0.2))
                 continue
-            frame, seq = self.hub.latest_with_seq()
-            if frame is None:
-                if self._stop.is_set() or self.hub.closed:
-                    return
-                self._stop.wait(0.02)
-                continue
-            next_at = max(next_at, now) + period
-            with self._lock:
-                if seq == last_seq:
-                    self.stats.stale += 1     # 相机比眼镜慢，重发上一帧
-                else:
-                    self.stats.dropped += max(0, seq - last_seq - 1)
-            last_seq = seq
             started = time.monotonic()
-            try:
-                packet = self.renderer.render(frame)
-            except Exception as exc:  # 坏帧只丢这一帧
+            if mode == "hud":
+                packet = self._render_hud()
+                if packet is None:
+                    self._stop.wait(0.1)
+                    continue
+                next_at = max(next_at, now) + period
+            else:
+                frame, seq = self.hub.latest_with_seq()
+                if frame is None:
+                    if self._stop.is_set() or self.hub.closed:
+                        return
+                    self._stop.wait(0.02)
+                    continue
+                next_at = max(next_at, now) + period
                 with self._lock:
-                    self.stats.errors += 1
-                    self.stats.last_error = "渲染失败: %s" % (
-                        str(exc).splitlines()[0] if str(exc) else exc)
-                continue
+                    if seq == last_seq:
+                        self.stats.stale += 1     # 相机比眼镜慢，重发上一帧
+                    else:
+                        self.stats.dropped += max(0, seq - last_seq - 1)
+                last_seq = seq
+                try:
+                    packet = self.renderer.render(frame)
+                except Exception as exc:  # 坏帧只丢这一帧
+                    with self._lock:
+                        self.stats.errors += 1
+                        self.stats.last_error = "渲染失败: %s" % (
+                            str(exc).splitlines()[0] if str(exc) else exc)
+                    continue
             rendered = time.monotonic()
             paused = False
             try:
                 # 整帧 1 MB 发送前先让 UVC 异步读暂停（在途 URB 排空），发完再恢复：
                 # 否则 1 MB OUT 和 30 fps 的 bulk IN 抢总线，单帧要 45–150 ms，
                 # 面板刷新期间跨更多帧 → 撕裂更明显。实测暂停后 1 MB 帧只要 ~25 ms。
+                # HUD 只 2 fps，同样走这条路径；暂停窗口占比更低。
                 if callable(self.pause_reader):
                     try:
                         self.pause_reader()
@@ -729,7 +932,10 @@ class LcdSink:
     # -- 状态 --------------------------------------------------------------
     def stats_dict(self) -> dict:
         with self._lock:
-            return self.stats.as_dict()
+            data = self.stats.as_dict()
+        data["mode"] = self.mode
+        data["zoom"] = self.renderer.zoom
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -737,12 +943,14 @@ class LcdSink:
 # ---------------------------------------------------------------------------
 def open_lcd_sink(dev, session, config, hub: LatestFrame, *, gate=None,
                   claim: bool = True, level_poller=None,
-                  pause_reader=None, resume_reader=None) -> LcdSink:
+                  pause_reader=None, resume_reader=None,
+                  hud_source=None, hud_fps: float = 2.0) -> LcdSink:
     """claim LCD 接口（必要时）+ 建 LcdSink；水平仪按需启动。
 
     ``level_poller`` 传入时由调用方（stream.Streamer）持有生命周期，LcdSink
     停止时不会把它一起停掉——Fn 按键在眼镜预览关闭时仍要持续轮询。
     ``pause_reader/resume_reader`` 用于在整帧 1 MB 发送前后暂停/恢复 UVC 异步读。
+    ``hud_source`` 给 ``LcdSink`` 提供 HUD 帧（Fn 短按在 preview/hud 间切换）。
     """
     intf, ep = usb.pick_bulk_out(dev)
     if claim and not session.claim_interface(intf, label="LCD(眼镜预览)"):
@@ -760,4 +968,5 @@ def open_lcd_sink(dev, session, config, hub: LatestFrame, *, gate=None,
                    level=poller, level_poller=poller, gate=gate,
                    session=session, intf=intf,
                    pause_reader=pause_reader, resume_reader=resume_reader,
-                   owns_level_poller=owns)
+                   owns_level_poller=owns,
+                   hud_source=hud_source, hud_fps=hud_fps)

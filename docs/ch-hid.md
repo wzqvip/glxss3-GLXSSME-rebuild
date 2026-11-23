@@ -363,6 +363,10 @@ fun parseReport(b: ByteArray): HidReport {
 
 ### 7.3 按键状态机（单击 / 长按）
 
+长按**只按时间判**（建议 0.9 s）；不要同时要求“连续 N 个按下包”——100 ms
+轮询时某个按下包可能落在 0.89 s，下一次轮询前就松开了，按满 1 秒会被误判成
+单击。松开时若 `duration >= longMs` 且长按还没触发，也补发 `LongPress`：
+
 ```kotlin
 class FnButton(private val longMs: Long = 900) {
     private var pressedAt = 0L
@@ -383,8 +387,14 @@ class FnButton(private val longMs: Long = 900) {
             }
             0 -> {
                 val t = pressedAt
+                val duration = if (t != 0L) now - t else 0L
                 pressedAt = 0
-                if (t != 0L && !longFired) return Event.Click(r.keyCode)
+                if (t != 0L && !longFired) {
+                    longFired = false
+                    // 阈值边缘：最后一个按下包没到 0.9 s，但实际按住够了
+                    return if (duration >= longMs) Event.LongPress(r.keyCode)
+                           else Event.Click(r.keyCode)
+                }
                 longFired = false
             }
         }
@@ -397,32 +407,56 @@ class FnButton(private val longMs: Long = 900) {
 > `lifecycleScope.launch(Dispatchers.IO) { while (active) { ...; delay(300) } }`，
 > 别在主线程轮询。
 
-### 7.4 本仓库 Python 实现（2026-11-22）
+### 7.4 本仓库 Python 实现（2026-11-22 实机修正）
 
-`linux/glxss/hid.py` 的 `FnWatcher` 把上面的 Kotlin 状态机做成纯逻辑，并保留
-原厂的“连续第 4 个按下包”语义，同时加 0.9 s 时间阈值（100 ms 轮询时第 4 包
-只有 0.3 s，不能只看包数）：
+`linux/glxss/hid.py` 的 `FnWatcher` 把上面的状态机做成纯逻辑。**长按只看
+按住时间**（默认 0.9 s），不再要求“连续第 4 个按下包”：
 
 ```python
 from glxss import hid
 
-watcher = hid.FnWatcher(long_seconds=0.9, long_packets=4)
-for event in watcher.feed(report):        # 每个 28 B 报告喂一次
+watcher = hid.FnWatcher(long_seconds=0.9)   # long_packets 仅为兼容保留
+for event in watcher.feed(report):          # 每个 28 B 报告喂一次
     if event.kind == "click":
         print("单击", event.duration, event.packets)
     elif event.kind == "long":
         print("长按", event.duration, event.packets)
 ```
 
-`pipeline.LevelPoller` 在独立线程里按 `--hid-poll`（默认 100 ms）读报告、
-更新水平仪，并把按键事件放进队列；`stream.Streamer` 主循环只 `drain_events()`，
-**绝不在 UVC 读线程里发 USB 控制请求**。控制请求和 LCD bulk OUT 共用
-`usb.UsbGate`，所以 HID 轮询既不会插进 1 MB LCD 帧，也不会阻塞 UVC 读流。
+原因（用户实机反馈“长按 1 秒没反应”）：100 ms 轮询时 1 s 按压只有 ~10 个
+包；若某个按下包落在 0.89 s、下一次轮询前就松开，旧逻辑（时间 AND 包数）
+会判成单击。现在：
+* 按住期间任一次轮询 `elapsed >= 0.9 s` → 立即发 `long`；
+* 松开时才攒够时间（`duration >= 0.9 s`）→ 发 `long` 而不是 `click`；
+* 每次 `keyStatus` 变化都打一行 `[hid] key 0x71 down/up（按住 x.xx s）`，
+  方便真实按键排查。
 
-`pi/stream.py` 的绑定：单击 = 眼镜显示 HUD ↔ camera preview；长按 = RTSP
-推流开/关；事件写 `[stream] Fn 按键：…` 日志，并可用 `glxss ctl status`
-查看 `显示/RTSP/按键`。没有硬件时用 `glxss ctl button click|long` 注入同一
-事件队列做端到端测试。
+`pipeline.LevelPoller` 在独立线程里按 `--hid-poll`（默认 100 ms）读报告、
+更新水平仪、写按键日志，并把事件放进队列；`stream.Streamer` 主循环只
+`drain_events()`，**绝不在 UVC 读线程里发 USB 控制请求**。控制请求和 LCD
+bulk OUT 共用 `usb.UsbGate`，所以 HID 轮询既不会插进 1 MB LCD 帧，也不会
+阻塞 UVC 读流。1 MB 帧发送窗口实测 29–39 ms，100 ms 轮询最多被推迟这么久，
+不会吞掉长达 1 s 的按压。
+
+`pi/stream.py` 的绑定（2026-11-22 晚改版，**RTSP 不再绑键**）：
+
+* **长按 ≥0.9 s** = 眼镜 camera preview ↔ HUD（stream 进程内渲染，不 release
+  LCD；旧版的长按开关 RTSP 已移除）；
+* **短按（preview 下）** = 循环数字变焦 `1.0x → 1.5x → 2.0x → 1.0x`；
+  `LcdRenderer` 先对 720p 源画面做**居中裁切**（1.5x → 853×480，2.0x →
+  640×360），再按 `--mirror-fit` 映射到 640×400；三分线/水平仪在裁切之后绘制，
+  始终正立；
+* **短按（HUD 视图下）忽略**（只打一行日志），避免在 HUD 上误触放大；要回视频
+  请长按；
+* RTSP 开关改用 `glxss ctl rtsp on|off`；变焦也可
+  `glxss ctl zoom 1.0|1.5|2.0|cycle`；
+* 事件写 `[stream] Fn 按键：…` 一行一个动作，`glxss ctl status` 可看
+  `view/lcd_mode/zoom/last_button/level/hid`。没有硬件时用
+  `glxss ctl button click|long` 注入同一事件队列做端到端测试。
+
+变焦只作用在**眼镜预览**这一路；RTSP 推流始终是全画幅（对端观众看到的是
+完整 1280×720 视野）。档位不落盘：进程重启回到 `--zoom`（默认 1.0，安全默认，
+避免上次放大后误以为镜头/对焦坏了）。
 
 ### 7.5 先使能传感器，否则 IMU 全 0
 
