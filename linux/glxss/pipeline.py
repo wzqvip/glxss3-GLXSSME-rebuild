@@ -222,7 +222,7 @@ def cover_box(width: int, height: int) -> Tuple[int, int]:
 
 # 数字变焦档位（模拟原厂 1.0x / 1.5x / 2.0x）。用元组而不是闭区间校验，
 # 避免 1.4999 之类的浮点数被悄悄接受。
-ZOOM_LEVELS = (1.0, 1.5, 2.0)
+ZOOM_LEVELS = (1.0, 1.5, 2.0, 3.0)
 
 
 def zoom_box(width: int, height: int, zoom: float = 1.0) -> Tuple[int, int]:
@@ -970,3 +970,4 @@ def open_lcd_sink(dev, session, config, hub: LatestFrame, *, gate=None,
                    pause_reader=pause_reader, resume_reader=resume_reader,
                    owns_level_poller=owns,
                    hud_source=hud_source, hud_fps=hud_fps)
+
