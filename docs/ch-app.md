@@ -36,6 +36,14 @@ com.wzqvip.glxsscast
 │   └─ LcdControl.kt      亮度/开关屏/roll/模式/状态/版本/EEPROM/自动亮度/LED
 ├─ cast/
 │   └─ CastService.kt     MediaProjection → VirtualDisplay → ImageReader → 映射 → USB
+├─ nav/                   导航 HUD（0.1.8）：Maps 通知 → 手机渲染 → 直推眼镜
+│   ├─ NavListenerService.kt  读 com.google.android.apps.maps 的导航通知
+│   ├─ NavParser.kt       指令/距离/机动/ETA/路名 解析 + 图标相似度兜底
+│   ├─ NavProtocol.kt     NavFrame / Maneuver / UDP JSON
+│   ├─ NavBus.kt          最近一帧、授权状态、UDP 发送、直推回调
+│   ├─ NavHudRenderer.kt  640×400 RGBA Canvas 渲染（箭头/距离/指令/路名）
+│   ├─ NavHudPusher.kt    1 Hz 直推调度 + 开屏 + PNG 抓图
+│   └─ NavHudSection.kt   页面：授权、开关、实时预览、模拟/抓帧
 └─ uvc/
     ├─ UvcCamera.kt       描述符解析、probe/commit、收流组帧、YUV 解码、拍照
     ├─ Yuv.kt             YV12/I420/NV12/NV21/YUY2/UYVY → ARGB（整数运算）
@@ -46,6 +54,10 @@ com.wzqvip.glxsscast
 |---|---:|---|---|
 | `MainActivity.kt` | 652 | UI、权限、广播、测试按钮、画面调整 | 全部 |
 | `cast/CastService.kt` | 545 | 投屏前台服务、旋转适配、三种映射 | `UsbLink`、`LcdControl` |
+| `nav/NavHudPusher.kt` | 380 | 导航 HUD 1 Hz 直推、开屏、PNG 抓图 | `UsbLink`、`LcdControl`、`NavBus` |
+| `nav/NavHudRenderer.kt` | 440 | 640×400 深色 HUD（无罗盘） | `LcdProtocol` |
+| `nav/NavParser.kt` | 650 | Maps 通知字段解析、路名抽取、图标比对 | `Notification` |
+| `nav/NavListenerService.kt` | 120 | 通知监听 + 启动时重扫 | `NavBus` |
 | `uvc/UvcCamera.kt` | 1022 | UVC 全流程 | `Yuv`、`UsbManager` |
 | `usb/UsbLink.kt` | 205 | 连接与 bulk | — |
 | `usb/MyriadBootLoader.kt` | 109 | 固件解密 + 灌写 | `UsbManager` |
@@ -58,6 +70,14 @@ com.wzqvip.glxsscast
 
 **技术栈**：Kotlin 2.0.21、AGP 8.7.3、Compose BOM 2024.10.01、`minSdk 26 / targetSdk 35`、JDK 17。
 无第三方运行时依赖（只有 AndroidX）。
+
+### 2.1 导航 HUD（0.1.8 起，方案 A：手机直推眼镜）
+
+`NotificationListenerService` 读 Google 地图导航通知 → `NavParser` 解析 → `NavHudRenderer`
+画 640×400 RGBA（大箭头 + 距离 + 指令 + 路名 + ETA）→ 复用投屏的 `LcdProtocol` 16 B 头 +
+1 MB bulk OUT **直推眼镜**，每秒一帧、数据变化立即补一帧。不需要 Pi/UDP，投屏进行中自动暂停。
+无眼镜时可把渲染结果抓成 PNG 到 `getExternalFilesDir/nav-hud/` 检查。
+完整用法/字段/实测见 [nav-hud.md](nav-hud.md)。
 
 ---
 

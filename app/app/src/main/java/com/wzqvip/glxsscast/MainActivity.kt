@@ -622,15 +622,18 @@ class MainActivity : ComponentActivity() {
                     val maneuver = Maneuver.fromKey(
                         intent.getStringExtra("maneuver") ?: "right"
                     )
+                    // 兼容 --ei / --ef / --el：Number 统一转 double
+                    fun numberExtra(key: String, fallback: Double): Double =
+                        (intent.extras?.get(key) as? Number)?.toDouble() ?: fallback
                     // use_last=1：抓「最近一条真实 Maps 通知」而不是造一条
                     val frame = if (intent.getBooleanExtra("use_last", false)) {
                         null
                     } else {
                         com.wzqvip.glxsscast.nav.NavParser.simulate(
                             maneuver = maneuver,
-                            distanceMeters = intent.getFloatExtra("nav_distance", 500f).toDouble(),
-                            etaSeconds = intent.getIntExtra("nav_eta", 120).toLong(),
-                            remainMeters = intent.getFloatExtra("nav_remain", 2400f).toDouble(),
+                            distanceMeters = numberExtra("nav_distance", 500.0),
+                            etaSeconds = numberExtra("nav_eta", 120.0).toLong(),
+                            remainMeters = numberExtra("nav_remain", 2400.0),
                             label = intent.getStringExtra("label"),
                         )
                     }

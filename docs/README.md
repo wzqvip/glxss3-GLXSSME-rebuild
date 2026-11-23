@@ -15,6 +15,7 @@
 | 6 | [固件与引导](ch-firmware.md) | 固件不在眼镜里，每次上电由主机灌 | MA2x + AES-128-ECB 尾 512 KiB；裸 bulk 1024 B/包 | ✅ 460 ms |
 | 7 | [App 架构](ch-app.md) | 模块、构建、调试、下一步 | 默认路径纯 Kotlin，无 native 依赖 | ✅ 可构建 |
 | 8 | [NPU 现状](ch-npu.md) | Myriad 2 有 12×SHAVE，但用不上 | NCS1 固件与显示/相机互斥 | ❌ |
+| 9 | [导航 HUD](nav-hud.md) | 手机读 Google 地图导航，自己渲染 640×400 直推眼镜 | Maps 通知 → Canvas → 16 B 头 + 1 MB bulk，1 Hz/25 ms；不需要 Pi | ✅ LG 真机（直推 ACK） |
 
 ## 2. 证据与专题文档
 
@@ -29,6 +30,7 @@
 | [vendor-flash-capture.md](vendor-flash-capture.md) | 原厂刷机 1490 包序列、payload 精确组成、-206 根因 | 刷写协议与生命周期坑的证据 |
 | [device-recovery.md](device-recovery.md) | 三态判定、卡死态证据、恢复 SOP、代码修复 | 运维手册 + 故障反证 |
 | [uvc-camera-plan.md](uvc-camera-plan.md) | 摄像头四种方案（A/B/C/D）对比、厂商 .so 绑定细节 | 技术选型记录，避免重走弯路 |
+| [nav-hud.md](nav-hud.md) | 导航 HUD：Maps 通知解析、640×400 渲染、USB 直推、PNG 抓帧、真机实测 | 方案 A 的完整说明与样张 |
 | [apk-versions.md](apk-versions.md) | 1.8.4 / 2.3.7 / 社区版对比、1.7.4 固件、UVC 档位表 | 版本考古与第二份固件 |
 | [open-questions.md](open-questions.md) | 仍未验证的项 + 验证方法 | 给后来者的待办清单 |
 
