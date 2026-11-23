@@ -141,9 +141,11 @@ object NavParser {
             ?: parseDistance(titleClean)
             ?: parseDistance(bigClean)
 
-        // 2) 剩余时间 / 剩余距离：副标题 > 信息栏 > 大文本
+        // 2) 剩余时间 / 剩余距离：副标题 > 信息栏 > 大文本；ETA 再兜底正文
+        //    （部分 Maps 版本把 "500 米 · 12 分钟" 都塞进 EXTRA_TEXT）。
         val extras = listOf(subClean, infoClean, bigClean).filter { it.isNotEmpty() }
         val eta = extras.firstNotNullOfOrNull { parseDuration(it) }
+            ?: parseDuration(textClean)
         val remain = extras.firstNotNullOfOrNull { parseDistance(it) }
 
         // 3) 机动类型：文本关键词优先，图标相似度兜底

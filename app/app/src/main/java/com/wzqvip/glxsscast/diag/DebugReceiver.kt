@@ -99,12 +99,15 @@ class DebugReceiver : BroadcastReceiver() {
                     val maneuver = Maneuver.fromKey(
                         intent.getStringExtra("maneuver") ?: "right"
                     )
+                    // 兼容 --ei / --ef / --el 三种写法（Number 统一转 double）。
+                    fun numberExtra(key: String, fallback: Double): Double =
+                        (intent.extras?.get(key) as? Number)?.toDouble() ?: fallback
                     val frame = NavBus.simulate(
                         app,
                         maneuver = maneuver,
-                        distanceMeters = intent.getDoubleExtra("distance", 500.0),
-                        etaSeconds = intent.getLongExtra("eta", 120L),
-                        remainMeters = intent.getDoubleExtra("remain", 2400.0),
+                        distanceMeters = numberExtra("distance", 500.0),
+                        etaSeconds = numberExtra("eta", 120.0).toLong(),
+                        remainMeters = numberExtra("remain", 2400.0),
                     )
                     Log.i(TAG, "nav_sim → " + frame.toJson())
                     Oplog.logf("NAV", "nav_sim → %s", frame.toJson())
