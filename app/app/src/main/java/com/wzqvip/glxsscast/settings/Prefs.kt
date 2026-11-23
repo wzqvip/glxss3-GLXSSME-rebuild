@@ -41,6 +41,15 @@ class Prefs private constructor(ctx: Context) {
         private const val KEY_ACC_FSR = "acc_fsr"
         private const val KEY_GYRO_FSR = "gyro_fsr"
         private const val KEY_FSR_INIT = "fsr_initialized"
+        // 导航 HUD（手机 → Pi Wi-Fi UDP）
+        private const val KEY_NAV_HUD = "nav_hud_enabled"
+        private const val KEY_NAV_IP = "nav_ip"
+        private const val KEY_NAV_PORT = "nav_port"
+        private const val KEY_NAV_BEARING = "nav_bearing"
+        private const val KEY_NAV_DISTANCE = "nav_distance"
+        private const val KEY_NAV_LABEL = "nav_label"
+        private const val KEY_NAV_MANUAL_HEADING_ON = "nav_manual_heading_on"
+        private const val KEY_NAV_MANUAL_HEADING = "nav_manual_heading"
 
         @Volatile private var inst: Prefs? = null
         fun get(ctx: Context): Prefs =
@@ -148,4 +157,42 @@ class Prefs private constructor(ctx: Context) {
     var fsrInitialized: Boolean
         get() = sp.getBoolean(KEY_FSR_INIT, false)
         set(v) { sp.edit().putBoolean(KEY_FSR_INIT, v).apply() }
+
+    // ---- 导航 HUD（手机 → Pi Wi-Fi UDP，默认 192.168.2.128:9999） ----
+    var navHudEnabled: Boolean
+        get() = sp.getBoolean(KEY_NAV_HUD, false)
+        set(v) { sp.edit().putBoolean(KEY_NAV_HUD, v).apply() }
+
+    var navIp: String
+        get() = sp.getString(KEY_NAV_IP, "192.168.2.128") ?: "192.168.2.128"
+        set(v) { sp.edit().putString(KEY_NAV_IP, v.trim()).apply() }
+
+    var navPort: Int
+        get() = sp.getInt(KEY_NAV_PORT, 9999).coerceIn(1, 65535)
+        set(v) { sp.edit().putInt(KEY_NAV_PORT, v.coerceIn(1, 65535)).apply() }
+
+    var navBearing: Float
+        get() = sp.getFloat(KEY_NAV_BEARING, 0f).let { ((it % 360f) + 360f) % 360f }
+        set(v) { sp.edit().putFloat(KEY_NAV_BEARING, ((v % 360f) + 360f) % 360f).apply() }
+
+    var navDistance: Float
+        get() = sp.getFloat(KEY_NAV_DISTANCE, 120f).coerceIn(0f, 1_000_000f)
+        set(v) { sp.edit().putFloat(KEY_NAV_DISTANCE, v.coerceIn(0f, 1_000_000f)).apply() }
+
+    var navLabel: String
+        get() = sp.getString(KEY_NAV_LABEL, "右转") ?: "右转"
+        set(v) { sp.edit().putString(KEY_NAV_LABEL, v).apply() }
+
+    var navManualHeadingOn: Boolean
+        get() = sp.getBoolean(KEY_NAV_MANUAL_HEADING_ON, false)
+        set(v) { sp.edit().putBoolean(KEY_NAV_MANUAL_HEADING_ON, v).apply() }
+
+    var navManualHeading: Float
+        get() = sp.getFloat(KEY_NAV_MANUAL_HEADING, 0f)
+            .let { ((it % 360f) + 360f) % 360f }
+        set(v) {
+            sp.edit().putFloat(
+                KEY_NAV_MANUAL_HEADING, ((v % 360f) + 360f) % 360f
+            ).apply()
+        }
 }

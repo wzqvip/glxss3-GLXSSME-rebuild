@@ -36,6 +36,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
@@ -59,6 +60,7 @@ import com.wzqvip.glxsscast.diag.Oplog
 import com.wzqvip.glxsscast.lcd.LcdControl
 import com.wzqvip.glxsscast.lcd.LcdProtocol
 import com.wzqvip.glxsscast.lcd.ProductInfo
+import com.wzqvip.glxsscast.nav.NavHudSender
 import com.wzqvip.glxsscast.record.RecordSource
 import com.wzqvip.glxsscast.record.VideoRecorder
 import com.wzqvip.glxsscast.settings.HidAction
@@ -132,6 +134,22 @@ class MainActivity : ComponentActivity() {
     private var hidClickAction by mutableStateOf(HidAction.SNAPSHOT)
     private var hidLongAction by mutableStateOf(HidAction.CAST_TOGGLE)
     private var hidMode by mutableStateOf(HidSensor.Mode.POLL)
+
+    // ---- 导航 HUD（手机 → Pi Wi-Fi UDP，每秒一包） ----
+    private var navHudOn by mutableStateOf(false)
+    private var navIp by mutableStateOf("192.168.2.128")
+    private var navPort by mutableStateOf("9999")
+    private var navBearing by mutableStateOf(0f)
+    private var navDistance by mutableStateOf(120f)
+    private var navLabel by mutableStateOf("右转")
+    private var navManualHeadingOn by mutableStateOf(false)
+    private var navManualHeading by mutableStateOf(0f)
+    private var navInfo by mutableStateOf("导航 HUD 未启动")
+    private var navLastError by mutableStateOf("")
+    private var navPackets by mutableStateOf(0)
+    private var navSender: NavHudSender? = null
+    private var navJob: Job? = null
+    private val navRequestCode = 4
 
     // ---- 传感器量程 / 姿态可视化（演示用） ----
     private data class Vec3(val x: Float, val y: Float, val z: Float) {
@@ -482,6 +500,16 @@ class MainActivity : ComponentActivity() {
         hidClickAction = HidAction.from(prefs.hidClickAction)
         hidLongAction = HidAction.from(prefs.hidLongAction)
         hidMode = if (prefs.hidMode == "interrupt") HidSensor.Mode.INTERRUPT else HidSensor.Mode.POLL
+        // 导航 HUD 配置持久化；开关本身不自动恢复（避免一启动就偷偷发 UDP）
+        navIp = prefs.navIp
+        navPort = prefs.navPort.toString()
+        navBearing = prefs.navBearing
+        navDistance = prefs.navDistance
+        navLabel = prefs.navLabel
+        navManualHeadingOn = prefs.navManualHeadingOn
+        navManualHeading = prefs.navManualHeading
+        navSender = NavHudSender(this)
+        navHudOn = false
         accFsr = prefs.accFsr
         gyroFsr = prefs.gyroFsr
         hidOn = false
@@ -587,6 +615,26 @@ class MainActivity : ComponentActivity() {
                 "fsr_estimate" -> estimateAccRange()
                 "level_calib" -> calibrateLevel()
                 "sensor_attr" -> readImuAttributes()
+                "nav_start" -> {
+                    // 无 UI 的自动化测试入口：
+                    // adb shell am start -n com.wzqvip.glxsscast/.MainActivity \
+                    //   --es cmd nav_start --es nav_ip 192.168.2.128 --ei nav_port 9999 \
+                    //   --ef nav_bearing 45 --ef nav_distance 120 --es nav_label 右转 \
+                    //   --ef nav_heading 40
+                    navIp = intent.getStringExtra("nav_ip") ?: navIp
+                    if (intent.hasExtra("nav_port")) {
+                        navPort = intent.getIntExtra("nav_port", 9999).toString()
+                    }
+                    navBearing = intent.getFloatExtra("nav_bearing", navBearing)
+                    navDistance = intent.getFloatExtra("nav_distance", navDistance)
+                    navLabel = intent.getStringExtra("nav_label") ?: navLabel
+                    if (intent.hasExtra("nav_heading")) {
+                        navManualHeadingOn = true
+                        navManualHeading = intent.getFloatExtra("nav_heading", 0f)
+                    }
+                    navSetEnabled(true)
+                }
+                "nav_stop" -> navSetEnabled(false)
                 "oplog_dump" -> {
                     Oplog.dumpCrash("manual")
                     updateCrashInfo()
@@ -639,6 +687,14 @@ class MainActivity : ComponentActivity() {
         }
         usbPollJob?.cancel()
         usbPollJob = null
+        // 导航 HUD：退出页面就停 GPS/UDP（不写持久化开关）
+        navJob?.cancel()
+        navJob = null
+        try {
+            navSender?.stop()
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "nav sender stop failed", t)
+        }
         // 录像要在进程里收尾，否则 muxer 的 mp4 索引写不完
         try {
             if (com.wzqvip.glxsscast.cast.CastService.frameTap === recorder) {
@@ -680,6 +736,110 @@ class MainActivity : ComponentActivity() {
         usbPollJob?.cancel()
         usbPollJob = null
         super.onPause()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != navRequestCode) return
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            navSender?.start()
+            navInfo = "定位权限已授予：" + (navSender?.statusText() ?: "")
+        } else {
+            navInfo = "未授予定位权限：heading 用 0/手动值（手动测试仍可用）"
+        }
+    }
+
+    // ==================================================================
+    // 导航 HUD（手机 → Pi Wi-Fi UDP）
+    // ==================================================================
+
+    private fun navEnsureSender(): NavHudSender =
+        navSender ?: NavHudSender(this).also { navSender = it }
+
+    /** 「导航 HUD」开关：开=启动 GPS 朝向监听 + 每秒 UDP；关=停。 */
+    private fun navSetEnabled(on: Boolean) {
+        if (!on) {
+            navStopSending()
+            return
+        }
+        val sender = navEnsureSender()
+        if (!sender.hasLocationPermission) {
+            // Android 12+ 只给模糊定位时拿不到 GPS bearing；手动测试不依赖它。
+            requestPermissions(
+                arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION),
+                navRequestCode
+            )
+        } else {
+            sender.start()
+        }
+        navHudOn = true
+        prefs.navHudEnabled = true
+        prefs.navIp = navIp.trim()
+        navLastError = ""
+        navInfo = "导航 HUD 已启动：每秒发送到 ${navIp.trim()}:${navPort.trim()}"
+        navPackets = 0
+        navJob?.cancel()
+        navJob = launchSafe {
+            while (isActive) {
+                val ip = navIp.trim()
+                val port = navPort.trim().toIntOrNull()
+                if (ip.isEmpty() || port == null || port !in 1..65535) {
+                    navLastError = "IP/端口无效：$ip:${navPort.trim()}"
+                    navInfo = navLastError
+                    delay(1000)
+                    continue
+                }
+                val heading = if (navManualHeadingOn) {
+                    navManualHeading
+                } else {
+                    sender.currentHeading()
+                }
+                val result = withContext(Dispatchers.IO) {
+                    sender.send(ip, port, navBearing, navDistance, navLabel, heading)
+                }
+                if (result.ok) {
+                    navPackets += 1
+                    navLastError = ""
+                    val headingText = heading?.let {
+                        String.format(Locale.US, "%.0f°", it)
+                    } ?: "未定位（不发 heading）"
+                    navInfo = String.format(
+                        Locale.US,
+                        "已发 %d 包 → %s:%d · bearing %.0f° · %.0f m · heading %s",
+                        navPackets, ip, port, navBearing, navDistance, headingText
+                    )
+                } else {
+                    navLastError = result.error
+                    navInfo = "发送失败：${result.error} → $ip:$port"
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    private fun navStopSending() {
+        navJob?.cancel()
+        navJob = null
+        navSender?.stop()
+        navHudOn = false
+        prefs.navHudEnabled = false
+        navInfo = "导航 HUD 已停止（Pi 端 5 s 后显示“等待手机…”）"
+    }
+
+    /** 方向按钮：设置 bearing + 动作文字（手动测试模式）。 */
+    private fun navPreset(bearing: Float, label: String, distance: Float? = null) {
+        navBearing = ((bearing % 360f) + 360f) % 360f
+        navLabel = label
+        if (distance != null) navDistance = distance
+        prefs.navBearing = navBearing
+        prefs.navLabel = label
+        if (distance != null) prefs.navDistance = navDistance
     }
 
     // ==================================================================
@@ -787,7 +947,7 @@ class MainActivity : ComponentActivity() {
      */
     private fun requestPermissionSafe(dev: UsbDevice) {
         try {
-            usb.requestPermission(dev)
+            usb.requestPermission(dev)  // UsbLink 内部已用 FLAG_MUTABLE 的 PendingIntent 处理 Android 12+
         } catch (t: Throwable) {
             Oplog.logf("CONN", "requestPermission failed %s: %s", t.javaClass.simpleName, t.message)
             status = "USB 权限请求失败：${t.message}"
@@ -2233,6 +2393,151 @@ class MainActivity : ComponentActivity() {
                     }
 
                     HorizontalDivider()
+                    Text("导航 HUD（Wi-Fi UDP → Pi）", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("导航 HUD 开关")
+                            Text(
+                                if (navHudOn) "推送中：每秒 1 包 JSON"
+                                else "关闭（IP/端口/测试值会保存）",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        Switch(
+                            checked = navHudOn,
+                            onCheckedChange = { navSetEnabled(it) }
+                        )
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = navIp,
+                            onValueChange = {
+                                navIp = it.trim()
+                                prefs.navIp = navIp
+                            },
+                            label = { Text("Pi IP") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1.6f)
+                        )
+                        OutlinedTextField(
+                            value = navPort,
+                            onValueChange = { text ->
+                                navPort = text.filter { ch -> ch.isDigit() }.take(5)
+                                prefs.navPort = navPort.toIntOrNull() ?: 9999
+                            },
+                            label = { Text("端口") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Text(
+                        navInfo,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    if (navLastError.isNotEmpty()) {
+                        Text(
+                            "错误：" + navLastError,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                    Text(
+                        navSender?.statusText() ?: "GPS 未启动",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Text(
+                        "箭头 bearing：%.0f°".format(navBearing),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Slider(
+                        value = navBearing,
+                        onValueChange = {
+                            navBearing = it
+                            prefs.navBearing = it
+                        },
+                        valueRange = 0f..359f,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { navPreset(270f, "左转") },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("左转") }
+                        OutlinedButton(
+                            onClick = { navPreset(0f, "直行") },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("直行") }
+                        OutlinedButton(
+                            onClick = { navPreset(90f, "右转") },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("右转") }
+                        OutlinedButton(
+                            onClick = { navPreset(0f, "到达", distance = 0f) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("到达") }
+                    }
+
+                    Text(
+                        "距离：%.0f m".format(navDistance),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Slider(
+                        value = navDistance,
+                        onValueChange = {
+                            navDistance = it
+                            prefs.navDistance = it
+                        },
+                        valueRange = 0f..2000f,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("手动 heading（无 GPS / 固定测试）")
+                            Text(
+                                "关闭时用 LocationManager 的 Location.getBearing()",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        Switch(
+                            checked = navManualHeadingOn,
+                            onCheckedChange = {
+                                navManualHeadingOn = it
+                                prefs.navManualHeadingOn = it
+                            }
+                        )
+                    }
+                    if (navManualHeadingOn) {
+                        Text(
+                            "heading：%.0f°".format(navManualHeading),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Slider(
+                            value = navManualHeading,
+                            onValueChange = {
+                                navManualHeading = it
+                                prefs.navManualHeading = it
+                            },
+                            valueRange = 0f..359f,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    HorizontalDivider()
                     Text("投屏", style = MaterialTheme.typography.titleSmall)
                     Button(
                         onClick = { cycleFillMode() },
@@ -2988,6 +3293,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
 
 
 
