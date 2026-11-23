@@ -1525,7 +1525,7 @@ class StreamFnZoomTests(unittest.TestCase):
         runner, sink = self._runner("preview")
         out = io.StringIO()
         with redirect_stdout(out):
-            for expected in (1.5, 2.0, 1.0, 1.5):
+            for expected in (1.5, 2.0, 3.0, 1.0):
                 self._click(runner)
                 runner._drain_buttons()
                 self.assertEqual(runner.stats.zoom, expected)
@@ -1535,6 +1535,8 @@ class StreamFnZoomTests(unittest.TestCase):
         self.assertIn("源中心 853x480", text)
         self.assertIn("zoom 2.0x", text)
         self.assertIn("源中心 640x360", text)
+        self.assertIn("zoom 3.0x", text)
+        self.assertIn("源中心 427x240", text)
 
     def test_click_in_hud_is_ignored(self):
         runner, sink = self._runner("hud")
@@ -1576,7 +1578,7 @@ class StreamFnZoomTests(unittest.TestCase):
             self.assertIn("1.5", response["error"])
             status = runner._handle_ctl({"cmd": "status"})["status"]
             self.assertEqual(status["zoom"], 2.0)
-            self.assertEqual(status["zoom_levels"], [1.0, 1.5, 2.0])
+            self.assertEqual(status["zoom_levels"], [1.0, 1.5, 2.0, 3.0])
         # status 在 HUD/无 LCD 时也应保留档位（切回视频立即生效）
         runner._lcd.mode = "hud"
         self.assertEqual(runner._handle_ctl({"cmd": "status"})["status"]["zoom"],
@@ -1584,6 +1586,7 @@ class StreamFnZoomTests(unittest.TestCase):
 
     def test_zoom_config_validation(self):
         stream.StreamConfig(zoom=1.5).validate()
+        stream.StreamConfig(zoom=3.0).validate()
         with self.assertRaises(GlxssError):
             stream.StreamConfig(zoom=1.3).validate()
 
