@@ -118,6 +118,9 @@ dist/         构建好的 APK
 本仓库另有一个 **Linux / 跨平台 Python 版本**，代码在 [`linux/`](linux/) 目录，
 位于 **`linux` 分支**（`git checkout linux`），不影响 `main` 分支的 Android App。
 
+完整功能清单、用法、实测数据和已知限制见 [`linux/README.md`](linux/README.md)
+（HUD、相机预览/变焦、RTSP 推流、Fn/HID、LCD HAT、固件、导航 UDP、`glxss ctl`）。
+
 它提供 `glxss` CLI（list/status/bright/screen/mode/roll/eeprom/version/hid/uvc/frame/flash/cast/hud/ctl）、
 可复用的 pyusb/numpy 核心库，以及面向 **Raspberry Pi Zero 2 W + Waveshare 1.3inch
 LCD HAT** 的完整方案：
