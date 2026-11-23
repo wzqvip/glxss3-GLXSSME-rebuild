@@ -22,5 +22,13 @@ class GlxssApp : Application() {
         } catch (t: Throwable) {
             Log.e("GlxssApp", "Oplog.init failed", t)
         }
+        // 深度息屏（root 关背光）如果上次没正常退出（崩溃/强杀），这里把背光还回去。
+        // 放后台线程：su 调用可能要等 Magisk 响应，不能阻塞进程启动。
+        try {
+            Thread({ com.wzqvip.glxsscast.cast.BacklightIo.restorePending(applicationContext) }, "BacklightRecover")
+                .apply { isDaemon = true }.start()
+        } catch (t: Throwable) {
+            Log.e("GlxssApp", "backlight recover failed", t)
+        }
     }
 }

@@ -294,3 +294,73 @@ PC 端完整调试 CLI（状态/控制/HID/EEPROM/UVC/刷写/解码）见
   并在分发时保留上游（serenegiant / Apache-2.0）声明；
 - 与 LLVision 无关联，见 [NOTICE.md](../NOTICE.md)。
 
+---
+
+## 10. Android Auto 界面投屏（OpenHeadUnit → 眼镜）
+
+把 LG 上 OpenHeadUnit 显示的 Android Auto 界面，经 MediaProjection 抓屏、缩放到 640×400、
+USB bulk 推到眼镜。整条链路不需要 Pi：`Pixel → WiFi → OpenHeadUnit → 本 App → 眼镜`。
+
+### 10.1 OpenHeadUnit 侧（必须一次设对）
+
+在 LG 的 OpenHeadUnit（`com.andrerinas.headunitrevived`，3.5.0 实测）里设置：
+
+| 设置项 | 值 | 原因 |
+|---|---|---|
+| 屏幕方向 / Screen orientation | **横屏 Landscape** | AA 画布变成 2340×1080；竖屏下 AA 是 1080×1920，裁到 640×400 只剩中间一条，不可用 |
+| HUD Mode (Horizontal Flip) | **关** | 开着会把整个 AA 画面左右镜像，眼镜上文字全反 |
+| 分辨率 / Resolution | **720p（1280×720）** | 目标只有 640×400，720p 足够且解码轻松；实测 AA 解码 30 fps |
+| 视频适配 / Video fit | **Fit with bars (CONTAIN)** | 不让 OpenHeadUnit 把 16:9 的 AA 拉伸成 21:9 |
+| Custom Insets | **0** | 恢复全屏；设了左右 inset 会把 AA 缩到中间并留黑边 |
+| 连接方式 | WiFi（Native AA） | USB 口要留给眼镜 |
+
+> OpenHeadUnit 3.5.0 的 Resolution 只有 Auto / 480p / 720p / 1080p / 1440p / 2160p，
+> **没有 1280×800**。别按 2:1 或 1280×800 去设，否则会找不到对应项。
+
+设置改完若 AA 没重连：点 OpenHeadUnit 的 **WiFi** 按钮，或
+`adb shell am broadcast -a com.andrerinas.openheadunit.ACTION_START_WIRELESS -p com.andrerinas.headunitrevived`。
+
+### 10.2 App 侧
+
+1. 眼镜插在 LG 上，App 里点「连接眼镜」（状态显示「眼镜：已连接」）。
+2. 点 **「▶ AA 投屏（一键：完整 AA 画面、无裁切）」**：
+   - 自动把画面模式设为 `MODE_AA`（适应 + AA 内容区识别），zoom/offset 归位并持久化；
+   - 拉起系统投屏授权。
+3. 系统对话框选 **「整个屏幕」** → 开始（选「单个应用 → OpenHeadUnit」见 10.4）。
+4. 切到 OpenHeadUnit 的 AA 界面。App 是前台 Service，切走不会停。
+
+`MODE_AA` 会先识别 AA 内容区（剥掉 OpenHeadUnit 的 letterbox 黑边），再按「适应」等比缩放：
+OpenHeadUnit 输出 16:9 内容 + 左右黑边时 → **640×360 居中**，上下各 20 px 黑边，
+完整保留左右应用栏和音乐面板；如果 AA 内容铺满整屏（没有可识别的黑边），会退化为整幅 fit
+（约 640×295，上下各 52 px 黑边）。想要满屏无黑边就手动切「裁剪(填满)」，代价是左右各裁 ~13%。
+
+如果 AA 在后台、抓到的却是桌面/App：把 OpenHeadUnit 的投影界面切回前台
+（`adb shell am broadcast -a com.andrerinas.openheadunit.ACTION_RAISE_PROJECTION -p com.andrerinas.headunitrevived`）。
+
+### 10.3 实测结果（LG G8X / Android 14 / OpenHeadUnit 3.5.0）
+
+- 整屏抓取 866×400 → 640×400（cover），**25–27 fps**（AA 自身解码 29–30 fps），
+  USB bulk 每次约 25 ms，连续 1000+ 帧无失败、无撕裂。
+- 整屏 cover 实帧可读：地图、转弯 banner、限速、当前路名、右侧音乐面板
+  （专辑封面/曲名/暂停键）都在；但最左侧应用栏会被裁掉。
+
+![整屏 cover 模式 640×400 实帧](../app/screenshots/aa-cast-640x400.png)
+
+- 代价：眼镜 16:10、AA 画面约 21:9，cover 左右各裁 ~13%。要完整画面用 10.2 的「AA 投屏」
+  （fit + 内容区识别）；要满屏用 cover，两者二选一。
+- 息屏：App 的「Android Auto 投屏」面板提供「息屏（黑屏+亮度0）」，
+  适合单应用投影时省电；整屏投影下息屏会连 AA 一起黑掉，不要同时用。
+
+### 10.4 已知问题
+
+- OpenHeadUnit 的 HUD Mode 必须关；如果它被别的自动化重新打开，眼镜上会左右镜像。
+  可在 OpenHeadUnit 设置里再关，或让 App 的 AA 面板通过
+  `ACTION_SET_SETTINGS`（需 OpenHeadUnit 开启 Allow external configuration）下发
+  `{"hud_mirroring":false,"screen-orientation":2,"video-fit-mode":1,"resolutionId":2}`。
+- 单应用投影（系统对话框选「单个应用」→ OpenHeadUnit）能避开状态栏，但 AA 的
+  SurfaceView/TextureView 在不同 ROM 上可能被系统判定为不可捕获；整屏投影最稳。
+- **息屏不要用不透明黑窗**：实测它会盖住 OpenHeadUnit，Android 14 单应用抓取拿到的
+  每一帧都是全黑（`cast-frame.png` 仅约 1.9 KB）。现改为**全透明窗口 + 窗口亮度 0**
+  （`windowIsTranslucent`），被投的 AA 仍保持可见/继续出帧；整屏抓取时状态栏会进画面，
+  建议 OpenHeadUnit 的 Screen mode 选 Immersive。
+

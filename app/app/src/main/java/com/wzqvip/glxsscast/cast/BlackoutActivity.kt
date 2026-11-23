@@ -1,7 +1,6 @@
 package com.wzqvip.glxsscast.cast
 
 import android.app.Activity
-import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
@@ -9,40 +8,55 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.View
-import android.view.WindowInsets
-import android.view.WindowInsetsController
 import android.view.WindowManager
 import com.wzqvip.glxsscast.diag.Oplog
 
 /**
- * 「息屏」遮罩：全屏纯黑 + 窗口亮度 0 + 保持常亮。
+ * 「息屏」模式：把手机屏幕压到最暗，但**不遮挡**被投的那个 App。
  *
- * 为什么需要它：MediaProjection 抓的是**虚拟显示**的内容，手机物理屏幕亮着就会漏光、
- * 耗电、误触。这里的做法是给手机盖一层纯黑的不透明窗口，并把**本窗口**的屏幕亮度设为 0，
- * 让手机看起来已经灭屏 —— 而 OpenHeadUnit（被「单个应用」抓取的那个 App）照常渲染，
- * 系统仍然把它的窗口内容送到虚拟显示里，于是眼镜上的 AA 画面不受影响。
+ * ## 为什么不能盖一块纯黑
  *
- * 为什么用「窗口亮度」而不是 `settings put system screen_brightness 0`：
- *  - `WindowManager.LayoutParams.screenBrightness` 只影响本窗口可见期间，
- *    Activity 一退出/被移除，系统自动回到原亮度，**不存在忘记恢复把手机变瞎的风险**；
- *  - 不需要 WRITE_SETTINGS，也不需要 root；也不会改掉用户系统里的亮度设置。
- *  （如果面板最低亮度仍然漏光，见 docs/ch-app.md：可选 root 兜底把背光写到 0。）
+ * 实测（LG G8X / Android 14，2026-11-22）：Android 14 的「单个应用」抓取本质上还是抓
+ * **合成后的显示内容**。一旦我们自己的不透明黑窗口盖住 OpenHeadUnit，系统就把被盖住的
+ * 那个窗口从合成里摘掉 —— 抓到的每一帧都是全黑（`cast-frame.png` = 1956 B 纯黑），
+ * 眼镜黑屏。整屏抓取更直接：黑遮罩本身就会进画面。
  *
- * 退出方式：点屏幕任意位置（整屏都是按钮）、返回键，或者通知栏里的「退出息屏」。
- * 投屏被停掉（拔线/连续发帧失败/用户点停止）时，本 Activity 会自己退出并恢复亮度。
+ * 所以这里用**全透明窗口**：
+ *  - `windowIsTranslucent` + 透明背景 → 被投 App 仍处于"可见"状态，照常合成、照常被抓；
+ *  - 但本窗口是**最顶层焦点窗口**，于是 `screenBrightness = 0f` 生效：框架把背光压到最暗；
+ *  - 窗口仍然吃触摸：点屏幕任意位置 = 退出息屏（不用摸黑找按钮）；返回键也退。
+ *
+ * ## 亮度 0 的两种实现
+ *
+ * 1. **窗口亮度**（默认，无需 root）：`WindowManager.LayoutParams.screenBrightness = 0f`。
+ *    只在本窗口可见期间生效，Activity 一退出系统自动还原 —— 不存在"把用户手机永久变黑"的风险。
+ *    代价：有些 ROM 的 0 只是"最暗档"，夜里还看得出 AA 画面。
+ * 2. **root 关背光**（可选，`deep=true`）：直接把
+ *    `/sys/class/backlight/panel0-backlight/brightness` 写 0，面板真正熄灭，AA 继续渲染。
+ *    原值写盘前先存进 SharedPreferences，退出/崩溃后下次启动都会还原（见 [BacklightIo]）。
+ *
+ * ## 与抓取模式的关系
+ *
+ * - 单个应用抓取：状态栏/通知不进画面，手机屏幕只剩"极暗的 AA"，眼镜上是最干净的 AA；
+ * - 整屏抓取：透明窗口不挡画面，所以也能用（此时状态栏会进画面，建议 OpenHeadUnit
+ *   Screen mode = Immersive 把系统栏藏掉）。
  */
 class BlackoutActivity : Activity() {
 
     companion object {
         private const val TAG = "Blackout"
+
+        /** true = 顺便用 root 把面板背光关掉（真正熄屏） */
+        const val EXTRA_DEEP = "deep"
     }
 
     private val ui = Handler(Looper.getMainLooper())
 
-    /** 上一次观察到的帧号/时刻，用于判断「被抓的 App 是不是还在出帧」 */
+    /** 上一次观察到的帧号/时刻，用于判断"被抓的 App 是不是还在出帧" */
     private var lastFrames = 0L
     private var lastFramesAt = 0L
     private var stallLogged = false
+    private var deep = false
 
     /**
      * 看门狗：
@@ -88,10 +102,15 @@ class BlackoutActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         try {
-            // 窗口本身也画黑（不依赖 ContentView 的绘制时序，避免闪一下白/灰）
-            window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+            deep = intent?.getBooleanExtra(EXTRA_DEEP, false) == true
+            // 透明窗口：不遮挡下面的 App（否则 MediaProjection 抓到的会是全黑）
+            window.setBackgroundDrawable(ColorDrawable(0x00000000))
+            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             // 亮度 0 = 框架允许的最暗；只在本窗口可见期间生效，退出即恢复
-            window.attributes = window.attributes.apply { screenBrightness = 0f }
+            window.attributes = window.attributes.apply {
+                screenBrightness = 0f
+                dimAmount = 0f
+            }
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (Build.VERSION.SDK_INT >= 27) {
                 setShowWhenLocked(true)
@@ -101,21 +120,36 @@ class BlackoutActivity : Activity() {
                 window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
             }
 
+            // 一个完全透明、但可点击的视图：点任意位置退出
             val root = View(this).apply {
-                setBackgroundColor(Color.BLACK)
+                setBackgroundColor(0x00000000)
                 isClickable = true
+                isFocusable = true
                 setOnClickListener { finish() }
             }
             setContentView(root)
-            hideSystemBars()
 
             CastService.setBlackout(true)
             lastFrames = CastService.frames
             lastFramesAt = System.currentTimeMillis()
             ui.postDelayed(watchdog, 2000)
+
+            if (deep) {
+                Thread({
+                    val orig = BacklightIo.readRaw()
+                    if (orig == null) {
+                        Oplog.log("BLACKOUT", "深度息屏失败：读不到背光（未授权 root？）→ 仅用窗口亮度 0")
+                        return@Thread
+                    }
+                    BacklightIo.savePending(this, orig)
+                    val ok = BacklightIo.writeRaw(0)
+                    Oplog.logf("BLACKOUT", "深度息屏: 背光 %d → 0 ok=%b", orig, ok)
+                }, "BlackoutBacklightOff").apply { isDaemon = true }.start()
+            }
+
             Oplog.logf(
-                "BLACKOUT", "进入息屏: brightness=0 keepScreenOn=true 抓取=%s frames=%d",
-                CastService.captureDesc.ifEmpty { "?" }, CastService.frames
+                "BLACKOUT", "进入息屏(透明): brightness=0 deep=%b keepScreenOn=true 抓取=%s frames=%d",
+                deep, CastService.captureDesc.ifEmpty { "?" }, CastService.frames
             )
         } catch (t: Throwable) {
             Oplog.logf("BLACKOUT", "进入息屏失败 %s: %s", t.javaClass.simpleName, t.message)
@@ -135,38 +169,11 @@ class BlackoutActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        // 通知栏/输入法弹出后系统会恢复系统栏，重新藏起来
+        // 个别 ROM 会在失焦/回焦后重置窗口亮度，重新压到 0
         if (hasFocus) {
-            hideSystemBars()
-            // 个别 ROM 会在失焦后重置窗口亮度，重新压到 0
             runCatching {
                 window.attributes = window.attributes.apply { screenBrightness = 0f }
             }
-        }
-    }
-
-    private fun hideSystemBars() {
-        try {
-            if (Build.VERSION.SDK_INT >= 30) {
-                window.setDecorFitsSystemWindows(false)
-                window.insetsController?.let { c ->
-                    c.hide(WindowInsets.Type.systemBars())
-                    c.systemBarsBehavior =
-                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                        or View.SYSTEM_UI_FLAG_FULLSCREEN
-                        or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                        or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                        or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                        or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    )
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "hideSystemBars failed", t)
         }
     }
 
@@ -179,6 +186,10 @@ class BlackoutActivity : Activity() {
             // 亮度随窗口消失自动恢复；这里显式写回 -1（跟随系统）双保险
             window.attributes = window.attributes.apply { screenBrightness = -1f }
         } catch (ignored: Throwable) {
+        }
+        if (deep) {
+            Thread({ BacklightIo.restorePending(this) }, "BlackoutBacklightOn")
+                .apply { isDaemon = true }.start()
         }
         CastService.setBlackout(false)
         Oplog.logf("BLACKOUT", "退出息屏 frames=%d", CastService.frames)

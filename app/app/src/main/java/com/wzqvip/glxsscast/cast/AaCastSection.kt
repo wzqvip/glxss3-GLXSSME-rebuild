@@ -17,7 +17,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Android Auto（OpenHeadUnit）投屏 + 息屏 面板。
@@ -28,6 +32,7 @@ import kotlinx.coroutines.delay
 @Composable
 fun AaCastSection(onStatus: (String) -> Unit) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     var running by remember { mutableStateOf(CastService.running) }
     var blackout by remember { mutableStateOf(CastService.blackout) }
     var capture by remember { mutableStateOf(CastService.captureDesc) }
@@ -53,9 +58,9 @@ fun AaCastSection(onStatus: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text("Android Auto 投屏（单应用 + 息屏）", style = MaterialTheme.typography.titleSmall)
         Text(
-            "1) OpenHeadUnit 设置里：分辨率 1280×800、画面适应 Fill with bars（16:10 上下留边）\n" +
-                "2) 点「开始投屏」→ 系统对话框选「单个应用」→ OpenHeadUnit\n" +
-                "3) 眼镜 640×400 正好按 2:1 缩放，无状态栏、无黑边",
+            "1) OpenHeadUnit：Resolution = 720p（480p 最接近 16:10）、Video fit = Fit with bars\n" +
+                "2) 投屏对话框选「单个应用」→ OpenHeadUnit（状态栏不会进画面）\n" +
+                "3) 眼镜 640×400：AA 完整 → 640×360（上下各 20 px 黑边）；切「裁剪」可满屏但左右各切 ~13%",
             style = MaterialTheme.typography.bodySmall
         )
         Row(
@@ -72,13 +77,13 @@ fun AaCastSection(onStatus: (String) -> Unit) {
                         ctx.startActivity(
                             android.content.Intent(ctx, BlackoutActivity::class.java)
                         )
-                        onStatus("息屏中：手机黑屏 + 亮度 0，点屏幕任意处可退出")
+                        onStatus("息屏中：屏幕最暗但 AA 继续渲染，点屏幕任意处退出")
                     } catch (t: Throwable) {
                         onStatus("息屏失败: ${t.javaClass.simpleName}: ${t.message}")
                     }
                 },
                 modifier = Modifier.weight(1f)
-            ) { Text(if (blackout) "息屏中（再点可叠加）" else "息屏（黑屏+亮度0）") }
+            ) { Text(if (blackout) "息屏中（点此再进）" else "息屏（亮度 0）") }
 
             OutlinedButton(
                 onClick = {
@@ -86,19 +91,46 @@ fun AaCastSection(onStatus: (String) -> Unit) {
                         onStatus("未投屏：先开始投屏")
                         return@OutlinedButton
                     }
-                    try {
-                        ctx.startService(
-                            android.content.Intent(ctx, CastService::class.java)
-                                .setAction(CastService.ACTION_DUMP_FRAME)
-                        )
-                        onStatus("已请求抓一帧（稍后看下面路径）")
-                    } catch (t: Throwable) {
-                        onStatus("抓帧请求失败: ${t.javaClass.simpleName}")
+                    // 深度息屏要 root：先探一次（Magisk 弹窗此时屏幕还亮着，能看见）
+                    scope.launch {
+                        onStatus("正在确认 root…")
+                        val rooted = withContext(Dispatchers.IO) { BacklightIo.hasRoot() }
+                        if (!rooted) {
+                            onStatus("没有 root 授权：改用「息屏（亮度 0）」即可")
+                            return@launch
+                        }
+                        try {
+                            ctx.startActivity(
+                                android.content.Intent(ctx, BlackoutActivity::class.java)
+                                    .putExtra(BlackoutActivity.EXTRA_DEEP, true)
+                            )
+                            onStatus("深度息屏中：面板背光已关，点屏幕任意处退出并恢复")
+                        } catch (t: Throwable) {
+                            onStatus("深度息屏失败: ${t.javaClass.simpleName}: ${t.message}")
+                        }
                     }
                 },
                 modifier = Modifier.weight(1f)
-            ) { Text("抓帧存 PNG") }
+            ) { Text("深度息屏(root)") }
         }
+        OutlinedButton(
+            onClick = {
+                if (!CastService.running) {
+                    onStatus("未投屏：先开始投屏")
+                    return@OutlinedButton
+                }
+                try {
+                    ctx.startService(
+                        android.content.Intent(ctx, CastService::class.java)
+                            .setAction(CastService.ACTION_DUMP_FRAME)
+                    )
+                    onStatus("已请求抓一帧（稍后看下面路径）")
+                } catch (t: Throwable) {
+                    onStatus("抓帧请求失败: ${t.javaClass.simpleName}")
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("抓帧存 PNG（证明息屏期间还在出帧）") }
         Text(
             if (!running) {
                 "投屏未运行"
