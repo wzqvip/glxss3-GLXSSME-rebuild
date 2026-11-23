@@ -352,6 +352,16 @@ class CastService : Service() {
                     if (hd != null && running) {
                         dumpRequested = true
                         lastError = "已请求抓一帧 PNG…"
+                        // AA 静止时 MediaProjection 可能几百毫秒都不出新帧，只等"下一帧"
+                        // 会让取证卡住 —— 兜底：0.4 s 后直接落盘最近一帧。
+                        // 兜底也跑在 cast 线程上，和 onFrame 串行，不会拷到写了一半的缓冲。
+                        hd.postDelayed({
+                            if (dumpRequested) {
+                                dumpRequested = false
+                                rgbaBuf?.let { dumpFrameAsync(it.copyOf()) }
+                                Oplog.log("CAST", "dump frame: 无新帧，落盘最近一帧")
+                            }
+                        }, 400)
                     } else {
                         lastError = "未投屏，无法抓帧"
                     }
