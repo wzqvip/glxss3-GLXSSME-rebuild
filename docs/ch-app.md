@@ -160,7 +160,27 @@ com.wzqvip.glxsscast
   息屏投屏期间不要锁屏太久：Android 14 的 MediaProjection 在锁屏后仍会继续，
   但**用户点「停止」或拔线**会立刻结束（`BlackoutActivity` 的看门狗 2 s 内退出并恢复亮度）。
 
-#### 2.2.5 推荐的完整操作顺序
+#### 2.2.5 实测记录（LG G850N，2026-11-22，OpenHeadUnit 3.5.0）
+
+| 项 | 数据 |
+|---|---|
+| 抓取尺寸 | `started capture=866x400`（高度固定 400 = 眼镜屏高，1:1 垂直，无二次缩放） |
+| 帧间隔 / 单帧 bulk OUT | 36 ms / 25–28 ms → **实测 27–28 fps**（上限 30） |
+| AA 协商分辨率 | `[RES_CAP] resolutionId=2 chosen=_1280x720`，画布恒为 16:9 |
+| 旧 fit（未剥黑边） | 内容 640×295，上下各 52 px 黑边 → `screenshots/aa-mode-fit-legacy-640x295.png` |
+| 旧 cover（未剥黑边） | 左右各切 113/866 = 13% → `screenshots/aa-mode-cover-crop-13pct.png` |
+| 内容区识别 + 三档映射 | `CastGeomTest` 8/8 通过（合成 866×400 帧，断言精确到 ±3 px） |
+| HUD 叠加 | 真机抓帧 → `screenshots/aa-hud-corners-640x400.png`： |
+| | 水平仪（左上，无姿态数据时灰色）、`20:27:35` 时间 + lux（右上）、 |
+| | 底部导航条「箭头 + 现在 + 驶向Red Iris Dr」（来自真实 Google 地图导航通知） |
+| 真关屏（Doze） | `mWakefulness=Dozing` 起 **10 s 内 0 帧** → 眼镜画面冻住，「关屏」路线不可行 |
+| 单应用抓取 | 可行（`screenshots/aa-singleapp-frame.png`）：黑遮罩不进画面 |
+
+> 抓帧命令（不用点 UI）：`adb shell su -c "am startservice -n com.wzqvip.glxsscast/.cast.CastService -a com.wzqvip.glxsscast.DUMP_FRAME"`
+> → `/data/data/com.wzqvip.glxsscast/files/cast-frame.png`（就是这一帧真正发给眼镜的 640×400 像素）。
+> 切模式同理：`-a com.wzqvip.glxsscast.SET_MODE --ei mode 0|1|2`；HUD 开关：`-a com.wzqvip.glxsscast.TOGGLE_HUD`。
+
+#### 2.2.6 推荐的完整操作顺序
 
 1. OpenHeadUnit：分辨率 1280×720，画布落位保持默认（AA 16:9 + 左右黑边）；
 2. App 里点 **「▶ AA 投屏」** → 系统对话框选 **「单个应用」→ OpenHeadUnit** → 开始；
