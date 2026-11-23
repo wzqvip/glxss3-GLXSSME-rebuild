@@ -492,8 +492,14 @@ sudo systemctl daemon-reload && sudo systemctl restart glxss-stream
 
 无手机时命令行验证（Pi 本地）：
 
+> systemd 单元把控制 socket 固定到 `/run/glxss/glxssctl.sock`：
+> `export GLXSS_SOCK=/run/glxss/glxssctl.sock`，或每条 `ctl` 加
+> `--socket /run/glxss/glxssctl.sock`。否则默认客户端会去
+> `/run/user/1000/glxssctl.sock`，报“控制服务未启动”。
+
 ```bash
 # 1) 注入一帧：bearing=45，距离 120 m，动作“右转”，手机 heading=40
+export GLXSS_SOCK=/run/glxss/glxssctl.sock
 glxss ctl nav 45 --distance 120 --label 右转 --heading 40
 glxss ctl status                 # 应出现“导航 / 导航UDP”两行
 glxss ctl nav-clear

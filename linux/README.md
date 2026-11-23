@@ -329,8 +329,14 @@ Pi 端 `glxss/nav.py` 在 `0.0.0.0:9999`（UDP）收手机 JSON，写进线程�
 
 命令行测试（不依赖手机）：
 
+> `glxss-stream.service` 把控制 socket 固定到 `/run/glxss/glxssctl.sock`。
+> Pi 上先 `export GLXSS_SOCK=/run/glxss/glxssctl.sock`（或给每条 `ctl`
+> 加 `--socket /run/glxss/glxssctl.sock`），否则会连到用户默认路径而报
+> “控制服务未启动”。
+
 ```bash
 # Pi 上：注入一帧（bearing=45，距离 120 m，动作“右转”，手机 heading=40）
+export GLXSS_SOCK=/run/glxss/glxssctl.sock
 glxss ctl nav 45 --distance 120 --label 右转 --heading 40
 glxss ctl status            # 看 导航 / 导航UDP 两行
 glxss ctl nav-clear
