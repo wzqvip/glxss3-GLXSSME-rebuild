@@ -256,8 +256,8 @@ object CastGeom {
         offsetX: Float,
         offsetY: Float,
     ) {
-        val dw = com.wzqvip.glxsscast.lcd.LcdProtocol.WIDTH
-        val dh = com.wzqvip.glxsscast.lcd.LcdProtocol.HEIGHT
+        val dw = LcdProtocol.WIDTH
+        val dh = LcdProtocol.HEIGHT
         if (dw * dh * 4 != dst.size) return
         if (w <= 0 || h <= 0) return
 
@@ -359,15 +359,51 @@ object CastGeom {
         val dstRowBytes = LcdProtocol.WIDTH * 4
         val limit = buf.limit()
         if (limit < 4 || rowStride <= 0) return
-        // 浮点取整后 sy 可能越过 limit（抓取尺寸/stride 不一致的残帧），先算上限
+        // 浮点取整后 sy 可能越过 limit（stride 与抓取尺寸不一致的残帧），先算上限
         val maxSy = ((limit - 1) / rowStride).coerceIn(0, h - 1)
 
+        if (colIndex.size < dw) colIndex = IntArray(dw)
         val xs = colIndex
-        if (xs.size < dw) colIndex = IntArray(dw).also { colIndex = it; return blitInner() }
-        return blitInner()
+        for (i in 0 until dw) {
+            xs[i] = (sx0 + (i + 0.5f) * sw / dw).toInt().coerceIn(0, w - 1)
+        }
 
-        // 分解出来只是为了让上面的缓冲扩容分支保持可读
-        @Suppress("UNUSED_EXPRESSION")
-        fun blitInner() { }
+        val rowBytes = minOf(w * pixelStride, rowStride).coerceAtLeast(4)
+        var scratch = rowScratch
+        if (scratch.size < rowBytes) {
+            scratch = ByteArray(rowBytes)
+            rowScratch = scratch
+        }
+        var lastSy = -1
+        for (y in 0 until dh) {
+            val sy = (sy0 + (y + 0.5f) * sh / dh).toInt().coerceIn(0, maxSy)
+            if (sy != lastSy) {
+                buf.position(sy * rowStride)
+                val n = minOf(rowBytes, buf.remaining())
+                if (n > 0) buf.get(scratch, 0, n)
+                lastSy = sy
+            }
+            val o = (dy0 + y) * dstRowBytes + dx0 * 4
+            var si = o
+            if (pixelStride == 4) {
+                for (i in 0 until dw) {
+                    val s = xs[i] shl 2
+                    dst[si] = scratch[s]
+                    dst[si + 1] = scratch[s + 1]
+                    dst[si + 2] = scratch[s + 2]
+                    dst[si + 3] = scratch[s + 3]
+                    si += 4
+                }
+            } else {
+                for (i in 0 until dw) {
+                    val s = xs[i] * pixelStride
+                    dst[si] = scratch[s]
+                    dst[si + 1] = if (s + 1 < rowBytes) scratch[s + 1] else 0
+                    dst[si + 2] = if (s + 2 < rowBytes) scratch[s + 2] else 0
+                    dst[si + 3] = 255.toByte()
+                    si += 4
+                }
+            }
+        }
     }
 }

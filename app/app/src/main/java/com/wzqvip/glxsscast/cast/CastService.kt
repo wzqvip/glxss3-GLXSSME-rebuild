@@ -68,6 +68,8 @@ class CastService : Service() {
         const val ACTION_RESYNC = "com.wzqvip.glxsscast.RESYNC"
         /** 抓屏线程抓一帧存成 PNG（证据/排障：证明"息屏"后仍有新帧） */
         const val ACTION_DUMP_FRAME = "com.wzqvip.glxsscast.DUMP_FRAME"
+        /** 通知栏「HUD」：HUD 叠加开关（不用回 App，也不用退出息屏） */
+        const val ACTION_TOGGLE_HUD = "com.wzqvip.glxsscast.TOGGLE_HUD"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_MODE = "mode"
@@ -95,6 +97,7 @@ class CastService : Service() {
         private const val RC_MODE = 2002
         private const val RC_OPEN = 2003
         private const val RC_BLACKOUT = 2004
+        private const val RC_HUD = 2005
 
         @Volatile var running = false; private set
         @Volatile var frames = 0L; private set
@@ -121,6 +124,22 @@ class CastService : Service() {
         /** 当前抓取尺寸，UI 展示 / 排障用 */
         @Volatile var captureDesc = ""; private set
 
+        /**
+         * AA 内容区（剥掉 letterbox 之后的真实画面）尺寸，空 = 全屏。
+         *
+         * OpenHeadUnit 全屏时是 `1920×1080`（左右各 210 px 黑边）—— 有这个数字才说明
+         * 「AA 画面被完整取到」而不是被 cover 切掉两边。
+         */
+        @Volatile var contentDesc = ""; private set
+
+        /**
+         * AA 内容区识别开关（UI 直接改，下一帧生效）。
+         *
+         * 开：先从抓取帧里剥掉纯黑 letterbox，再按模式映射 —— 三种模式都不会再切掉 AA 两边。
+         * 关：退回整幅映射（旧行为，便于对比/排障）。
+         */
+        @Volatile var aaContent = true
+
         /** 录像旁路（Activity 直接挂到服务上，不用 bind；null = 不录像） */
         @Volatile var frameTap: CastFrameTap? = null
 
@@ -146,6 +165,18 @@ class CastService : Service() {
             MODE_FIT -> "适应(黑边)"
             MODE_STRETCH -> "拉伸(填满)"
             else -> "裁剪(填满)"
+        }
+
+        /** 一键「AA 投屏」用的模式：适应 + 内容区识别 → AA 16:9 完整显示成 640×360。 */
+        const val MODE_AA = MODE_FIT
+
+        /** 一键「AA 投屏」：模式 + 内容区识别都设成推荐值（持久化），再启动投屏。 */
+        fun applyAaLanding() {
+            fillMode = MODE_AA
+            aaContent = true
+            zoom = 1f
+            offsetX = 0f
+            offsetY = 0f
         }
 
         /** 活着的服务实例（[BlackoutActivity]/通知用；null = 没在投屏） */
@@ -182,9 +213,11 @@ class CastService : Service() {
 
     private var rgbaBuf: ByteArray? = null
     private var frameBuf: ByteArray? = null
-    private var rowScratch: ByteArray? = null
     private var captureW = LcdProtocol.WIDTH
     private var captureH = LcdProtocol.HEIGHT
+
+    /** AA 内容区跟踪（剥 letterbox 黑边；只在 cast 线程用） */
+    private val content = CastGeom.ContentTracker()
 
     /** [ACTION_DUMP_FRAME]：下一帧落盘 PNG（主线程置位，cast 线程消费） */
     @Volatile private var dumpRequested = false
@@ -221,6 +254,13 @@ class CastService : Service() {
         offsetX = prefs.offsetX
         offsetY = prefs.offsetY
         flip180 = prefs.flip180
+        // AA 内容区识别 + HUD 叠加（服务可能先于 Activity 起来）
+        aaContent = prefs.aaContentDetect
+        content.enabled = aaContent
+        CastHud.enabled = prefs.hudOn
+        CastHud.alphaPct = prefs.hudAlpha
+        CastHud.position = prefs.hudPos
+        CastHud.navOnly = prefs.hudNavOnly
         registerDetachReceiver()
     }
 
@@ -316,6 +356,19 @@ class CastService : Service() {
                         lastError = "未投屏，无法抓帧"
                     }
                 }
+                ACTION_TOGGLE_HUD -> {
+                    // 通知栏一键开关叠加层：开着 AA + 息屏时不用退出黑屏就能切
+                    CastHud.enabled = !CastHud.enabled
+                    CastHud.reset()
+                    Prefs.get(this).hudOn = CastHud.enabled
+                    lastError = if (CastHud.enabled) {
+                        "HUD 叠加: 开（${CastHud.layoutName}）"
+                    } else {
+                        "HUD 叠加: 关"
+                    }
+                    updateNotification()
+                    if (!running) stopSelf()
+                }
                 ACTION_START -> {
                     val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
                     @Suppress("DEPRECATION")
@@ -356,8 +409,13 @@ class CastService : Service() {
     /** 通知栏动作的 PendingIntent（FLAG_IMMUTABLE：Android 12+ 必须显式声明可变性） */
     private fun pending(action: String): PendingIntent {
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val rc = when (action) {
+            ACTION_STOP -> RC_STOP
+            ACTION_TOGGLE_HUD -> RC_HUD
+            else -> RC_MODE
+        }
         return PendingIntent.getService(
-            this, if (action == ACTION_STOP) RC_STOP else RC_MODE,
+            this, rc,
             Intent(this, CastService::class.java).setAction(action), flags
         )
     }
@@ -393,6 +451,8 @@ class CastService : Service() {
                 } else {
                     append(" · 息屏中")
                 }
+                if (contentDesc.isNotEmpty()) append(" · AA 内容 ").append(contentDesc)
+                if (CastHud.enabled) append(" · HUD ").append(CastHud.layoutName)
             }
         }
         return Notification.Builder(this, CHANNEL_ID)
@@ -418,6 +478,14 @@ class CastService : Service() {
                     icon(android.R.drawable.ic_menu_view),
                     if (blackout) "退出息屏" else "息屏",
                     blackoutPi
+                ).build()
+            )
+            .addAction(
+                // HUD 叠加开关：息屏/后台时不用回 App 也能切（第 4 个动作，展开通知可见）
+                Notification.Action.Builder(
+                    icon(android.R.drawable.ic_menu_info_details),
+                    if (CastHud.enabled) "HUD 关" else "HUD 开",
+                    pending(ACTION_TOGGLE_HUD)
                 ).build()
             )
             .build()
@@ -587,6 +655,9 @@ class CastService : Service() {
         lastFrameAt = 0
         countWindow = 0
         windowStart = System.currentTimeMillis()
+        content.reset()
+        contentDesc = ""
+        CastHud.reset()
         updateNotification()
         Oplog.logf("CAST", "started capture=${captureW}x$captureH mode=%d", fillMode)
         Log.i(TAG, "casting started mode=$fillMode capture=${captureW}x$captureH")
@@ -756,11 +827,20 @@ class CastService : Service() {
             val rowStride = plane.rowStride
             val pixelStride = plane.pixelStride
 
-            when (fillMode) {
-                MODE_STRETCH -> mapStretch(buf, w, h, rowStride, pixelStride, dst)
-                MODE_FIT -> mapFit(buf, w, h, rowStride, pixelStride, dst)
-                else -> mapCover(buf, w, h, rowStride, pixelStride, dst)
-            }
+            // 内容区识别（每 10 帧探测一次，内部带迟滞）：OpenHeadUnit 全屏时 AA 画面
+            // 左右各有 ~210 px 黑边（实测 x∈[210,2130]），先剥掉黑边再映射，
+            // 三种模式都不会再把 AA 左右各切掉 13%。（见 CastGeom 的说明）
+            content.enabled = aaContent
+            content.tick(buf, w, h, rowStride, pixelStride)
+            val cd = if (content.rect == null) "" else content.desc
+            if (cd != contentDesc) contentDesc = cd
+            CastGeom.map(
+                buf, w, h, rowStride, pixelStride, dst,
+                fillMode, content.rect, zoom, offsetX, offsetY
+            )
+
+            // HUD 叠加：映射完之后、180° 翻转之前画（叠加层与 AA 同方向）。
+            CastHud.compose(dst)
 
             // 180° 软件翻转：映射后再做一次扫描顺序反转（目标行/列都反），
             // 对三种画面模式和任意抓取尺寸都等价，且不需要重启投屏。
@@ -922,111 +1002,6 @@ class CastService : Service() {
             }
         }, "CastDumpFrame").apply { isDaemon = true }.start()
     }
-
-    /** 拉伸：忽略比例，把整幅图铺满 640×400 */    private fun mapStretch(
-        buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
-    ) {
-        val dstW = LcdProtocol.WIDTH
-        val dstH = LcdProtocol.HEIGHT
-        val dstRow = dstW * 4
-        val rowBytes = minOf(w * pixelStride, rowStride)
-        for (y in 0 until dstH) {
-            val srcRow = y * h / dstH
-            buf.position(srcRow * rowStride)
-            val n = minOf(rowBytes, buf.remaining(), dst.size - y * dstRow)
-            if (n > 0) buf.get(dst, y * dstRow, n)
-        }
-    }
-
-    /** 适应：等比缩放后上下留黑边（老行为） */
-    private fun mapFit(
-        buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
-    ) {
-        val dstW = LcdProtocol.WIDTH
-        val dstH = LcdProtocol.HEIGHT
-        val dstRow = dstW * 4
-        val rowBytes = minOf(w * pixelStride, rowStride)
-        java.util.Arrays.fill(dst, 0)
-        val contentH = (dstW.toLong() * h / w).toInt().coerceAtMost(dstH)
-        val top = (dstH - contentH) / 2
-        for (y in 0 until contentH) {
-            val srcRow = y * h / contentH
-            buf.position(srcRow * rowStride)
-            val n = minOf(rowBytes, buf.remaining(), dst.size - (top + y) * dstRow)
-            if (n > 0) buf.get(dst, (top + y) * dstRow, n)
-        }
-    }
-
-    /**
-     * 裁剪(填满)：cover 变换 —— scale = max(dstW/w, dstH/h) * zoom，
-     * 居中裁剪，再叠加归一化偏移（以源图像素为单位 = offset * 源宽/高 / 2），
-     * 采样坐标 clamp 到图内，因此任何抓取尺寸都不会留黑边/越界。
-     */
-    private fun mapCover(
-        buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
-    ) {
-        if (w <= 0 || h <= 0) return
-        val dstW = LcdProtocol.WIDTH
-        val dstH = LcdProtocol.HEIGHT
-        val dstRow = dstW * 4
-
-        val z = zoom.coerceIn(1f, 4f)
-        val scale = maxOf(dstW.toFloat() / w, dstH.toFloat() / h) * z
-        // cover 保证 srcW <= w、srcH <= h
-        val srcW = (dstW / scale).coerceIn(1f, w.toFloat())
-        val srcH = (dstH / scale).coerceIn(1f, h.toFloat())
-        val maxLeft = (w - srcW).coerceAtLeast(0f)
-        val maxTop = (h - srcH).coerceAtLeast(0f)
-
-        val cx = w / 2f + offsetX.coerceIn(-1f, 1f) * w * 0.5f
-        val cy = h / 2f + offsetY.coerceIn(-1f, 1f) * h * 0.5f
-        val left = (cx - srcW / 2f).coerceIn(0f, maxLeft)
-        val top = (cy - srcH / 2f).coerceIn(0f, maxTop)
-
-        // 每列采样源 x（预计算，逐像素只做索引）
-        val xs = IntArray(dstW) { x ->
-            (left + (x + 0.5f) * srcW / dstW).toInt().coerceIn(0, w - 1)
-        }
-        val rowBytes = minOf(w * pixelStride, rowStride)
-        var scratch = rowScratch
-        if (scratch == null || scratch.size < rowBytes) {
-            scratch = ByteArray(rowBytes)
-            rowScratch = scratch
-        }
-
-        var lastSy = -1
-        for (y in 0 until dstH) {
-            val sy = (top + (y + 0.5f) * srcH / dstH).toInt().coerceIn(0, h - 1)
-            if (sy != lastSy) {
-                buf.position(sy * rowStride)
-                val n = minOf(rowBytes, buf.remaining())
-                buf.get(scratch, 0, n)
-                lastSy = sy
-            }
-            val o = y * dstRow
-            var si = o
-            if (pixelStride == 4) {
-                for (x in 0 until dstW) {
-                    val s = xs[x] shl 2
-                    dst[si] = scratch[s]
-                    dst[si + 1] = scratch[s + 1]
-                    dst[si + 2] = scratch[s + 2]
-                    dst[si + 3] = scratch[s + 3]
-                    si += 4
-                }
-            } else {
-                for (x in 0 until dstW) {
-                    val s = xs[x] * pixelStride
-                    dst[si] = scratch[s]
-                    dst[si + 1] = if (s + 1 < rowBytes) scratch[s + 1] else 0
-                    dst[si + 2] = if (s + 2 < rowBytes) scratch[s + 2] else 0
-                    dst[si + 3] = if (s + 3 < rowBytes) scratch[s + 3] else 255.toByte()
-                    si += 4
-                }
-            }
-        }
-    }
-
     /**
      * 停止投屏（主线程/投影回调都会走到）。
      *
@@ -1055,6 +1030,9 @@ class CastService : Service() {
             }
             projection = null
             captureDesc = ""
+            content.reset()
+            contentDesc = ""
+            CastHud.reset()
             // 投屏结束：清掉息屏状态（BlackoutActivity 的看门狗会在 ~2s 内自己退出并恢复亮度）
             blackoutWarning = ""
             blackout = false

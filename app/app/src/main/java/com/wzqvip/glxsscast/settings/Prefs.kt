@@ -41,6 +41,12 @@ class Prefs private constructor(ctx: Context) {
         private const val KEY_ACC_FSR = "acc_fsr"
         private const val KEY_GYRO_FSR = "gyro_fsr"
         private const val KEY_FSR_INIT = "fsr_initialized"
+        // Android Auto 投屏：内容区识别 + HUD 叠加
+        private const val KEY_AA_CONTENT = "aa_content"
+        private const val KEY_HUD = "hud_on"
+        private const val KEY_HUD_ALPHA = "hud_alpha"
+        private const val KEY_HUD_POS = "hud_pos"
+        private const val KEY_HUD_NAV_ONLY = "hud_nav_only"
         // 导航 HUD（Google 地图通知 → 眼镜直推 / Pi Wi-Fi UDP）
         private const val KEY_NAV_IP = "nav_host"
         private const val KEY_NAV_PORT = "nav_udp_port"
@@ -157,6 +163,37 @@ class Prefs private constructor(ctx: Context) {
     var fsrInitialized: Boolean
         get() = sp.getBoolean(KEY_FSR_INIT, false)
         set(v) { sp.edit().putBoolean(KEY_FSR_INIT, v).apply() }
+
+    // ---- Android Auto 投屏：内容区识别 + HUD 叠加 ----
+
+    /**
+     * 「AA 内容区识别」：从抓取帧里剥掉 letterbox 黑边再映射（默认开）。
+     *
+     * 关掉就退回旧行为（整幅映射）—— OpenHeadUnit 全屏时会把 AA 的左右各切掉 ~13%。
+     */
+    var aaContentDetect: Boolean
+        get() = sp.getBoolean(KEY_AA_CONTENT, true)
+        set(v) { sp.edit().putBoolean(KEY_AA_CONTENT, v).apply() }
+
+    /** HUD 叠加到投屏帧上（默认关：避免遮挡 AA，用户自己开） */
+    var hudOn: Boolean
+        get() = sp.getBoolean(KEY_HUD, false)
+        set(v) { sp.edit().putBoolean(KEY_HUD, v).apply() }
+
+    /** HUD 不透明度 20–100（%） */
+    var hudAlpha: Int
+        get() = sp.getInt(KEY_HUD_ALPHA, 88).coerceIn(20, 100)
+        set(v) { sp.edit().putInt(KEY_HUD_ALPHA, v.coerceIn(20, 100)).apply() }
+
+    /** HUD 版式：0=四角 1=顶部条 2=底部条 */
+    var hudPos: Int
+        get() = sp.getInt(KEY_HUD_POS, 0).coerceIn(0, 2)
+        set(v) { sp.edit().putInt(KEY_HUD_POS, v.coerceIn(0, 2)).apply() }
+
+    /** 只画导航（不画水平仪/lux），给「不想被挡」的场景 */
+    var hudNavOnly: Boolean
+        get() = sp.getBoolean(KEY_HUD_NAV_ONLY, false)
+        set(v) { sp.edit().putBoolean(KEY_HUD_NAV_ONLY, v).apply() }
 
     // ---- 导航 HUD（Google 地图通知 → Pi Wi-Fi UDP，默认 192.168.2.128:9999） ----
     /** Pi 的地址。 */

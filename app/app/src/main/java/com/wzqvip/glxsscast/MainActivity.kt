@@ -1445,6 +1445,41 @@ class MainActivity : ComponentActivity() {
         status = "画面模式: " + com.wzqvip.glxsscast.cast.CastService.modeName(fillMode)
     }
 
+    /**
+     * 一键「AA 投屏」：把映射设成**最适合 AA** 的组合，然后在没投屏时拉起系统授权。
+     *
+     * - 模式 = 适应（[com.wzqvip.glxsscast.cast.CastService.MODE_AA]）：等比缩放、内容不丢；
+     * - 内容区识别 = 开：先剥掉 OpenHeadUnit 的左右 letterbox 黑边，16:9 → 640×360，
+     *   上下各 20 px 留边（屏高 5%），而不是旧版 cover 左右各切 13%；
+     * - 缩放/偏移复位（免得沿用上次的裁剪参数）。
+     *
+     * 已在投屏时只切模式（下一帧生效），不会去申请第二个 MediaProjection。
+     */
+    private fun startAaCast() {
+        com.wzqvip.glxsscast.cast.CastService.applyAaLanding()
+        fillMode = com.wzqvip.glxsscast.cast.CastService.MODE_AA
+        zoom = com.wzqvip.glxsscast.cast.CastService.zoom
+        offsetX = com.wzqvip.glxsscast.cast.CastService.offsetX
+        offsetY = com.wzqvip.glxsscast.cast.CastService.offsetY
+        prefs.fillMode = fillMode
+        prefs.zoom = zoom
+        prefs.offsetX = offsetX
+        prefs.offsetY = offsetY
+        prefs.aaContentDetect = true
+        com.wzqvip.glxsscast.cast.CastService.aaContent = true
+        if (com.wzqvip.glxsscast.cast.CastService.running) {
+            status = "已切到 AA 模式：适应 + 内容区识别（下一帧生效）"
+            return
+        }
+        status = "AA 投屏：适应 + 内容区识别，等待系统授权…"
+        runCatching {
+            mpLauncher.launch(projectionManager.createScreenCaptureIntent())
+        }.onFailure {
+            status = "AA 投屏授权启动失败: ${it.javaClass.simpleName}: ${it.message}"
+            Oplog.logf("CAST", "AA 投屏 launch 失败 %s: %s", it.javaClass.simpleName, it.message)
+        }
+    }
+
     private fun sendAsync(payload: ByteArray) {
         if (busy) return
         busy = true
@@ -1747,6 +1782,14 @@ class MainActivity : ComponentActivity() {
             bubbleX = (dx / denom).coerceIn(-1f, 1f),
             bubbleY = (dy / denom).coerceIn(-1f, 1f)
         )
+        // 同一帧姿态喂给投屏 HUD 叠加层（息屏/后台时 HID 仍在跑 → 眼镜上的水平仪继续动）
+        try {
+            com.wzqvip.glxsscast.cast.CastHud.pushPose(
+                pitch, roll, dx / denom, dy / denom, r.lux
+            )
+        } catch (t: Throwable) {
+            Oplog.logf("CAST", "HUD pushPose 异常 %s", t.javaClass.simpleName)
+        }
     }
 
     /** docs 约定：抬头为 +；pitch = atan2(x, hypot(y,z)) */
@@ -2332,8 +2375,26 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("开始投屏（实时镜像）") }
 
+                    // 一键「AA 投屏」：适应模式 + 内容区识别 + 无缩放偏移，再拉起系统授权
+                    Button(
+                        onClick = { startAaCast() },
+                        enabled = usb.isOpen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            if (com.wzqvip.glxsscast.cast.CastService.running) {
+                                "AA 投屏：切到「适应 + 内容区识别」（完整画面）"
+                            } else {
+                                "▶ AA 投屏（一键：完整 AA 画面、无裁切）"
+                            }
+                        )
+                    }
+
                     // AA / 单应用投屏：设置指导 + 息屏（黑屏+亮度0）+ 抓帧取证
                     com.wzqvip.glxsscast.cast.AaCastSection { status = it }
+
+                    // AA 画面 → 眼镜：内容区识别（剥黑边）开关 + HUD 叠加（版式/透明度）
+                    com.wzqvip.glxsscast.cast.CastHudSection { status = it }
 
                     // ---- 画面调整（可折叠）：实时微调位置/缩放，值持久化 ----
                     Button(
