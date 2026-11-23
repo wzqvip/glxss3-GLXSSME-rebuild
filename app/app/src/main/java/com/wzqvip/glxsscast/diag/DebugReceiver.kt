@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import com.wzqvip.glxsscast.MainActivity
+import com.wzqvip.glxsscast.nav.Maneuver
+import com.wzqvip.glxsscast.nav.NavBus
 import com.wzqvip.glxsscast.cast.CastService
 
 /**
@@ -92,6 +94,32 @@ class DebugReceiver : BroadcastReceiver() {
                     intent.getIntExtra("seconds", 600).toLong() * 1000L
                 )
                 "ctrl_poll_stop" -> ExpHarness.stopCtrlPoll()
+                // 导航 HUD：无 UI 的解析/发包自测（不需要解锁屏幕、不需要开车）
+                "nav_sim" -> {
+                    val maneuver = Maneuver.fromKey(
+                        intent.getStringExtra("maneuver") ?: "right"
+                    )
+                    val frame = NavBus.simulate(
+                        app,
+                        maneuver = maneuver,
+                        distanceMeters = intent.getDoubleExtra("distance", 500.0),
+                        etaSeconds = intent.getLongExtra("eta", 120L),
+                        remainMeters = intent.getDoubleExtra("remain", 2400.0),
+                    )
+                    Log.i(TAG, "nav_sim → " + frame.toJson())
+                    Oplog.logf("NAV", "nav_sim → %s", frame.toJson())
+                }
+                "nav_icon_test" -> {
+                    NavBus.runIconSelfTest()
+                    Log.i(TAG, "nav icon self-test: " + NavBus.iconSelfTest.value)
+                    Oplog.logf("NAV", "icon self-test: %s", NavBus.iconSelfTest.value)
+                }
+                "nav_status" -> {
+                    val line = "sent=${NavBus.sent.value} active=${NavBus.active.value} " +
+                        "err=${NavBus.error.value} last=${NavBus.last.value?.toJson()}"
+                    Log.i(TAG, "nav status: $line")
+                    Oplog.logf("NAV", "status: %s", line)
+                }
                 // 需要 Activity 的命令（投屏授权 / 录像 / HID UI / 状态）
                 "cast", "record_start", "record_stop", "hid_start", "hid_stop", "status",
                 "fsr_estimate", "level_calib", "sensor_attr" -> {
@@ -118,3 +146,4 @@ class DebugReceiver : BroadcastReceiver() {
         }
     }
 }
+

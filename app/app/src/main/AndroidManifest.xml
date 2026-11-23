@@ -6,10 +6,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 导航 HUD：UDP JSON 推到 Pi + GPS 方位（Location.getBearing）作为 heading -->
+    <!-- 导航 HUD：把解析后的导航 JSON 推到 Pi（Wi-Fi 同网段） -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 导航 HUD：读 Google 地图的导航通知（用户在系统里授权「通知使用权」） -->
+    <uses-permission android:name="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" />
     <!-- UVC 设备（眼镜摄像头）需要 CAMERA 权限才会授予 USB 访问 -->
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- 眼镜麦克风（UAC）录音 -->
@@ -44,6 +45,17 @@
             android:name=".cast.CastService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <!-- 导航 HUD：解析 Google 地图导航通知（需要「通知使用权」） -->
+        <service
+            android:name=".nav.NavListenerService"
+            android:exported="true"
+            android:label="GLXSS3 导航 HUD"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
         <!-- 实验/取证入口：exported=false，只能用 root shell 的 am broadcast 显式组件调用 -->
         <receiver
