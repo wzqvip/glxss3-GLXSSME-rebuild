@@ -41,10 +41,11 @@ class Prefs private constructor(ctx: Context) {
         private const val KEY_ACC_FSR = "acc_fsr"
         private const val KEY_GYRO_FSR = "gyro_fsr"
         private const val KEY_FSR_INIT = "fsr_initialized"
-        // 导航 HUD（Google 地图通知 → Pi Wi-Fi UDP）
+        // 导航 HUD（Google 地图通知 → 眼镜直推 / Pi Wi-Fi UDP）
         private const val KEY_NAV_IP = "nav_host"
         private const val KEY_NAV_PORT = "nav_udp_port"
         private const val KEY_NAV_SEND = "nav_send"
+        private const val KEY_NAV_DIRECT = "nav_direct"
 
         /** 导航 HUD 默认目标：Pi Zero 2 W 的 Wi-Fi 地址。 */
         const val DEFAULT_NAV_HOST = "192.168.2.128"
@@ -169,8 +170,14 @@ class Prefs private constructor(ctx: Context) {
         get() = sp.getInt(KEY_NAV_PORT, DEFAULT_NAV_PORT).coerceIn(1, 65535)
         set(v) { sp.edit().putInt(KEY_NAV_PORT, v.coerceIn(1, 65535)).apply() }
 
-    /** 是否把导航包发到 Pi（默认开）。 */
+    // ---- 导航 HUD ----
+    /** 「导航 HUD → 眼镜」直推开关（方案 A：手机直接走 USB bulk 推 640×400 RGBA）。 */
+    var navDirect: Boolean
+        get() = sp.getBoolean(KEY_NAV_DIRECT, true)
+        set(v) { sp.edit().putBoolean(KEY_NAV_DIRECT, v).apply() }
+
+    /** 旧方案：把导航 JSON 发到 Pi（Wi-Fi UDP）。默认关，作为独立场景备选。 */
     var navSend: Boolean
-        get() = sp.getBoolean(KEY_NAV_SEND, true)
+        get() = sp.getBoolean(KEY_NAV_SEND, false)
         set(v) { sp.edit().putBoolean(KEY_NAV_SEND, v).apply() }
 }

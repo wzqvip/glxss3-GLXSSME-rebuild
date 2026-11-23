@@ -7,6 +7,9 @@ import android.util.Log
 import com.wzqvip.glxsscast.MainActivity
 import com.wzqvip.glxsscast.nav.Maneuver
 import com.wzqvip.glxsscast.nav.NavBus
+import com.wzqvip.glxsscast.nav.NavHudPusher
+import com.wzqvip.glxsscast.nav.NavParser
+import com.wzqvip.glxsscast.settings.Prefs
 import com.wzqvip.glxsscast.cast.CastService
 
 /**
@@ -122,6 +125,62 @@ class DebugReceiver : BroadcastReceiver() {
                         "err=${NavBus.error.value} last=${NavBus.last.value?.toJson()}"
                     Log.i(TAG, "nav status: $line")
                     Oplog.logf("NAV", "status: %s", line)
+                }
+                // 方案 A：手机直推眼镜。无 UI 的完整自测：解析 → 640×400 渲染 → PNG
+                //   adb shell am broadcast -n com.wzqvip.glxsscast/.diag.DebugReceiver \
+                //     --es cmd nav_hud_png --es maneuver right --ef distance 500 \
+                //     --ef eta 120 --ef remain 2400
+                "nav_hud_png" -> {
+                    val maneuver = Maneuver.fromKey(
+                        intent.getStringExtra("maneuver") ?: "right"
+                    )
+                    fun number(key: String, fallback: Double): Double =
+                        (intent.extras?.get(key) as? Number)?.toDouble() ?: fallback
+                    val distance = number("distance", 500.0)
+                    val eta = number("eta", 120.0).toLong()
+                    val remain = number("remain", 2400.0)
+                    val label = intent.getStringExtra("label")
+                    bg("NavHudPng") {
+                        // use_last=1：抓「最近一条真实 Maps 通知」而不是造一条
+                        val frame = if (intent.getBooleanExtra("use_last", false)) {
+                            null
+                        } else {
+                            NavParser.simulate(
+                                maneuver = maneuver,
+                                distanceMeters = distance,
+                                etaSeconds = eta,
+                                remainMeters = remain,
+                                label = label,
+                            )
+                        }
+                        val path = NavHudPusher.capturePng(
+                            app, frame, note = "DebugReceiver",
+                            waiting = intent.getBooleanExtra("waiting", false),
+                        )
+                        Log.i(TAG, "nav_hud_png → $path")
+                        Oplog.logf("NAV", "nav_hud_png maneuver=%s → %s", maneuver.key, path)
+                    }
+                }
+                "nav_hud_push" -> {
+                    NavHudPusher.pushOnce(app)
+                    Log.i(TAG, "nav_hud_push requested, running=${NavHudPusher.running.value}")
+                    Oplog.logf("NAV", "nav_hud_push requested")
+                }
+                "nav_direct" -> {
+                    val on = intent.getIntExtra("on", 1) != 0
+                    Prefs.get(app).navDirect = on
+                    if (on) NavHudPusher.start(app) else NavHudPusher.stop()
+                    Log.i(TAG, "nav_direct=$on")
+                    Oplog.logf("NAV", "nav_direct=%b", on)
+                }
+                "nav_hud_status" -> {
+                    val line = "running=${NavHudPusher.running.value} " +
+                        "pushes=${NavHudPusher.pushes.value} " +
+                        "err=${NavHudPusher.lastError.value} " +
+                        "png=${NavHudPusher.lastPngPath.value} " +
+                        "status=${NavHudPusher.status.value}"
+                    Log.i(TAG, "nav hud status: $line")
+                    Oplog.logf("NAV", "hud status: %s", line)
                 }
                 // 需要 Activity 的命令（投屏授权 / 录像 / HID UI / 状态）
                 "cast", "record_start", "record_stop", "hid_start", "hid_stop", "status",

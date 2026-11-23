@@ -66,6 +66,8 @@ class CastService : Service() {
         const val ACTION_STOP = "com.wzqvip.glxsscast.STOP"
         const val ACTION_SET_MODE = "com.wzqvip.glxsscast.SET_MODE"
         const val ACTION_RESYNC = "com.wzqvip.glxsscast.RESYNC"
+        /** 抓屏线程抓一帧存成 PNG（证据/排障：证明"息屏"后仍有新帧） */
+        const val ACTION_DUMP_FRAME = "com.wzqvip.glxsscast.DUMP_FRAME"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_MODE = "mode"
@@ -92,12 +94,29 @@ class CastService : Service() {
         private const val RC_STOP = 2001
         private const val RC_MODE = 2002
         private const val RC_OPEN = 2003
+        private const val RC_BLACKOUT = 2004
 
         @Volatile var running = false; private set
         @Volatile var frames = 0L; private set
         @Volatile var fps = 0f; private set
         @Volatile var lastError = ""; private set
         @Volatile var fillMode = MODE_CROP
+
+        /** 「息屏」遮罩是否正在显示（[BlackoutActivity] 维护；通知文案/告警用） */
+        @Volatile var blackout = false; private set
+
+        /**
+         * 息屏期间抓到**连续全黑帧**时给出的提示（空 = 正常）。
+         *
+         * 全黑通常意味着用户在选择抓取范围时点的是「整个屏幕」——那样我们的黑遮罩也会被
+         * 抓进去，眼镜上就只剩黑屏。提示用户改选「单个应用 → OpenHeadUnit」。
+         */
+        @Volatile var blackoutWarning = ""; private set
+
+        /** 最近一次 [ACTION_DUMP_FRAME] 落盘的路径（证据） */
+        @Volatile var lastDumpPath = ""; private set
+        /** 最近一帧的时间（System.currentTimeMillis），外部判断"是否还在出帧" */
+        @Volatile var lastFrameAtWall = 0L; private set
 
         /** 当前抓取尺寸，UI 展示 / 排障用 */
         @Volatile var captureDesc = ""; private set
@@ -128,6 +147,25 @@ class CastService : Service() {
             MODE_STRETCH -> "拉伸(填满)"
             else -> "裁剪(填满)"
         }
+
+        /** 活着的服务实例（[BlackoutActivity]/通知用；null = 没在投屏） */
+        @Volatile private var instance: CastService? = null
+
+        /** 由 [BlackoutActivity] 调用：同步"息屏遮罩可见"状态并刷新通知 */
+        fun setBlackout(on: Boolean) {
+            blackout = on
+            if (!on) {
+                blackoutWarning = ""
+                blackFrameStreak = 0
+            }
+            try {
+                instance?.updateNotification()
+            } catch (ignored: Throwable) {
+            }
+        }
+
+        /** 息屏时连续全黑帧计数（cast 线程写） */
+        @Volatile private var blackFrameStreak = 0
     }
 
     private var projection: MediaProjection? = null
@@ -147,6 +185,9 @@ class CastService : Service() {
     private var rowScratch: ByteArray? = null
     private var captureW = LcdProtocol.WIDTH
     private var captureH = LcdProtocol.HEIGHT
+
+    /** [ACTION_DUMP_FRAME]：下一帧落盘 PNG（主线程置位，cast 线程消费） */
+    @Volatile private var dumpRequested = false
 
     /** 上一帧 USB 发出的时刻（elapsedRealtime），用于 30 fps 上限 */
     private var lastFrameAt = 0L
@@ -171,6 +212,7 @@ class CastService : Service() {
     override fun onCreate() {
         super.onCreate()
         Oplog.init(this)
+        instance = this
         usb = UsbLink.get(this)
         // 服务可能先于 Activity 起来：先从 SharedPreferences 恢复画面调整/画面模式
         val prefs = Prefs.get(this)
@@ -263,6 +305,17 @@ class CastService : Service() {
                     if (hd != null && running) hd.post { applyScreenSizeSafe() }
                     else lastError = "未投屏，无法重新适配方向"
                 }
+                ACTION_DUMP_FRAME -> {
+                    // 证据：把"下一帧"原样落成 PNG（投屏目标尺寸 640×400），
+                    // 用来证明息屏/遮罩期间抓取管线仍然有帧、而且抓到的是 AA 画面。
+                    val hd = handler
+                    if (hd != null && running) {
+                        dumpRequested = true
+                        lastError = "已请求抓一帧 PNG…"
+                    } else {
+                        lastError = "未投屏，无法抓帧"
+                    }
+                }
                 ACTION_START -> {
                     val code = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
                     @Suppress("DEPRECATION")
@@ -310,8 +363,11 @@ class CastService : Service() {
     }
 
     /**
-     * 投屏前台通知：带「停止投屏」「画面模式」两个动作，
-     * 点完不用回 App（PendingIntent → [ACTION_STOP] / [ACTION_SET_MODE]）。
+     * 投屏前台通知：带「停止投屏」「画面模式」「息屏」三个动作，
+     * 点完不用回 App（PendingIntent → [ACTION_STOP] / [ACTION_SET_MODE] / [BlackoutActivity]）。
+     *
+     * 「息屏」用 `getActivity` 直达 [BlackoutActivity]：这条路径是**用户点通知**触发的，
+     * 不受 Android 10+ 的后台启动 Activity 限制，也就不需要在 Service 里偷偷 startActivity。
      */
     private fun buildNotification(): Notification {
         val openApp = PendingIntent.getActivity(
@@ -321,12 +377,29 @@ class CastService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         fun icon(id: Int): Icon = Icon.createWithResource(this, id)
+        val blackoutPi = PendingIntent.getActivity(
+            this, RC_BLACKOUT,
+            Intent(this, BlackoutActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val text = if (blackoutWarning.isNotEmpty()) {
+            blackoutWarning
+        } else {
+            buildString {
+                append("画面模式: ").append(modeName(fillMode))
+                if (!blackout) {
+                    if (captureDesc.isNotEmpty()) append(" · 抓取 ").append(captureDesc)
+                } else {
+                    append(" · 息屏中")
+                }
+            }
+        }
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("GLXSS3 Cast · 投屏中")
-            .setContentText(
-                "画面模式: ${modeName(fillMode)}" +
-                    if (captureDesc.isNotEmpty()) " · 抓取 $captureDesc" else ""
+            .setContentTitle(
+                if (blackout) "GLXSS3 Cast · 息屏投屏中" else "GLXSS3 Cast · 投屏中"
             )
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setOngoing(true)
             .setContentIntent(openApp)
@@ -338,6 +411,13 @@ class CastService : Service() {
             .addAction(
                 Notification.Action.Builder(
                     icon(android.R.drawable.ic_menu_crop), "画面模式", pending(ACTION_SET_MODE)
+                ).build()
+            )
+            .addAction(
+                Notification.Action.Builder(
+                    icon(android.R.drawable.ic_menu_view),
+                    if (blackout) "退出息屏" else "息屏",
+                    blackoutPi
                 ).build()
             )
             .build()
@@ -686,6 +766,18 @@ class CastService : Service() {
             // 对三种画面模式和任意抓取尺寸都等价，且不需要重启投屏。
             if (flip180) LcdProtocol.flip180InPlace(dst)
 
+            lastFrameAtWall = System.currentTimeMillis()
+
+            // 息屏时的自检：整屏全黑说明抓到的是我们自己的黑遮罩（= 用户选的是"整个屏幕"
+            // 而不是"单个应用"），眼镜上就什么都看不到 —— 这种情况下必须明确告警。
+            if (blackout) checkBlackoutFrame(dst)
+
+            // 证据落盘（异步，不占 cast 线程）：把这一帧原样写成 PNG
+            if (dumpRequested) {
+                dumpRequested = false
+                dumpFrameAsync(dst.copyOf())
+            }
+
             // 录像旁路：在组装 USB 帧（16B 头 + payload）之前把这一帧 640×400 RGBA 交出去。
             // 消费者只做一次拷贝就返回（满了就丢帧），不会拖慢 USB 发送。
             frameTap?.let { tap ->
@@ -750,8 +842,88 @@ class CastService : Service() {
         }
     }
 
-    /** 拉伸：忽略比例，把整幅图铺满 640×400 */
-    private fun mapStretch(
+    /**
+     * 息屏自检：连续约 1.5 秒抓到纯黑帧 ⇒ 很可能抓的是"整个屏幕"（遮罩被一起抓走）。
+     *
+     * 采样（每 97 字节取一个）成本可忽略，只在息屏期间跑。判定成功后写
+     * [blackoutWarning] 并刷一次通知，让用户在眼镜黑掉的时候知道该改哪个设置。
+     */
+    private fun checkBlackoutFrame(dst: ByteArray) {
+        var any = false
+        var i = 0
+        val step = 97
+        while (i < dst.size) {
+            // 只看 RGB（alpha 恒为 255，不能作为"有内容"的依据）
+            if (dst[i].toInt() != 0) {
+                any = true
+                break
+            }
+            i += step
+        }
+        if (any) {
+            if (blackFrameStreak > 0) {
+                blackFrameStreak = 0
+                if (blackoutWarning.isNotEmpty()) {
+                    blackoutWarning = ""
+                    Handler(mainLooper).post { updateNotification() }
+                }
+            }
+            return
+        }
+        blackFrameStreak++
+        if (blackFrameStreak == 45 && blackoutWarning.isEmpty()) {
+            blackoutWarning =
+                "息屏中抓到全黑画面：投屏授权请选「单个应用 → OpenHeadUnit」"
+            Oplog.logf("CAST", "blackout: %d 帧全黑 → 提示用户改选「单个应用」", blackFrameStreak)
+            Handler(mainLooper).post { updateNotification() }
+        }
+    }
+
+    /**
+     * 把一帧 640×400 RGBA 存成 PNG（`files/cast-frame.png`），异步写盘。
+     *
+     * 用途：在没有外部采集设备时，直接证明"投屏链路这一刻收到的画面是什么"。
+     * 例如：进入息屏后 dump 一帧，能同时证明 ①仍有新帧 ②抓到的是 AA 画面而不是黑遮罩。
+     */
+    private fun dumpFrameAsync(rgba: ByteArray) {
+        val w = LcdProtocol.WIDTH
+        val h = LcdProtocol.HEIGHT
+        Thread({
+            var path = ""
+            try {
+                val px = IntArray(w * h)
+                var o = 0
+                for (i in px.indices) {
+                    px[i] = (0xFF shl 24) or
+                        ((rgba[o].toInt() and 0xFF) shl 16) or
+                        ((rgba[o + 1].toInt() and 0xFF) shl 8) or
+                        (rgba[o + 2].toInt() and 0xFF)
+                    o += 4
+                }
+                val bmp = android.graphics.Bitmap.createBitmap(
+                    px, w, h, android.graphics.Bitmap.Config.ARGB_8888
+                )
+                val f = java.io.File(filesDir, "cast-frame.png")
+                java.io.FileOutputStream(f).use { out ->
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                }
+                bmp.recycle()
+                path = f.absolutePath
+            } catch (t: Throwable) {
+                Oplog.logf("CAST", "dumpFrame 失败 %s: %s", t.javaClass.simpleName, t.message)
+            }
+            if (path.isNotEmpty()) {
+                lastDumpPath = path
+                lastError = "已保存抓帧: $path"
+                Oplog.logf(
+                    "CAST", "dump frame → %s (frames=%d blackout=%b 全黑帧连续=%d)",
+                    path, frames, blackout, blackFrameStreak
+                )
+            }
+        }, "CastDumpFrame").apply { isDaemon = true }.start()
+    }
+
+    /** 拉伸：忽略比例，把整幅图铺满 640×400 */    private fun mapStretch(
         buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixelStride: Int, dst: ByteArray
     ) {
         val dstW = LcdProtocol.WIDTH
@@ -883,6 +1055,11 @@ class CastService : Service() {
             }
             projection = null
             captureDesc = ""
+            // 投屏结束：清掉息屏状态（BlackoutActivity 的看门狗会在 ~2s 内自己退出并恢复亮度）
+            blackoutWarning = ""
+            blackout = false
+            dumpRequested = false
+            lastFrameAtWall = 0L
             try {
                 thread?.quitSafely()
             } catch (_: Throwable) {
@@ -929,6 +1106,7 @@ class CastService : Service() {
         }
         stopCasting()
         // USB 连接是进程内共享的（Activity 还在用），这里不关闭
+        if (instance === this) instance = null
         super.onDestroy()
     }
 }

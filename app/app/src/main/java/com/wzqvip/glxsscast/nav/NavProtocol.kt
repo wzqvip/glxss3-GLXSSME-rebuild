@@ -9,11 +9,13 @@ import org.json.JSONObject
  * ```
  * {"bearing": null, "distance": 500, "label": "右转进入 人民路",
  *  "heading": null, "maneuver": "right", "eta": 120,
- *  "remain": 2400, "source": "maps"}
+ *  "remain": 2400, "road": "人民路", "source": "maps"}
  * ```
  * * `bearing` / `heading` 固定发 `null`：眼镜没有磁力计，Pi 的 HUD 不再画罗盘，
  *   箭头只按 `maneuver`（或 `label` 关键词）画机动类型。
  * * `distance` 是到下一个动作的距离（米），`eta` 剩余秒数，`remain` 剩余路线米数。
+ * * `road` 是从指令里单独抽出的路名（`进入 人民路` → `人民路`），没有时为空串；
+ *   `label` 仍是完整指令（不裁掉路名）。
  * * `maneuver` 取值见 [Maneuver.key]；拿不到时发 `unknown`，Pi 会按 `label` 兜底。
  */
 enum class Maneuver(val key: String, val zh: String, val en: String) {
@@ -41,11 +43,13 @@ enum class Maneuver(val key: String, val zh: String, val en: String) {
  * 一条解析好的导航通知。
  *
  * [label] 是通知标题（Maps 的转向指令，如“右转进入 人民路”），会原样发到 Pi，
- * 同时用于 HUD 底部指令条；[maneuver] 决定 HUD 中心画什么箭头。
+ * 同时用于 HUD 底部指令条；[road] 是从 [label] 里单独抽出的路名（“人民路”），
+ * HUD 第二行放大高亮；[maneuver] 决定 HUD 中心画什么箭头。
  */
 data class NavFrame(
     val label: String,
     val maneuver: Maneuver,
+    val road: String = "",
     val distanceMeters: Double? = null,
     val etaSeconds: Long? = null,
     val remainMeters: Double? = null,
@@ -70,6 +74,7 @@ data class NavFrame(
         obj.put("bearing", JSONObject.NULL)
         obj.put("heading", JSONObject.NULL)
         obj.put("label", label.take(48))
+        obj.put("road", road.take(32))
         obj.put("distance", distanceMeters ?: 0.0)
         obj.put("maneuver", maneuver.key)
         etaSeconds?.let { obj.put("eta", it) }

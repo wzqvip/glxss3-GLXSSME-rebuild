@@ -58,7 +58,11 @@ object NavParser {
         ),
         Maneuver.STRAIGHT to listOf(
             "直行", "直走", "继续直行", "沿路直行", "前方直行",
-            "straight", "continue", "go straight", "keep straight"
+            // 车机模式（Maps 在 Android Auto/驾驶模式下的 navigation_status 通知）用
+            // “驶向 X 路 / 前往 X”表示继续沿路走，不是转弯。
+            "驶向", "前往", "开往",
+            "straight", "continue", "go straight", "keep straight",
+            "heading to", "head toward", "toward"
         ),
     )
 
@@ -71,6 +75,41 @@ object NavParser {
         RegexOption.IGNORE_CASE
     )
     private val LESS_THAN_MIN_RE = Regex("""[<＜]\s*1\s*(分|min)""", RegexOption.IGNORE_CASE)
+
+    // ---- 路名（从指令里单独抽出来给 HUD 第二行放大显示） ----
+    /** 中文：“进入/驶入/转入/并入/驶上/沿(着)” 后面的路名；允许路名里带空格（`G6 京藏高速`）。 */
+    private val ZH_ROAD_RE = Regex("""(?:进入|驶入|转入|并入|驶上|沿着|沿)\s*([^，。；,;、!?]{1,24})""")
+
+    /** 中文道路通名（长的在前），用它把 `人民路后靠右` 截成 `人民路`。 */
+    private val ZH_ROAD_SUFFIX = Regex("""(?:高速公路|高速|公路|大道|大街|胡同|路|街|道|巷|弄|桥|环岛)""")
+
+    /** 没有通名时，再按动作词截断（`进入隧道随后直行` → `隧道`）。 */
+    private val ZH_ROAD_TAIL_RE = Regex(
+        """(?:直行|行驶|前行|前进|继续|方向|靠左|靠右|掉头|右转|左转|向东|向西|向南|向北|往东|往西|往南|往北).*"""
+    )
+
+    /** 这些是动作/车道/环岛本身，不是“要去的路名”。 */
+    private val ZH_ROAD_REJECT = setOf(
+        "环岛", "环状交叉", "回旋", "目的地", "终点", "出口", "匝道", "收费站",
+        "左侧车道", "右侧车道", "中间车道", "公交车道", "应急车道",
+    )
+
+    /** 英文：onto / along / on 后面的路名。 */
+    private val EN_ROAD_RE = Regex(
+        """\b(onto|along|on)\s+([^,.;!?]{2,60})""",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** 英文截止词：`on Main St for 500 m`、`onto US-101 and then...`。 */
+    private val EN_ROAD_TAIL_RE = Regex(
+        """\s+(?:for|and|then|to|in|at|near|towards?|via)\b.*""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val EN_ROAD_REJECT = setOf(
+        "right", "left", "the right", "the left", "roundabout", "the roundabout",
+        "lane", "the lane", "exit", "the exit", "road", "the road",
+    )
 
     // ------------------------------------------------------------------
     // 入口
@@ -148,8 +187,13 @@ object NavParser {
             ?: parseDuration(textClean)
         val remain = extras.firstNotNullOfOrNull { parseDistance(it) }
 
-        // 3) 机动类型：文本关键词优先，图标相似度兜底
-        val label = titleClean.ifEmpty { bigClean }
+        // 3) 指令 / 机动类型
+        //    **字段顺序不固定**：普通手机通知是 title=指令、text=距离；而 Maps 的
+        //    navigation_status（车机/驾驶模式）反过来：title=距离（"0 英尺"）、
+        //    text=“驶向 XX 路”。所以按“像不像纯数值”来挑指令文字。
+        val label = pickLabel(titleClean, textClean, bigClean)
+        // 路名只在指令文字里找；label 保持完整（HUD 第一行仍显示整句）。
+        val road = extractRoad(label.ifEmpty { textClean }.ifEmpty { bigClean })
         val haystack = (titleClean + " " + textClean + " " + bigClean).lowercase()
         var maneuver = keywordManeuver(haystack)
         var iconGuess = Maneuver.UNKNOWN
@@ -169,6 +213,7 @@ object NavParser {
         return NavFrame(
             label = label.ifEmpty { textClean },
             maneuver = maneuver,
+            road = road,
             distanceMeters = distance,
             etaSeconds = eta,
             remainMeters = remain,
@@ -221,7 +266,8 @@ object NavParser {
             icon = icon,
             simulated = true,
         ) ?: NavFrame(
-            label = zh, maneuver = maneuver, distanceMeters = distanceMeters,
+            label = zh, maneuver = maneuver, road = extractRoad(zh),
+            distanceMeters = distanceMeters,
             etaSeconds = etaSeconds, remainMeters = remainMeters,
             source = "maps", title = zh, text = text, subText = sub,
             simulated = true,
@@ -247,9 +293,79 @@ object NavParser {
         }
     }
 
+    /**
+     * 只含数值 + 单位的字符串（`0 英尺`、`500 m`、`12 分钟`）不算“指令”，
+     * 用来在 title/text 顺序不固定时挑出真正的那一行。
+     */
+    fun isBareMeasurement(text: String): Boolean {
+        if (text.isBlank()) return false
+        var stripped = DISTANCE_RE.replace(text, " ")
+        stripped = DURATION_RE.replace(stripped, " ")
+        stripped = LESS_THAN_MIN_RE.replace(stripped, " ")
+        stripped = stripped.replace(Regex("""[\s·,，.、:：/<>＜()（）\-—]"""), "")
+        return stripped.isEmpty()
+    }
+
+    /** 指令文字：title > text > bigText，跳过纯数值项（见 [isBareMeasurement]）。 */
+    fun pickLabel(title: String, text: String, bigText: String): String {
+        for (candidate in listOf(title, text, bigText)) {
+            if (candidate.isNotBlank() && !isBareMeasurement(candidate)) return candidate
+        }
+        return title.ifBlank { bigText }
+    }
+
     fun clean(value: String?): String =
         (value ?: "").replace('\n', ' ').replace('\r', ' ').trim()
             .replace(Regex("""\s+"""), " ")
+
+    /**
+     * 从转向指令里抽出**路名**；抽不出来返回空串（[label] 本身保持完整指令）。
+     *
+     * 中文：`右转进入 人民路` / `左转驶入解放路` / `沿 中山东路 直行` /
+     * `驶入 G6 京藏高速`；英文：`Turn right onto Main St` /
+     * `Continue on Elm Street for 2 km` / `Merge onto US-101`。
+     *
+     * 环岛、车道、目的地这类不是路名，返回空串；`进入环岛` 后面的出口路名由
+     * 下一条指令（`驶出到 XX 路`）给出。
+     */
+    fun extractRoad(text: String): String {
+        val src = clean(text)
+        if (src.isEmpty()) return ""
+        extractRoadZh(src)?.let { return it }
+        return extractRoadEn(src)
+    }
+
+    private fun extractRoadZh(text: String): String? {
+        for (match in ZH_ROAD_RE.findAll(text)) {
+            var name = match.groupValues[1].trim()
+            // 先截到第一个道路通名（`人民路后靠右` → `人民路`），没有通名再按动作词截。
+            val suffix = ZH_ROAD_SUFFIX.find(name)
+            name = if (suffix != null) {
+                name.substring(0, suffix.range.last + 1)
+            } else {
+                name.replace(ZH_ROAD_TAIL_RE, "")
+            }
+            name = name.trim().trimEnd('的', '。', '，', ',', '.')
+            if (name.length >= 2 && name !in ZH_ROAD_REJECT) return name
+        }
+        return null
+    }
+
+    private fun extractRoadEn(text: String): String {
+        for (match in EN_ROAD_RE.findAll(text)) {
+            val prep = match.groupValues[1].lowercase()
+            var name = match.groupValues[2].replace(EN_ROAD_TAIL_RE, "").trim()
+            name = name.trimEnd(',', '.', ';', ':', '，', '。', '；')
+            if (name.startsWith("the ", ignoreCase = true)) name = name.substring(4).trim()
+            val lower = name.lowercase()
+            if (name.length < 2 || !name.any { it.isLetter() }) continue
+            if (lower in EN_ROAD_REJECT) continue
+            // "on the right" 是方向提示，不是路名（此时 "the" 已去掉）。
+            if (prep == "on" && (lower == "right" || lower == "left")) continue
+            return name
+        }
+        return ""
+    }
 
     fun keywordManeuver(text: String): Maneuver {
         if (text.isBlank()) return Maneuver.UNKNOWN
@@ -523,6 +639,9 @@ object NavParser {
         }
         return buildString {
             append("label=").append(frame.label).append('\n')
+            if (frame.road.isNotEmpty()) {
+                append("road=").append(frame.road).append('\n')
+            }
             append("maneuver=").append(frame.maneuver.key)
             append("  distance=").append(NavFrame.distanceText(frame.distanceMeters))
             append("  eta=").append(NavFrame.etaText(frame.etaSeconds))

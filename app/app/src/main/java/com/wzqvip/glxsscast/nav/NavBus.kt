@@ -36,6 +36,17 @@ object NavBus {
     /** 图标相似度自检结果（调试按钮）。 */
     val iconSelfTest = mutableStateOf("")
 
+    /**
+     * 新帧回调（「直推眼镜」挂在这里）。
+     *
+     * 与 UDP 的 1 Hz 重发不同：直推只在**数据变化**时立即补一帧（外加 1 Hz 刷新），
+     * 所以需要拿到「刚解析出来的那一帧」的即时通知。回调在
+     * NotificationListenerService 的线程上执行，实现方必须自带线程切换（见
+     * [NavHudPusher]）。
+     */
+    @Volatile
+    var frameListener: ((NavFrame) -> Unit)? = null
+
     private const val FRESH_MS = 30_000L
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "glxss-nav-udp").apply { isDaemon = true }
@@ -72,12 +83,18 @@ object NavBus {
         last.value = frame
         active.value = true
         Oplog.logf(
-            "NAV", "解析 %s maneuver=%s distance=%s eta=%s ← %s",
-            frame.label, frame.maneuver.key,
+            "NAV", "解析 %s maneuver=%s road=%s distance=%s eta=%s ← %s",
+            frame.label, frame.maneuver.key, frame.road.ifEmpty { "-" },
             NavFrame.distanceText(frame.distanceMeters),
             NavFrame.etaText(frame.etaSeconds), frame.packageName
         )
         send(frame)
+        // 直推眼镜：立即渲染一帧（不改变 UDP 行为）
+        try {
+            frameListener?.invoke(frame)
+        } catch (t: Throwable) {
+            Oplog.logf("NAV", "frameListener 异常 %s: %s", t.javaClass.simpleName, t.message)
+        }
     }
 
     /** Maps 导航通知被移除（结束导航）→ 停止发包。 */

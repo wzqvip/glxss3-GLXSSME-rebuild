@@ -615,6 +615,42 @@ class MainActivity : ComponentActivity() {
                     NavBus.clearDebug()
                     status = "已停止导航 HUD 发送"
                 }
+                // 方案 A：手机直推眼镜（无需 root 广播，走 Activity 的 exported intent）
+                //   adb shell am start -n com.wzqvip.glxsscast/.MainActivity \
+                //     --es cmd nav_hud_png --es maneuver right --ei nav_distance 500
+                "nav_hud_png" -> {
+                    val maneuver = Maneuver.fromKey(
+                        intent.getStringExtra("maneuver") ?: "right"
+                    )
+                    // use_last=1：抓「最近一条真实 Maps 通知」而不是造一条
+                    val frame = if (intent.getBooleanExtra("use_last", false)) {
+                        null
+                    } else {
+                        com.wzqvip.glxsscast.nav.NavParser.simulate(
+                            maneuver = maneuver,
+                            distanceMeters = intent.getFloatExtra("nav_distance", 500f).toDouble(),
+                            etaSeconds = intent.getIntExtra("nav_eta", 120).toLong(),
+                            remainMeters = intent.getFloatExtra("nav_remain", 2400f).toDouble(),
+                            label = intent.getStringExtra("label"),
+                        )
+                    }
+                    val path = com.wzqvip.glxsscast.nav.NavHudPusher.capturePng(
+                        this, frame, note = "Activity intent",
+                        waiting = intent.getBooleanExtra("waiting", false),
+                    )
+                    status = if (path.isEmpty()) "抓 PNG 失败（见 oplog）" else "PNG: $path"
+                }
+                "nav_hud_push" -> {
+                    com.wzqvip.glxsscast.nav.NavHudPusher.pushOnce(this)
+                    status = "已请求立即推一帧导航 HUD"
+                }
+                "nav_direct" -> {
+                    val on = intent.getIntExtra("on", 1) != 0
+                    prefs.navDirect = on
+                    if (on) com.wzqvip.glxsscast.nav.NavHudPusher.start(this)
+                    else com.wzqvip.glxsscast.nav.NavHudPusher.stop()
+                    status = if (on) "导航 HUD 直推已开启" else "导航 HUD 直推已关闭"
+                }
                 "oplog_dump" -> {
                     Oplog.dumpCrash("manual")
                     updateCrashInfo()
@@ -2202,7 +2238,7 @@ class MainActivity : ComponentActivity() {
             }
 
             Scaffold(
-                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.7 Dev") }) }
+                topBar = { TopAppBar(title = { Text("GLXSS3 Cast 0.1.8 Dev") }) }
             ) { pad ->
                 Column(
                     Modifier
@@ -2261,7 +2297,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     HorizontalDivider()
-                    // 导航 HUD（Google 地图通知 → UDP → Pi）
+                    // 导航 HUD（Google 地图通知 → 手机直推 640×400 USB 帧；UDP → Pi 为可选）
                     com.wzqvip.glxsscast.nav.NavHudSection(prefs)
 
                     HorizontalDivider()
@@ -2292,6 +2328,9 @@ class MainActivity : ComponentActivity() {
                         enabled = usb.isOpen,
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("开始投屏（实时镜像）") }
+
+                    // AA / 单应用投屏：设置指导 + 息屏（黑屏+亮度0）+ 抓帧取证
+                    com.wzqvip.glxsscast.cast.AaCastSection { status = it }
 
                     // ---- 画面调整（可折叠）：实时微调位置/缩放，值持久化 ----
                     Button(

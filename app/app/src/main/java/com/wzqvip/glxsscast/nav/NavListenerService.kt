@@ -26,7 +26,27 @@ class NavListenerService : NotificationListenerService() {
         NavBus.listenerConnected.value = true
         NavBus.listenerEnabled.value = true
         NavBus.ensureTicker(this)
+        // 进程可能由系统直接拉起（没有 Activity）：按持久化开关恢复「直推眼镜」，
+        // 这样插着眼镜、锁屏开车时也能持续刷新 HUD。
+        NavHudPusher.syncFromPrefs(this)
         Oplog.logf("NAV", "NotificationListenerService 已连接（可读地图通知）")
+        // App/服务刚重启时导航可能已经在跑：系统只推「之后」的通知，这里主动扫一遍
+        // 当前通知栏，否则要等 Maps 下一次更新（停车等待时可能几十秒）才出 HUD。
+        try {
+            val existing = activeNotifications
+            var restored = 0
+            existing?.forEach { sbn ->
+                if (sbn != null && handle(sbn)) restored++
+            }
+            if (restored > 0) {
+                Oplog.logf("NAV", "启动时恢复 %d 条进行中的地图通知", restored)
+            }
+        } catch (t: Throwable) {
+            Oplog.logf(
+                "NAV", "activeNotifications 扫描失败 %s: %s",
+                t.javaClass.simpleName, t.message
+            )
+        }
     }
 
     override fun onListenerDisconnected() {
@@ -37,14 +57,20 @@ class NavListenerService : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
-        if (sbn.packageName != NavParser.MAPS_PACKAGE) return
+        handle(sbn)
+    }
+
+    /** 解析一条通知并交给 [NavBus]；返回是否是一条有效的导航通知。 */
+    private fun handle(sbn: StatusBarNotification): Boolean {
+        if (sbn.packageName != NavParser.MAPS_PACKAGE) return false
         val frame = try {
             NavParser.parseNotification(sbn.notification, sbn.packageName, this)
         } catch (t: Throwable) {
             Oplog.logf("NAV", "解析地图通知失败 %s: %s", t.javaClass.simpleName, t.message)
             null
-        } ?: return
+        } ?: return false
         NavBus.onFrame(frame, this)
+        return true
     }
 
     override fun onNotificationRemoved(

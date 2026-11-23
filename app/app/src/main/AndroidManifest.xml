@@ -46,6 +46,17 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <!-- 息屏遮罩：全屏纯黑 + 窗口亮度 0。只在「单个应用」抓取时用，否则黑遮罩会被一起抓走。
+             screenOrientation="locked"：不把显示方向从横屏掰回竖屏（否则被抓的 App 会 resize）。 -->
+        <activity
+            android:name=".cast.BlackoutActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:screenOrientation="locked"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode"
+            android:theme="@style/Theme.Blackout" />
+
         <!-- 导航 HUD：解析 Google 地图导航通知（需要「通知使用权」） -->
         <service
             android:name=".nav.NavListenerService"
